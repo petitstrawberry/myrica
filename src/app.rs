@@ -19,7 +19,6 @@ use crate::backend::{
 
 const WINDOW_WIDTH: f32 = 1_100.0;
 const WINDOW_HEIGHT: f32 = 760.0;
-const ADDRESS_WIDTH: f32 = 620.0;
 
 /// Myrica's browser chrome and selected embedded engine.
 #[derive(Clone)]
@@ -84,11 +83,10 @@ impl MyricaApp {
                     .placeholder("Enter an HTTP(S) address")
                     .blur_on_submit(true)
                     .on_submit(move || navigate_from_address(&submit_backend, &submit_address))
-                    .frame_width(ADDRESS_WIDTH),
+                    .frame_width(f32::INFINITY),
                 Button::new("Go")
                     .header_style()
                     .on_click(move || navigate_from_address(&go_backend, &go_address)),
-                Spacer::new(),
                 Text::new(snapshot.backend_name).font_size(12.0),
             }
             .spacing(8.0)
