@@ -2973,7 +2973,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-platform-sws",
@@ -2983,14 +2983,16 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-core"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.1",
+ "fontique",
  "libm",
  "raw-window-handle",
  "scarlet-ui-icons-tabler",
  "scarlet-ui-macros",
+ "unicode-script",
  "unicode-segmentation",
  "zune-jpeg",
 ]
@@ -2998,7 +3000,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-icons-tabler"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "svgtypes",
 ]
@@ -3006,7 +3008,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-macros"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3016,7 +3018,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-sws"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-renderer-sgfx",
@@ -3028,7 +3030,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-winit"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "objc2-app-kit",
  "objc2-quartz-core 0.2.2",
@@ -3043,7 +3045,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-renderer-sgfx"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#3271f78bcab7e7748bb81defa3b064d193f608ae"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#56841e4fd5ef83a0bc5981c3c790f1de5b0e2440"
 dependencies = [
  "libm",
  "scarlet-ui-core",
@@ -4051,6 +4053,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
 
 [[package]]
 name = "unicode-segmentation"
