@@ -1,0 +1,75 @@
+[package]
+name = "myrica"
+version = "0.1.0"
+edition = "2024"
+description = "A cross-platform web browser built for Scarlet OS"
+license = "MIT"
+
+[[bin]]
+name = "myrica"
+path = "src/main.rs"
+
+[features]
+default = ["backend-blitz"]
+backend-blitz = [
+    "dep:anyrender",
+    "dep:anyrender_vello_cpu",
+    "dep:blitz-dom",
+    "dep:blitz-html",
+    "dep:blitz-paint",
+    "dep:blitz-traits",
+    "dep:keyboard-types",
+    "dep:parley",
+    "dep:peniko",
+    "dep:reqwest",
+    "dep:tokio",
+]
+
+[dependencies]
+anyrender = { version = "0.13.0", optional = true }
+anyrender_vello_cpu = { version = "0.17.0", optional = true }
+blitz-html = { git = "https://github.com/petitstrawberry/blitz", rev = "c26e20dfff971941486ca9f50c8dcd332ec404da", optional = true }
+blitz-paint = { git = "https://github.com/petitstrawberry/blitz", rev = "c26e20dfff971941486ca9f50c8dcd332ec404da", default-features = false, features = ["scrollbars"], optional = true }
+blitz-traits = { git = "https://github.com/petitstrawberry/blitz", rev = "c26e20dfff971941486ca9f50c8dcd332ec404da", default-features = false, optional = true }
+keyboard-types = { version = "0.7", optional = true }
+parley = { version = "0.11.1", default-features = false, features = ["std"], optional = true }
+peniko = { version = "0.6.0", optional = true }
+reqwest = { version = "0.12.24", default-features = false, features = ["charset", "rustls-tls-webpki-roots"], optional = true }
+tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"], optional = true }
+
+[target.'cfg(target_os = "scarlet")'.dependencies]
+blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "c26e20dfff971941486ca9f50c8dcd332ec404da", default-features = false, features = ["woff"], optional = true }
+getrandom = { version = "0.2.16", default-features = false, features = ["custom"] }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-os", default-features = false, features = ["std"] }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-sys" }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", branch = "main", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+
+[target.'cfg(not(target_os = "scarlet"))'.dependencies]
+blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "c26e20dfff971941486ca9f50c8dcd332ec404da", default-features = false, features = ["system-fonts", "woff"], optional = true }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", branch = "main", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+
+[patch.crates-io]
+ring = { git = "https://github.com/petitstrawberry/ring.git", branch = "scarlet" }
+selectors = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+servo_arc = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+socket2 = { git = "https://github.com/petitstrawberry/socket2.git", branch = "scarlet" }
+stylo = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_atoms = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_derive = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_dom = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_malloc_size_of = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_static_prefs = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+stylo_traits = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+to_shmem = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+to_shmem_derive = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
+tokio = { git = "https://github.com/petitstrawberry/tokio.git", branch = "scarlet" }
+
+[profile.dev]
+opt-level = 2
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
