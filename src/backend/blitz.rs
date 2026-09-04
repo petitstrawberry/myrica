@@ -740,6 +740,8 @@ fn map_key(key: BrowserKey) -> (Key, Code) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{BlitzBackend, BrowserBackend as _, normalize_location};
 
@@ -773,5 +775,33 @@ mod tests {
         assert!(buffer.chunks_exact(4).all(|pixel| pixel[3] == 255));
         let first = &buffer[..4];
         assert!(buffer.chunks_exact(4).any(|pixel| pixel != first));
+    }
+
+    #[test]
+    fn data_url_raster_image_is_rendered() {
+        const IMAGE_HTML: &str = r#"<!doctype html>
+<html><body>
+<img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABUAAAAYCAMAAAAiV0Z6AAAAPFBMVEVLoEN0wU6CzFKCzFKCzFKCzFKCzFJSo0MSczNDmkCCzFJPoUMTczNdr0gmgziCzFITczMTczMTczMTczPh00jOAAAAFHRSTlPF/+bIsms8Ad///hX+//5/tXw7aMEAx10AAACaSURBVHgBbc4HDoRQCATQ33tbvf9dF9QxaCT9UQaltLHOh/golXKhMs5Xqa0xU1lyoa2fXFyQOsDG38qsLy4TaV+sFislovyhPzLJJrBu6eQOtpW0LjbJkzTuTDLRVNKa3uxJI+VdiRqXSeu6GW+Qxi29eLIi8H7EsYrT42BD+mQtNO5JMjRuC4lSY8V4hsLX0egGijvUSEP9AbylEsOkeCgWAAAAAElFTkSuQmCC">
+</body></html>"#;
+
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.document = Some(backend.build_document(IMAGE_HTML, None, None));
+        let mut buffer = vec![0_u8; 320 * 240 * 4];
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            backend.render(&mut buffer, 320, 240, 1.0);
+            let has_green = buffer
+                .chunks_exact(4)
+                .any(|pixel| pixel[1] > 100 && pixel[1] > pixel[0] && pixel[1] > pixel[2]);
+            if has_green {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for raster image resource"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }

@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use blitz_traits::net::{Body, Bytes, NetHandler, NetProvider, Request};
+use data_url::DataUrl;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{BackendError, WakeCallback};
@@ -110,6 +111,27 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
         .is_some_and(|signal| signal.aborted())
     {
         return Err(String::from("request aborted"));
+    }
+
+    if request.url.scheme() == "data" {
+        let final_url = request.url.to_string();
+        let data_url =
+            DataUrl::process(&final_url).map_err(|error| format!("invalid data URL: {error:?}"))?;
+        let (body, _) = data_url
+            .decode_to_vec()
+            .map_err(|error| format!("invalid data URL payload: {error:?}"))?;
+        return Ok(FetchResponse {
+            final_url,
+            status: 200,
+            body,
+        });
+    }
+
+    if !matches!(request.url.scheme(), "http" | "https") {
+        return Err(format!(
+            "unsupported resource URL scheme: {}",
+            request.url.scheme()
+        ));
     }
 
     let mut builder = client
