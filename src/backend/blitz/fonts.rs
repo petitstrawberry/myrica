@@ -22,7 +22,7 @@ pub(super) fn load_font_context() -> FontContext {
     let mut font_roots: Vec<PathBuf> = std::env::var_os("MYRICA_FONT_PATH")
         .map(|paths| std::env::split_paths(&paths).collect())
         .unwrap_or_default();
-    font_roots.push(PathBuf::from("/fonts"));
+    font_roots.push(PathBuf::from("/share/fonts"));
     font_roots.retain(|path| path.is_dir());
     font_roots.sort_unstable();
     font_roots.dedup();
