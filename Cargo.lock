@@ -227,7 +227,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -236,7 +236,7 @@ dependencies = [
  "color",
  "cssparser",
  "cursor-icon",
- "debug_timer 0.1.3 (git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da)",
+ "debug_timer 0.1.3 (git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812)",
  "euclid",
  "html-escape",
  "image",
@@ -268,7 +268,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -279,7 +279,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 dependencies = [
  "anyrender",
  "blitz-dom",
@@ -298,7 +298,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.1",
@@ -674,7 +674,7 @@ checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 
 [[package]]
 name = "derive_more"
@@ -923,9 +923,8 @@ dependencies = [
 
 [[package]]
 name = "fontique"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6688bc1294fe7117d788937b6c53480169b29c566954af490830d4c09da9516a"
+version = "0.11.0"
+source = "git+https://github.com/linebender/parley?rev=dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7#dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7"
 dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
@@ -1173,7 +1172,7 @@ dependencies = [
 [[package]]
 name = "gpu-raw"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 dependencies = [
  "scarlet-os",
 ]
@@ -2394,14 +2393,34 @@ dependencies = [
 [[package]]
 name = "parlance"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b6937eda350acc1a5d05872c3cbf99fe78619c269096e2be3d4a350058639d5"
+source = "git+https://github.com/linebender/parley?rev=dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7#dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7"
 
 [[package]]
 name = "parley"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22d2ff88bd3f7d68d1d9b09c7e6209f9a8e8c05088295140a2bcf2e9b17038c5"
+version = "0.11.0"
+source = "git+https://github.com/linebender/parley?rev=dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7#dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7"
+dependencies = [
+ "fontique",
+ "hashbrown 0.17.1",
+ "linebender_resource_handle",
+ "parlance",
+ "parley_engine",
+ "skrifa",
+ "smallvec",
+]
+
+[[package]]
+name = "parley_data"
+version = "0.11.0"
+source = "git+https://github.com/linebender/parley?rev=dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7#dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7"
+dependencies = [
+ "icu_properties",
+]
+
+[[package]]
+name = "parley_engine"
+version = "0.11.0"
+source = "git+https://github.com/linebender/parley?rev=dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7#dbcdc7d214f28fb7ec16bb17b34bf0aeb85d0fc7"
 dependencies = [
  "fontique",
  "harfrust",
@@ -2413,15 +2432,6 @@ dependencies = [
  "parlance",
  "parley_data",
  "skrifa",
-]
-
-[[package]]
-name = "parley_data"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1567535334d6ba2d3cde19221ba9a7bd0fabb3cbd99046ddfb10ae061cfcc889"
-dependencies = [
- "icu_properties",
 ]
 
 [[package]]
@@ -2997,12 +3007,12 @@ dependencies = [
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 dependencies = [
  "scarlet-abi",
  "scarlet-sys",
@@ -3011,15 +3021,15 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 dependencies = [
  "scarlet-abi",
 ]
 
 [[package]]
 name = "scarlet-ui"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-platform-sws",
@@ -3028,8 +3038,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-ui-core"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.1",
@@ -3045,16 +3055,16 @@ dependencies = [
 
 [[package]]
 name = "scarlet-ui-icons-tabler"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "svgtypes",
 ]
 
 [[package]]
 name = "scarlet-ui-macros"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3063,8 +3073,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-ui-platform-sws"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-renderer-sgfx",
@@ -3075,8 +3085,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-ui-platform-winit"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "objc2-app-kit",
  "objc2-quartz-core 0.2.2",
@@ -3090,8 +3100,8 @@ dependencies = [
 
 [[package]]
 name = "scarlet-ui-renderer-sgfx"
-version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#c980c960b073b6a7c71a2ab501210e3b3a570e77"
+version = "0.1.0"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?branch=main#cc29019ba2377bdf7c4f4844596334aa3148661c"
 dependencies = [
  "libm",
  "scarlet-ui-core",
@@ -3658,7 +3668,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=c26e20dfff971941486ca9f50c8dcd332ec404da#c26e20dfff971941486ca9f50c8dcd332ec404da"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2d979a42b46694afedf59e0c545046d76063c812#2d979a42b46694afedf59e0c545046d76063c812"
 dependencies = [
  "bitflags 2.13.1",
  "stylo",
@@ -3706,7 +3716,7 @@ dependencies = [
 [[package]]
 name = "sws-client"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 dependencies = [
  "scarlet-os",
  "sws-protocol",
@@ -3715,7 +3725,7 @@ dependencies = [
 [[package]]
 name = "sws-protocol"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#c0f334b76abeac27b5d02ad6ae07593498e7b8ae"
+source = "git+https://github.com/petitstrawberry/Scarlet?branch=dev#615c221055454fc9938891b7b1d7e57c2eec95eb"
 
 [[package]]
 name = "syn"
