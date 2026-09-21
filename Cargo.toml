@@ -44,19 +44,19 @@ tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"], optional
 [target.'cfg(target_os = "scarlet")'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "808409712e7f77ac1cf8f00f3a43d15af574d95b", default-features = false, features = ["woff"], optional = true }
 getrandom = { version = "0.2.16", default-features = false, features = ["custom"] }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-os", default-features = false, features = ["std"] }
-scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", branch = "dev", package = "scarlet-sys" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", branch = "main", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", package = "scarlet-os", default-features = false, features = ["std"] }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", package = "scarlet-sys" }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "e6e00f11c95de371057899ec05b7a832d04adc7f", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "808409712e7f77ac1cf8f00f3a43d15af574d95b", default-features = false, features = ["system-fonts", "woff"], optional = true }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", branch = "main", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "e6e00f11c95de371057899ec05b7a832d04adc7f", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [patch.crates-io]
 ring = { git = "https://github.com/petitstrawberry/ring.git", branch = "scarlet" }
 selectors = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
 servo_arc = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
-socket2 = { git = "https://github.com/petitstrawberry/socket2.git", branch = "scarlet" }
+socket2 = { git = "https://github.com/petitstrawberry/socket2.git", rev = "15f0140af367c76befdab2606c7b643f29552bfd" }
 stylo = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
 stylo_atoms = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
 stylo_derive = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
@@ -66,7 +66,7 @@ stylo_static_prefs = { git = "https://github.com/petitstrawberry/stylo", branch 
 stylo_traits = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
 to_shmem = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
 to_shmem_derive = { git = "https://github.com/petitstrawberry/stylo", branch = "scarlet" }
-tokio = { git = "https://github.com/petitstrawberry/tokio.git", branch = "scarlet" }
+tokio = { git = "https://github.com/petitstrawberry/tokio.git", rev = "8610548b5826d9405a2c7bff6465aee01813be83" }
 
 [profile.dev]
 opt-level = 2
