@@ -12,7 +12,7 @@ The name comes from *Myrica rubra*, an evergreen tree with scarlet fruit.
 - Native desktop frontend through ScarletUI's Winit backend
 - Scarlet OS frontend through ScarletUI's SWS backend
 - Blitz HTML/CSS rendering backend with HTTP(S) loading
-- Optional Boa-powered JavaScript for inline and external scripts, DOM events, and timers
+- Optional Boa-powered JavaScript for inline and external scripts, ES modules, DOM events, timers, and in-memory web storage
 - Backend-neutral navigation, input, lifecycle, and framebuffer boundary
 
 Blitz is the bring-up backend. Servo is the intended full browser engine once

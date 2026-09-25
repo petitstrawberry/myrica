@@ -25,7 +25,9 @@ use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::net::{AbortController, AbortSignal, Request, Url};
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 #[cfg(feature = "javascript")]
-use blitz_vibey_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher};
+use blitz_vibey_script::{
+    DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher, module_specifiers,
+};
 use keyboard_types::{Code, Key, Location, Modifiers};
 use peniko::{Fill, kurbo::Rect};
 
@@ -94,13 +96,14 @@ enum BackendMessage {
 }
 
 #[cfg(feature = "javascript")]
-struct PendingScripts {
+struct PrefetchBatch {
     generation: u64,
     requested_url: String,
     history_action: HistoryAction,
     response: Option<FetchResponse>,
-    remaining: usize,
     sources: HashMap<String, String>,
+    seen: HashSet<String>,
+    in_flight: usize,
 }
 
 #[cfg(feature = "javascript")]
@@ -116,6 +119,97 @@ impl ScriptFetcher for PrefetchedScriptFetcher {
             .cloned()
             .map(Ok)
             .unwrap_or_else(|| DefaultScriptFetcher.fetch(url))
+    }
+}
+
+/// Resolve a module specifier against its importing module's URL and keep only
+/// network schemes, which the prefetcher can fetch.
+#[cfg(feature = "javascript")]
+fn resolve_module_url(base: &Url, specifier: &str) -> Option<String> {
+    let url = if let Ok(url) = Url::parse(specifier) {
+        url
+    } else {
+        base.join(specifier).ok()?
+    };
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
+/// Fetch one wave of script URLs and recurse into the module specifiers found
+/// in each response, so the synchronous script fetcher can serve the entire
+/// transitive module graph from memory.
+#[cfg(feature = "javascript")]
+fn submit_prefetch_wave(
+    network: NetworkService,
+    sender: Sender<BackendMessage>,
+    wake: WakeCallback,
+    abort: Option<AbortSignal>,
+    batch: Arc<Mutex<PrefetchBatch>>,
+    urls: Vec<String>,
+) {
+    for url in urls {
+        let requested_script = url.clone();
+        let mut request = Request::get(Url::parse(&url).expect("prefetched script URL is valid"));
+        request.signal = abort.clone();
+        let batch = Arc::clone(&batch);
+        let sender = sender.clone();
+        let wake = Arc::clone(&wake);
+        let next_network = network.clone();
+        let next_abort = abort.clone();
+        network.submit(
+            request,
+            Box::new(move |result| {
+                let mut next = Vec::new();
+                let mut message = None;
+                {
+                    let mut pending = batch.lock().expect("prefetch batch lock poisoned");
+                    match result {
+                        Ok(response) if (200..400).contains(&response.status) => {
+                            let source = String::from_utf8_lossy(&response.body).into_owned();
+                            pending
+                                .sources
+                                .insert(requested_script.clone(), source.clone());
+                            let script_url = Url::parse(&requested_script)
+                                .expect("prefetched script URL is valid");
+                            for specifier in module_specifiers(&source) {
+                                if let Some(dependency) =
+                                    resolve_module_url(&script_url, &specifier)
+                                {
+                                    if pending.seen.insert(dependency.clone()) {
+                                        pending.in_flight += 1;
+                                        next.push(dependency);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(response) => eprintln!(
+                            "[myrica:javascript] script {} returned HTTP {}",
+                            requested_script, response.status
+                        ),
+                        Err(error) => eprintln!(
+                            "[myrica:javascript] failed to load script {}: {error}",
+                            requested_script
+                        ),
+                    }
+                    pending.in_flight -= 1;
+                    if pending.in_flight == 0 {
+                        message = Some(BackendMessage::ScriptsLoaded {
+                            generation: pending.generation,
+                            requested_url: std::mem::take(&mut pending.requested_url),
+                            history_action: pending.history_action,
+                            response: pending.response.take().expect("batch response exists"),
+                            sources: std::mem::take(&mut pending.sources),
+                        });
+                    }
+                }
+                if let Some(message) = message {
+                    if sender.send(message).is_ok() {
+                        wake();
+                    }
+                } else if !next.is_empty() {
+                    submit_prefetch_wave(next_network, sender, wake, next_abort, batch, next);
+                }
+            }),
+        );
     }
 }
 
@@ -324,13 +418,22 @@ impl BlitzBackend {
             },
         );
         let mut seen = HashSet::new();
-        let urls: Vec<_> = probe
-            .external_script_urls()
-            .into_iter()
-            .filter(|url| matches!(url.scheme(), "http" | "https"))
-            .filter(|url| seen.insert(url.to_string()))
-            .collect();
-        if urls.is_empty() {
+        let base_url = Url::parse(&response.final_url)
+            .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank is a valid URL"));
+        let mut initial = Vec::new();
+        for url in probe.external_script_urls() {
+            if matches!(url.scheme(), "http" | "https") && seen.insert(url.to_string()) {
+                initial.push(url.to_string());
+            }
+        }
+        for specifier in probe.inline_module_specifiers() {
+            if let Some(url) = resolve_module_url(&base_url, &specifier) {
+                if seen.insert(url.clone()) {
+                    initial.push(url);
+                }
+            }
+        }
+        if initial.is_empty() {
             return self.apply_root_response(
                 generation,
                 requested_url,
@@ -340,58 +443,23 @@ impl BlitzBackend {
             );
         }
 
-        let pending = Arc::new(Mutex::new(PendingScripts {
+        let batch = Arc::new(Mutex::new(PrefetchBatch {
             generation,
             requested_url,
             history_action,
             response: Some(response),
-            remaining: urls.len(),
             sources: HashMap::new(),
+            seen,
+            in_flight: initial.len(),
         }));
-        for url in urls {
-            let requested_script = url.to_string();
-            let mut request = Request::get(url);
-            request.signal = self.current_abort.as_ref().map(|c| c.signal.clone());
-            let pending = Arc::clone(&pending);
-            let sender = self.message_sender.clone();
-            let wake = Arc::clone(&self.wake);
-            self.network.submit(
-                request,
-                Box::new(move |result| {
-                    let mut batch = pending.lock().expect("script batch lock poisoned");
-                    match result {
-                        Ok(response) if (200..400).contains(&response.status) => {
-                            batch.sources.insert(
-                                requested_script,
-                                String::from_utf8_lossy(&response.body).into_owned(),
-                            );
-                        }
-                        Ok(response) => eprintln!(
-                            "[myrica:javascript] script {} returned HTTP {}",
-                            requested_script, response.status
-                        ),
-                        Err(error) => eprintln!(
-                            "[myrica:javascript] failed to load script {}: {}",
-                            requested_script, error
-                        ),
-                    }
-                    batch.remaining -= 1;
-                    if batch.remaining == 0 {
-                        let message = BackendMessage::ScriptsLoaded {
-                            generation: batch.generation,
-                            requested_url: std::mem::take(&mut batch.requested_url),
-                            history_action: batch.history_action,
-                            response: batch.response.take().expect("batch response exists"),
-                            sources: std::mem::take(&mut batch.sources),
-                        };
-                        drop(batch);
-                        if sender.send(message).is_ok() {
-                            wake();
-                        }
-                    }
-                }),
-            );
-        }
+        submit_prefetch_wave(
+            self.network.clone(),
+            self.message_sender.clone(),
+            Arc::clone(&self.wake),
+            self.current_abort.as_ref().map(|c| c.signal.clone()),
+            batch,
+            initial,
+        );
         false
     }
 
@@ -1143,5 +1211,99 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         server.join().unwrap();
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn module_imports_are_prefetched_transitively() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        use super::LoadState;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut requested = Vec::new();
+            let mut saw_lib = false;
+            while Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    if requested.len() == 3 && saw_lib {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0_u8; 2048];
+                let length = stream.read(&mut buffer).unwrap();
+                let line = String::from_utf8_lossy(&buffer[..length]);
+                let path = line.split_whitespace().nth(1).unwrap_or_default();
+                requested.push(path.to_string());
+                let body = match path {
+                    "/main.mjs" => r#"import { setTitle } from "./lib.mjs"; setTitle();"#,
+                    "/lib.mjs" => {
+                        saw_lib = true;
+                        r#"export function setTitle() {
+                            document.querySelector("title").textContent = "module-ready";
+                        }"#
+                    }
+                    _ => {
+                        r#"<html><head><title>waiting</title></head><body>
+                    <script type="module" src="/main.mjs"></script></body></html>"#
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            assert!(
+                saw_lib,
+                "browser did not request the transitive module import; requests: {requested:?}"
+            );
+        });
+
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.navigate(&format!("http://{address}/page")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            backend.tick();
+            let snapshot = backend.snapshot();
+            if matches!(snapshot.load_state, LoadState::Ready) {
+                assert_eq!(snapshot.title, "module-ready");
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out loading module page");
+            thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn javascript_web_storage_is_available() {
+        let backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        let document = backend.build_document(
+            r#"<html><head><title>before</title></head><body>
+            <script>
+              localStorage.setItem('theme', 'dark');
+              document.querySelector('title').textContent = localStorage.getItem('theme');
+            </script>
+            </body></html>"#,
+            None,
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(
+            document.inner().find_title_node().unwrap().text_content(),
+            "dark"
+        );
     }
 }
