@@ -4,5 +4,8 @@ linker = "rust-lld"
 [target.riscv64gc-unknown-scarlet]
 linker = "rust-lld"
 
+[target.'cfg(target_os = "scarlet")']
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]
+
 [unstable]
 unstable-options = true

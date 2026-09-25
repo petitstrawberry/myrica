@@ -12,6 +12,7 @@ The name comes from *Myrica rubra*, an evergreen tree with scarlet fruit.
 - Native desktop frontend through ScarletUI's Winit backend
 - Scarlet OS frontend through ScarletUI's SWS backend
 - Blitz HTML/CSS rendering backend with HTTP(S) loading
+- Optional Boa-powered JavaScript for inline and external scripts, DOM events, and timers
 - Backend-neutral navigation, input, lifecycle, and framebuffer boundary
 
 Blitz is the bring-up backend. Servo is the intended full browser engine once
@@ -24,6 +25,14 @@ cargo run --release -- https://example.com/
 ```
 
 The URL is optional and defaults to `https://example.com/`.
+Enable the experimental script runtime with `--features javascript`:
+
+```bash
+cargo run --release --features javascript -- https://example.com/
+```
+
+This runtime supports a subset of browser JavaScript APIs; compatibility with
+general websites is still limited.
 
 ## Build for Scarlet OS
 
@@ -35,6 +44,9 @@ nix develop
 cargo build --release --target aarch64-unknown-scarlet
 cargo build --release --target riscv64gc-unknown-scarlet
 ```
+
+Add `--features javascript` to either Scarlet build command to include the
+script runtime.
 
 The Scarlet Rust toolchain input may temporarily lag compiler changes required
 by Myrica's dependencies. Desktop development remains available with an

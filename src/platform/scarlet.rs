@@ -28,5 +28,21 @@ fn scarlet_getrandom(destination: &mut [u8]) -> Result<(), getrandom::Error> {
     Ok(())
 }
 
+#[cfg(feature = "javascript")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    destination: *mut u8,
+    length: usize,
+) -> Result<(), getrandom_v04::Error> {
+    if length == 0 {
+        return Ok(());
+    }
+    // SAFETY: getrandom provides a writable buffer of `length` bytes. Initialize
+    // it before creating a slice, including when the native syscall fails.
+    unsafe { std::ptr::write_bytes(destination, 0, length) };
+    let destination = unsafe { std::slice::from_raw_parts_mut(destination, length) };
+    scarlet_getrandom(destination).map_err(|_| getrandom_v04::Error::UNEXPECTED)
+}
+
 // Keep the Scarlet process/runtime crate linked even though ScarletUI owns main-loop setup.
 use scarlet_os as _;

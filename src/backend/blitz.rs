@@ -1,13 +1,21 @@
 //! Blitz implementation of Myrica's browser-engine boundary.
 
+use std::collections::HashMap;
+#[cfg(feature = "javascript")]
+use std::collections::HashSet;
 use std::sync::Arc;
+#[cfg(feature = "javascript")]
+use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::task::{Context, Wake, Waker};
 use std::time::Instant;
 
 use anyrender::{ImageRenderer as _, PaintScene as _};
 use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{Document as _, DocumentConfig, FontContext, util::Color as BlitzColor};
-use blitz_html::{HtmlDocument, HtmlProvider};
+use blitz_dom::{Document, DocumentConfig, FontContext, util::Color as BlitzColor};
+#[cfg(not(feature = "javascript"))]
+use blitz_html::HtmlDocument;
+use blitz_html::HtmlProvider;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
     BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, KeyState,
@@ -16,6 +24,8 @@ use blitz_traits::events::{
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::net::{AbortController, AbortSignal, Request, Url};
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+#[cfg(feature = "javascript")]
+use blitz_vibey_script::{DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher};
 use keyboard_types::{Code, Key, Location, Modifiers};
 use peniko::{Fill, kurbo::Rect};
 
@@ -73,6 +83,52 @@ enum BackendMessage {
         history_action: HistoryAction,
         result: Result<FetchResponse, String>,
     },
+    #[cfg(feature = "javascript")]
+    ScriptsLoaded {
+        generation: u64,
+        requested_url: String,
+        history_action: HistoryAction,
+        response: FetchResponse,
+        sources: HashMap<String, String>,
+    },
+}
+
+#[cfg(feature = "javascript")]
+struct PendingScripts {
+    generation: u64,
+    requested_url: String,
+    history_action: HistoryAction,
+    response: Option<FetchResponse>,
+    remaining: usize,
+    sources: HashMap<String, String>,
+}
+
+#[cfg(feature = "javascript")]
+struct PrefetchedScriptFetcher {
+    sources: HashMap<String, String>,
+}
+
+#[cfg(feature = "javascript")]
+impl ScriptFetcher for PrefetchedScriptFetcher {
+    fn fetch(&self, url: &Url) -> Result<String, FetchError> {
+        self.sources
+            .get(url.as_str())
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| DefaultScriptFetcher.fetch(url))
+    }
+}
+
+struct BackendWaker(WakeCallback);
+
+impl Wake for BackendWaker {
+    fn wake(self: Arc<Self>) {
+        (self.0)();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        (self.0)();
+    }
 }
 
 struct NavigationSink {
@@ -111,7 +167,8 @@ pub struct BlitzBackend {
     navigation_provider: Arc<dyn NavigationProvider>,
     shell_provider: Arc<dyn ShellProvider>,
     font_context: FontContext,
-    document: Option<HtmlDocument>,
+    document: Option<Box<dyn Document>>,
+    waker: Waker,
     renderer: Option<VelloCpuImageRenderer>,
     rgba: Vec<u8>,
     renderer_size: (u32, u32),
@@ -138,6 +195,7 @@ impl BlitzBackend {
         });
 
         let mut backend = Self {
+            waker: Waker::from(Arc::new(BackendWaker(Arc::clone(&wake)))),
             wake,
             network,
             message_sender,
@@ -164,7 +222,7 @@ impl BlitzBackend {
             started_at: Instant::now(),
             mouse_buttons: MouseEventButtons::None,
         };
-        backend.document = Some(backend.build_document(WELCOME_HTML, None, None));
+        backend.document = Some(backend.build_document(WELCOME_HTML, None, None, HashMap::new()));
         Ok(backend)
     }
 
@@ -173,26 +231,39 @@ impl BlitzBackend {
         html: &str,
         base_url: Option<String>,
         abort_signal: Option<AbortSignal>,
-    ) -> HtmlDocument {
-        HtmlDocument::from_html(
-            html,
-            DocumentConfig {
-                viewport: Some(Viewport::new(
-                    DEFAULT_WIDTH,
-                    DEFAULT_HEIGHT,
-                    1.0,
-                    ColorScheme::Light,
-                )),
-                base_url,
-                net_provider: Some(Arc::new(self.network.clone())),
-                navigation_provider: Some(Arc::clone(&self.navigation_provider)),
-                shell_provider: Some(Arc::clone(&self.shell_provider)),
-                html_parser_provider: Some(Arc::new(HtmlProvider)),
-                font_ctx: Some(self.font_context.clone()),
-                abort_signal,
-                ..Default::default()
-            },
-        )
+        sources: HashMap<String, String>,
+    ) -> Box<dyn Document> {
+        let config = DocumentConfig {
+            viewport: Some(Viewport::new(
+                DEFAULT_WIDTH,
+                DEFAULT_HEIGHT,
+                1.0,
+                ColorScheme::Light,
+            )),
+            base_url,
+            net_provider: Some(Arc::new(self.network.clone())),
+            navigation_provider: Some(Arc::clone(&self.navigation_provider)),
+            shell_provider: Some(Arc::clone(&self.shell_provider)),
+            html_parser_provider: Some(Arc::new(HtmlProvider)),
+            font_ctx: Some(self.font_context.clone()),
+            abort_signal,
+            ..Default::default()
+        };
+        #[cfg(feature = "javascript")]
+        {
+            let mut document = ScriptDocument::from_html(html, config)
+                .with_fetcher(PrefetchedScriptFetcher { sources });
+            document.execute_scripts();
+            for error in document.take_js_errors() {
+                eprintln!("[myrica:javascript] {error}");
+            }
+            Box::new(document)
+        }
+        #[cfg(not(feature = "javascript"))]
+        {
+            let _ = sources;
+            Box::new(HtmlDocument::from_html(html, config))
+        }
     }
 
     fn start_request(&mut self, mut request: Request, history_action: HistoryAction) {
@@ -232,12 +303,105 @@ impl BlitzBackend {
         );
     }
 
+    #[cfg(feature = "javascript")]
+    fn prefetch_scripts(
+        &mut self,
+        generation: u64,
+        requested_url: String,
+        history_action: HistoryAction,
+        response: FetchResponse,
+    ) -> bool {
+        if generation != self.load_generation {
+            return false;
+        }
+
+        let html = String::from_utf8_lossy(&response.body);
+        let probe = ScriptDocument::from_html(
+            &html,
+            DocumentConfig {
+                base_url: Some(response.final_url.clone()),
+                ..Default::default()
+            },
+        );
+        let mut seen = HashSet::new();
+        let urls: Vec<_> = probe
+            .external_script_urls()
+            .into_iter()
+            .filter(|url| matches!(url.scheme(), "http" | "https"))
+            .filter(|url| seen.insert(url.to_string()))
+            .collect();
+        if urls.is_empty() {
+            return self.apply_root_response(
+                generation,
+                requested_url,
+                history_action,
+                Ok(response),
+                HashMap::new(),
+            );
+        }
+
+        let pending = Arc::new(Mutex::new(PendingScripts {
+            generation,
+            requested_url,
+            history_action,
+            response: Some(response),
+            remaining: urls.len(),
+            sources: HashMap::new(),
+        }));
+        for url in urls {
+            let requested_script = url.to_string();
+            let mut request = Request::get(url);
+            request.signal = self.current_abort.as_ref().map(|c| c.signal.clone());
+            let pending = Arc::clone(&pending);
+            let sender = self.message_sender.clone();
+            let wake = Arc::clone(&self.wake);
+            self.network.submit(
+                request,
+                Box::new(move |result| {
+                    let mut batch = pending.lock().expect("script batch lock poisoned");
+                    match result {
+                        Ok(response) if (200..400).contains(&response.status) => {
+                            batch.sources.insert(
+                                requested_script,
+                                String::from_utf8_lossy(&response.body).into_owned(),
+                            );
+                        }
+                        Ok(response) => eprintln!(
+                            "[myrica:javascript] script {} returned HTTP {}",
+                            requested_script, response.status
+                        ),
+                        Err(error) => eprintln!(
+                            "[myrica:javascript] failed to load script {}: {}",
+                            requested_script, error
+                        ),
+                    }
+                    batch.remaining -= 1;
+                    if batch.remaining == 0 {
+                        let message = BackendMessage::ScriptsLoaded {
+                            generation: batch.generation,
+                            requested_url: std::mem::take(&mut batch.requested_url),
+                            history_action: batch.history_action,
+                            response: batch.response.take().expect("batch response exists"),
+                            sources: std::mem::take(&mut batch.sources),
+                        };
+                        drop(batch);
+                        if sender.send(message).is_ok() {
+                            wake();
+                        }
+                    }
+                }),
+            );
+        }
+        false
+    }
+
     fn apply_root_response(
         &mut self,
         generation: u64,
         requested_url: String,
         history_action: HistoryAction,
         result: Result<FetchResponse, String>,
+        sources: HashMap<String, String>,
     ) -> bool {
         if generation != self.load_generation {
             return false;
@@ -252,9 +416,10 @@ impl BlitzBackend {
                     .as_ref()
                     .map(|controller| controller.signal.clone());
                 let mut document =
-                    self.build_document(&html, Some(resolved_url.clone()), abort_signal);
-                document.resolve(self.animation_time());
+                    self.build_document(&html, Some(resolved_url.clone()), abort_signal, sources);
+                document.inner_mut().resolve(self.animation_time());
                 let title = document
+                    .inner()
                     .find_title_node()
                     .map(|node| node.text_content())
                     .filter(|title| !title.trim().is_empty())
@@ -290,7 +455,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
             escape_html(url),
             escape_html(error),
         );
-        self.document = Some(self.build_document(&html, None, None));
+        self.document = Some(self.build_document(&html, None, None, HashMap::new()));
         self.snapshot.url = url.to_owned();
         self.snapshot.title = String::from("Could not load page");
         self.snapshot.load_state = LoadState::Failed(error.to_owned());
@@ -354,12 +519,13 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
         } else {
             1.0
         };
-        if document.viewport().window_size != (width, height)
-            || (document.viewport().hidpi_scale - scale).abs() > f32::EPSILON
+        let mut inner = document.inner_mut();
+        if inner.viewport().window_size != (width, height)
+            || (inner.viewport().hidpi_scale - scale).abs() > f32::EPSILON
         {
-            document.set_viewport(Viewport::new(width, height, scale, ColorScheme::Light));
+            inner.set_viewport(Viewport::new(width, height, scale, ColorScheme::Light));
         }
-        document.resolve(animation_time);
+        inner.resolve(animation_time);
 
         if self.renderer.is_none() {
             self.renderer = Some(VelloCpuImageRenderer::new(width, height));
@@ -382,7 +548,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
                     Default::default(),
                     &Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
                 );
-                paint_scene(scene, document, f64::from(scale), width, height, 0, 0);
+                paint_scene(scene, &mut inner, f64::from(scale), width, height, 0, 0);
             },
             &mut self.rgba,
         );
@@ -395,7 +561,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
             destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
         }
 
-        if document.is_animating() {
+        if inner.is_animating() {
             (self.wake)();
         }
     }
@@ -405,7 +571,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
             .document
             .as_ref()
             .map(|document| {
-                let scroll = document.viewport_scroll();
+                let scroll = document.inner().viewport_scroll();
                 (scroll.x, scroll.y)
             })
             .unwrap_or((0.0, 0.0));
@@ -430,7 +596,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
     }
 
     fn dispatch_key(
-        document: &mut HtmlDocument,
+        document: &mut dyn Document,
         key: BrowserKey,
         pressed: bool,
         modifiers: BrowserModifiers,
@@ -465,7 +631,8 @@ impl BrowserBackend for BlitzBackend {
             if let Some(controller) = self.current_abort.take() {
                 controller.abort();
             }
-            self.document = Some(self.build_document(WELCOME_HTML, None, None));
+            self.load_generation = self.load_generation.wrapping_add(1);
+            self.document = Some(self.build_document(WELCOME_HTML, None, None, HashMap::new()));
             self.snapshot.url = String::from("about:myrica");
             self.snapshot.title = String::from("Myrica");
             self.snapshot.load_state = LoadState::Ready;
@@ -528,8 +695,73 @@ impl BrowserBackend for BlitzBackend {
                     history_action,
                     result,
                 } => {
-                    changed |=
-                        self.apply_root_response(generation, requested_url, history_action, result);
+                    #[cfg(feature = "javascript")]
+                    {
+                        changed |= match result {
+                            Ok(response) => self.prefetch_scripts(
+                                generation,
+                                requested_url,
+                                history_action,
+                                response,
+                            ),
+                            Err(error) => self.apply_root_response(
+                                generation,
+                                requested_url,
+                                history_action,
+                                Err(error),
+                                HashMap::new(),
+                            ),
+                        };
+                        continue;
+                    }
+                    #[cfg(not(feature = "javascript"))]
+                    {
+                        changed |= self.apply_root_response(
+                            generation,
+                            requested_url,
+                            history_action,
+                            result,
+                            HashMap::new(),
+                        );
+                    }
+                }
+                #[cfg(feature = "javascript")]
+                BackendMessage::ScriptsLoaded {
+                    generation,
+                    requested_url,
+                    history_action,
+                    response,
+                    sources,
+                } => {
+                    changed |= self.apply_root_response(
+                        generation,
+                        requested_url,
+                        history_action,
+                        Ok(response),
+                        sources,
+                    );
+                }
+            }
+        }
+        if let Some(document) = self.document.as_mut() {
+            changed |= document.poll(Some(Context::from_waker(&self.waker)));
+            let title = document
+                .inner()
+                .find_title_node()
+                .map(|node| node.text_content())
+                .filter(|title| !title.trim().is_empty());
+            if let Some(title) = title {
+                if self.snapshot.title != title {
+                    self.snapshot.title = title;
+                    changed = true;
+                }
+            }
+            #[cfg(feature = "javascript")]
+            if let Some(script) =
+                (document.as_mut() as &mut dyn std::any::Any).downcast_mut::<ScriptDocument>()
+            {
+                for error in script.take_js_errors() {
+                    eprintln!("[myrica:javascript] {error}");
                 }
             }
         }
@@ -559,6 +791,7 @@ impl BrowserBackend for BlitzBackend {
                 self.document
                     .as_mut()
                     .expect("document existence was checked")
+                    .inner_mut()
                     .clear_hover();
             }
             BrowserInput::PointerButton {
@@ -608,7 +841,8 @@ impl BrowserBackend for BlitzBackend {
             } => Self::dispatch_key(
                 self.document
                     .as_mut()
-                    .expect("document existence was checked"),
+                    .expect("document existence was checked")
+                    .as_mut(),
                 key,
                 pressed,
                 modifiers,
@@ -619,7 +853,8 @@ impl BrowserBackend for BlitzBackend {
                 Self::dispatch_key(
                     self.document
                         .as_mut()
-                        .expect("document existence was checked"),
+                        .expect("document existence was checked")
+                        .as_mut(),
                     BrowserKey::Character(character),
                     true,
                     BrowserModifiers::default(),
@@ -628,7 +863,8 @@ impl BrowserBackend for BlitzBackend {
                 Self::dispatch_key(
                     self.document
                         .as_mut()
-                        .expect("document existence was checked"),
+                        .expect("document existence was checked")
+                        .as_mut(),
                     BrowserKey::Character(character),
                     false,
                     BrowserModifiers::default(),
@@ -739,6 +975,7 @@ fn map_key(key: BrowserKey) -> (Key, Code) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -785,7 +1022,7 @@ mod tests {
 </body></html>"#;
 
         let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
-        backend.document = Some(backend.build_document(IMAGE_HTML, None, None));
+        backend.document = Some(backend.build_document(IMAGE_HTML, None, None, HashMap::new()));
         let mut buffer = vec![0_u8; 320 * 240 * 4];
         let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -803,5 +1040,108 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn inline_script_changes_the_document() {
+        let backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        let document = backend.build_document(
+            r#"<html><head><title>before</title></head><body>
+            <script>document.querySelector('title').textContent = 'after';</script>
+            </body></html>"#,
+            None,
+            None,
+            HashMap::new(),
+        );
+        assert_eq!(
+            document.inner().find_title_node().unwrap().text_content(),
+            "after"
+        );
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn javascript_timer_updates_the_browser_title() {
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.document = Some(backend.build_document(
+            r#"<html><head><title>waiting</title></head><body>
+            <script>
+              setTimeout(() => { document.querySelector('title').textContent = 'timer-ready'; }, 10);
+            </script></body></html>"#,
+            None,
+            None,
+            HashMap::new(),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            backend.tick();
+            if backend.snapshot().title == "timer-ready" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "JavaScript timer never ran");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn external_script_is_prefetched_before_execution() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        use super::LoadState;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while served < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let body = if request.starts_with("GET /change.js ") {
+                    "document.querySelector('title').textContent = 'external-ready';"
+                } else {
+                    r#"<html><head><title>waiting</title></head><body>
+                    <script src="/change.js"></script></body></html>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                served += 1;
+            }
+            assert_eq!(served, 2, "browser did not request both page and script");
+        });
+
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.navigate(&format!("http://{address}/page")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            backend.tick();
+            let snapshot = backend.snapshot();
+            if matches!(snapshot.load_state, LoadState::Ready) {
+                assert_eq!(snapshot.title, "external-ready");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out loading JavaScript page"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
     }
 }
