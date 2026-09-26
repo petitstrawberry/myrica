@@ -3,6 +3,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use scarlet_ui::SgfxCanvasFrame;
+
 #[cfg(feature = "backend-blitz")]
 mod blitz;
 
@@ -162,8 +164,8 @@ pub trait BrowserBackend {
     /// Returns `true` when externally visible state changed.
     fn tick(&mut self) -> bool;
 
-    /// Paint the current web view into a BGRA framebuffer.
-    fn render(&mut self, buffer: &mut [u8], width: u32, height: u32, scale: f32);
+    /// Build a retained SGFX frame for the current web view.
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> Arc<SgfxCanvasFrame>;
 
     /// Deliver input localized to the web view.
     ///

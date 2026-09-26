@@ -10,9 +10,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::task::{Context, Wake, Waker};
 use std::time::Instant;
 
-use anyrender::{ImageRenderer as _, PaintScene as _};
-use anyrender_vello_cpu::VelloCpuImageRenderer;
-use blitz_dom::{Document, DocumentConfig, FontContext, util::Color as BlitzColor};
+use blitz_dom::{Document, DocumentConfig, FontContext};
 #[cfg(not(feature = "javascript"))]
 use blitz_html::HtmlDocument;
 use blitz_html::HtmlProvider;
@@ -29,13 +27,13 @@ use blitz_vibey_script::{
     DefaultScriptFetcher, FetchError, ScriptDocument, ScriptFetcher, module_specifiers,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
-use peniko::{Fill, kurbo::Rect};
 
 use super::{
     BackendError, BrowserBackend, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
     BrowserSnapshot, LoadState, WakeCallback,
 };
 use crate::network::{FetchResponse, NetworkService};
+use crate::sgfx_scene::SgfxSceneRenderer;
 
 mod fonts;
 
@@ -252,7 +250,7 @@ impl ShellProvider for RedrawSink {
     }
 }
 
-/// CPU-rendered Blitz backend used for browser bring-up.
+/// Blitz backend rendered as retained SGFX geometry.
 pub struct BlitzBackend {
     wake: WakeCallback,
     network: NetworkService,
@@ -263,9 +261,7 @@ pub struct BlitzBackend {
     font_context: FontContext,
     document: Option<Box<dyn Document>>,
     waker: Waker,
-    renderer: Option<VelloCpuImageRenderer>,
-    rgba: Vec<u8>,
-    renderer_size: (u32, u32),
+    renderer: SgfxSceneRenderer,
     snapshot: BrowserSnapshot,
     history: Vec<String>,
     history_index: Option<usize>,
@@ -298,9 +294,7 @@ impl BlitzBackend {
             shell_provider,
             font_context: fonts::load_font_context(),
             document: None,
-            renderer: None,
-            rgba: Vec::new(),
-            renderer_size: (0, 0),
+            renderer: SgfxSceneRenderer::new(),
             snapshot: BrowserSnapshot {
                 backend_name: BACKEND_NAME,
                 url: String::from("about:myrica"),
@@ -570,16 +564,15 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
         self.started_at.elapsed().as_secs_f64()
     }
 
-    fn render_document(&mut self, buffer: &mut [u8], width: u32, height: u32, scale: f32) {
-        let expected_len = width as usize * height as usize * 4;
-        if width == 0 || height == 0 || buffer.len() < expected_len {
-            return;
-        }
-
+    fn render_document(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Arc<scarlet_ui::SgfxCanvasFrame> {
         let animation_time = self.animation_time();
         let Some(document) = self.document.as_mut() else {
-            fill_bgra(buffer, [242, 240, 237, 255]);
-            return;
+            return self.renderer.empty_frame(width, height);
         };
 
         let scale = if scale.is_finite() && scale > 0.0 {
@@ -595,43 +588,22 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
         }
         inner.resolve(animation_time);
 
-        if self.renderer.is_none() {
-            self.renderer = Some(VelloCpuImageRenderer::new(width, height));
-            self.renderer_size = (width, height);
-        }
-        let renderer = self.renderer.as_mut().expect("renderer was initialized");
-        if self.renderer_size != (width, height) {
-            renderer.resize(width, height);
-            self.renderer_size = (width, height);
-        }
-        renderer.reset();
-        self.rgba.resize(expected_len, 0);
-
-        renderer.render(
-            |scene| {
-                scene.fill(
-                    Fill::NonZero,
-                    Default::default(),
-                    BlitzColor::WHITE,
-                    Default::default(),
-                    &Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
-                );
-                paint_scene(scene, &mut inner, f64::from(scale), width, height, 0, 0);
-            },
-            &mut self.rgba,
+        self.renderer.begin_frame(width, height);
+        paint_scene(
+            &mut self.renderer,
+            &mut inner,
+            f64::from(scale),
+            width,
+            height,
+            0,
+            0,
         );
-
-        for (source, destination) in self
-            .rgba
-            .chunks_exact(4)
-            .zip(buffer[..expected_len].chunks_exact_mut(4))
-        {
-            destination.copy_from_slice(&[source[2], source[1], source[0], source[3]]);
-        }
+        let frame = self.renderer.finish_frame();
 
         if inner.is_animating() {
             (self.wake)();
         }
+        frame
     }
 
     fn pointer_event(&self, x: f32, y: f32, button: MouseEventButton) -> BlitzPointerEvent {
@@ -836,9 +808,9 @@ impl BrowserBackend for BlitzBackend {
         changed
     }
 
-    fn render(&mut self, buffer: &mut [u8], width: u32, height: u32, scale: f32) {
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> Arc<scarlet_ui::SgfxCanvasFrame> {
         self.tick();
-        self.render_document(buffer, width, height, scale);
+        self.render_document(width, height, scale)
     }
 
     fn handle_input(&mut self, input: BrowserInput) -> bool {
@@ -977,12 +949,6 @@ fn normalize_location(location: &str) -> Result<Url, BackendError> {
     Ok(url)
 }
 
-fn fill_bgra(buffer: &mut [u8], color: [u8; 4]) {
-    for pixel in buffer.chunks_exact_mut(4) {
-        pixel.copy_from_slice(&color);
-    }
-}
-
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1072,14 +1038,11 @@ mod tests {
     }
 
     #[test]
-    fn welcome_page_renders_an_opaque_non_uniform_frame() {
+    fn welcome_page_builds_sgfx_draws() {
         let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
-        let mut buffer = vec![0_u8; 320 * 240 * 4];
-        backend.render(&mut buffer, 320, 240, 1.0);
+        let frame = backend.render(320, 240, 1.0);
 
-        assert!(buffer.chunks_exact(4).all(|pixel| pixel[3] == 255));
-        let first = &buffer[..4];
-        assert!(buffer.chunks_exact(4).any(|pixel| pixel != first));
+        assert!(frame.draw_count() > 0);
     }
 
     #[test]
@@ -1091,15 +1054,11 @@ mod tests {
 
         let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
         backend.document = Some(backend.build_document(IMAGE_HTML, None, None, HashMap::new()));
-        let mut buffer = vec![0_u8; 320 * 240 * 4];
         let deadline = Instant::now() + Duration::from_secs(5);
 
         loop {
-            backend.render(&mut buffer, 320, 240, 1.0);
-            let has_green = buffer
-                .chunks_exact(4)
-                .any(|pixel| pixel[1] > 100 && pixel[1] > pixel[0] && pixel[1] > pixel[2]);
-            if has_green {
+            backend.render(320, 240, 1.0);
+            if backend.renderer.texture_count() > 0 {
                 break;
             }
             assert!(

@@ -132,23 +132,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyrender_vello_cpu"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fb392bf738b1e50c50fc82824ff3f875f15632717ba732fe68e2fe6e1011e6c"
-dependencies = [
- "anyrender",
- "bytemuck",
- "color",
- "debug_timer 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "glifo",
- "kurbo 0.13.1",
- "peniko",
- "vello_common",
- "vello_cpu",
-]
-
-[[package]]
 name = "app_units"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -269,7 +252,7 @@ dependencies = [
  "color",
  "cssparser",
  "cursor-icon",
- "debug_timer 0.1.3 (git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013)",
+ "debug_timer",
  "euclid",
  "html-escape",
  "image",
@@ -708,9 +691,6 @@ name = "color"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ec7c5eb7a16992b1904d76c517d170ab353b0e0b3d5a0c81a8a0cd1037893cf"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "color_quant"
@@ -941,12 +921,6 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da220af51a1a335e9a930beaaef53d261e41ea9eecfb3d973a3ddae1a7284b9c"
-
-[[package]]
-name = "debug_timer"
-version = "0.1.3"
 source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
 
 [[package]]
@@ -1162,7 +1136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1217,12 +1191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fearless_simd"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1254,6 +1222,12 @@ dependencies = [
  "cfg-if",
  "rustc_version",
 ]
+
+[[package]]
+name = "float_next_after"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fnv"
@@ -1524,22 +1498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glifo"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed4a1bb24121291d27230c1b1b44e07d6a9b28cefdb32fe1581dfb84e14f940a"
-dependencies = [
- "bytemuck",
- "foldhash 0.2.0",
- "hashbrown 0.17.1",
- "log",
- "peniko",
- "skrifa",
- "smallvec",
- "vello_common",
-]
-
-[[package]]
 name = "glow"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1618,15 +1576,6 @@ source = "git+https://github.com/petitstrawberry/Scarlet?rev=b3d2a55740a3d2ca49d
 dependencies = [
  "scarlet-abi",
  "scarlet-os",
-]
-
-[[package]]
-name = "guillotiere"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b17e70c989c36bad147b27a58d148c0741c51448aa5653436547323e524d0ab"
-dependencies = [
- "euclid",
 ]
 
 [[package]]
@@ -2281,6 +2230,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lyon_geom"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4336502e29e32af93cf2dad2214ed6003c17ceb5bd499df77b1de663b9042b92"
+dependencies = [
+ "arrayvec",
+ "euclid",
+ "num-traits",
+]
+
+[[package]]
+name = "lyon_path"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e"
+dependencies = [
+ "lyon_geom",
+ "num-traits",
+]
+
+[[package]]
+name = "lyon_tessellation"
+version = "1.0.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43b8dcf906637ecef61b3c0740c7a4e7f27caeb31257cfac0cc579ce15be6005"
+dependencies = [
+ "float_next_after",
+ "lyon_path",
+ "num-traits",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2407,7 +2388,6 @@ name = "myrica"
 version = "0.1.0"
 dependencies = [
  "anyrender",
- "anyrender_vello_cpu",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",
@@ -2418,12 +2398,15 @@ dependencies = [
  "getrandom 0.4.3",
  "image",
  "keyboard-types",
+ "lyon_path",
+ "lyon_tessellation",
  "parley",
  "peniko",
  "reqwest",
  "scarlet-os",
  "scarlet-sys",
  "scarlet-ui",
+ "skrifa",
  "tokio",
 ]
 
@@ -2539,6 +2522,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -3002,7 +2986,6 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "839c8299360d2e998bdb106dc0a6cd71dcc5f4df51df1b620361bf50e283cca6"
 dependencies = [
- "bytemuck",
  "color",
  "kurbo 0.13.1",
  "linebender_resource_handle",
@@ -3333,7 +3316,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3574,7 +3557,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3656,7 +3639,7 @@ dependencies = [
 [[package]]
 name = "scarlet-scroll-motion"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "libm",
 ]
@@ -3672,7 +3655,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-platform-sws",
@@ -3682,7 +3665,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.1",
@@ -3700,7 +3683,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-icons-tabler"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "svgtypes",
 ]
@@ -3708,7 +3691,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-macros"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3718,7 +3701,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-sws"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-renderer-sgfx",
@@ -3730,7 +3713,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-winit"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "objc2-app-kit",
  "objc2-quartz-core 0.2.2",
@@ -3745,7 +3728,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-renderer-sgfx"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=e6e00f11c95de371057899ec05b7a832d04adc7f#e6e00f11c95de371057899ec05b7a832d04adc7f"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=48e74748598bcc99fffd1837981065342f884aaf#48e74748598bcc99fffd1837981065342f884aaf"
 dependencies = [
  "libm",
  "scarlet-ui-core",
@@ -4939,34 +4922,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
-name = "vello_common"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2e9aed918117e8152c9eddfd8362d73c465c23f26c44786aa331707b8a64fa2"
-dependencies = [
- "bytemuck",
- "fearless_simd",
- "guillotiere",
- "log",
- "peniko",
- "png",
- "smallvec",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "vello_cpu"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac7349e1f55f6b801c7c277958df4ea53e7f20f21e8014910ad888b2ecda93ea"
-dependencies = [
- "bytemuck",
- "glifo",
- "hashbrown 0.17.1",
- "vello_common",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5339,7 +5294,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

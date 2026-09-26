@@ -8,6 +8,8 @@ mod backend;
 #[cfg(feature = "backend-blitz")]
 mod network;
 mod platform;
+#[cfg(feature = "backend-blitz")]
+mod sgfx_scene;
 
 use std::process::ExitCode;
 

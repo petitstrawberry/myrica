@@ -1,14 +1,16 @@
 //! ScarletUI application shell for Myrica.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use scarlet_ui::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
 use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
-    Application, ComponentElement, Element, Listenable, Size, View, Window, generate_state_id,
+    Application, ComponentElement, Element, Listenable, SgfxCanvas, SgfxCanvasFrame,
+    SgfxCanvasHandle, Size, View, Window, WindowContext, generate_state_id,
 };
 use scarlet_ui::{hstack, vstack};
 
@@ -19,6 +21,8 @@ use crate::backend::{
 
 const WINDOW_WIDTH: f32 = 1_100.0;
 const WINDOW_HEIGHT: f32 = 760.0;
+const BROWSER_CHROME_HEIGHT: f32 = 86.0;
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 /// Myrica's browser chrome and selected embedded engine.
 #[derive(Clone)]
@@ -27,6 +31,11 @@ pub struct MyricaApp {
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
     repaint_revision: State<u64>,
+    rendered_revision: Rc<Cell<u64>>,
+    last_rendered_at: Rc<Cell<Instant>>,
+    canvas_handle: SgfxCanvasHandle,
+    canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    webview_size: State<Size>,
     webview_focused: State<bool>,
     last_backend_url: Rc<RefCell<String>>,
 }
@@ -46,12 +55,21 @@ impl MyricaApp {
         }
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
+        let webview_size = Size::new(WINDOW_WIDTH, WINDOW_HEIGHT - BROWSER_CHROME_HEIGHT);
+        let initial_frame =
+            backend.render(webview_size.width as u32, webview_size.height as u32, 1.0);
+        let initial_revision = repaint_revision.get();
 
         Ok(Self {
             backend: Rc::new(RefCell::new(backend)),
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
             repaint_revision,
+            rendered_revision: Rc::new(Cell::new(initial_revision)),
+            last_rendered_at: Rc::new(Cell::new(Instant::now())),
+            canvas_handle: SgfxCanvasHandle::new(),
+            canvas_frame: State::new(generate_state_id(), initial_frame),
+            webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
         })
@@ -94,17 +112,13 @@ impl MyricaApp {
         )
         .height(56.0);
 
-        let render_backend = Rc::clone(&self.backend);
         let event_backend = Rc::clone(&self.backend);
-        let canvas = CanvasView::new(
-            960.0,
-            640.0,
-            Rc::new(move |buffer, width, height| {
-                let scale = graphics::current_scale_milli().max(1) as f32 / 1_000.0;
-                render_backend
-                    .borrow_mut()
-                    .render(buffer, width, height, scale);
-            }),
+        let webview_size = self.webview_size.get();
+        let canvas = SgfxCanvas::from_state(
+            self.canvas_handle,
+            webview_size.width,
+            webview_size.height,
+            self.canvas_frame.clone(),
         )
         .on_event(move |event| dispatch_webview_event(&event_backend, event))
         .focusable(self.webview_focused.clone())
@@ -128,7 +142,7 @@ impl MyricaApp {
     }
 
     fn synchronize_backend_state(&self) {
-        self.backend.borrow_mut().tick();
+        let backend_changed = self.backend.borrow_mut().tick();
         let latest = self.backend.borrow().snapshot();
         if latest != self.snapshot.get() {
             self.snapshot.set(latest.clone());
@@ -138,6 +152,20 @@ impl MyricaApp {
         if latest.url != *last_url {
             self.address.set(latest.url.clone());
             *last_url = latest.url;
+        }
+
+        let requested_revision = self.repaint_revision.get();
+        let animation_frame_due = requested_revision != self.rendered_revision.get()
+            && self.last_rendered_at.get().elapsed() >= ANIMATION_FRAME_INTERVAL;
+        if backend_changed || animation_frame_due {
+            let size = self.webview_size.get();
+            let scale = graphics::current_scale_milli().max(1) as f32 / 1_000.0;
+            let width = (size.width.max(1.0) * scale).ceil() as u32;
+            let height = (size.height.max(1.0) * scale).ceil() as u32;
+            let frame = self.backend.borrow_mut().render(width, height, scale);
+            self.canvas_frame.set(frame);
+            self.rendered_revision.set(requested_revision);
+            self.last_rendered_at.set(Instant::now());
         }
     }
 }
@@ -152,6 +180,8 @@ impl View for MyricaApp {
             &self.address,
             &self.snapshot,
             &self.repaint_revision,
+            &self.canvas_frame,
+            &self.webview_size,
             &self.webview_focused,
         ]
     }
@@ -176,6 +206,15 @@ impl Application for MyricaApp {
 
     fn on_idle(&mut self) {
         self.synchronize_backend_state();
+    }
+
+    fn on_window_resize(&mut self, _ctx: &WindowContext, width: u32, height: u32) {
+        self.webview_size.set(Size::new(
+            width.max(1) as f32,
+            (height as f32 - BROWSER_CHROME_HEIGHT).max(1.0),
+        ));
+        self.repaint_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
     }
 
     fn debug_logging(&self) -> bool {
