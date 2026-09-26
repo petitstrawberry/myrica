@@ -243,7 +243,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -284,7 +284,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -295,7 +295,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "anyrender",
  "blitz-dom",
@@ -314,7 +314,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.1",
@@ -330,7 +330,7 @@ dependencies = [
 [[package]]
 name = "blitz-vibey-script"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "blitz-dom",
  "blitz-html",
@@ -921,7 +921,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 
 [[package]]
 name = "deranged"
@@ -4334,7 +4334,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=b394a18b0a07d2c230f4de95c7aa20cd78cc2013#b394a18b0a07d2c230f4de95c7aa20cd78cc2013"
+source = "git+https://github.com/petitstrawberry/blitz?rev=13946cbbe417ad0f771869a0f6c1e9d9aabb4969#13946cbbe417ad0f771869a0f6c1e9d9aabb4969"
 dependencies = [
  "bitflags 2.13.1",
  "stylo",
