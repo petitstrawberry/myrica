@@ -3,7 +3,12 @@
 use std::fmt;
 use std::sync::Arc;
 
-use scarlet_ui::SgfxCanvasFrame;
+mod frame;
+mod worker;
+
+pub use frame::BrowserFrame;
+pub(crate) use frame::{BrowserDraw, BrowserTexture};
+pub use worker::{BrowserViewport, BrowserWorker};
 
 #[cfg(feature = "backend-blitz")]
 mod blitz;
@@ -40,7 +45,7 @@ impl LoadState {
 }
 
 /// Browser state exposed to chrome without leaking engine-specific types.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BrowserSnapshot {
     /// Human-readable backend name.
     pub backend_name: &'static str,
@@ -54,6 +59,16 @@ pub struct BrowserSnapshot {
     pub can_go_back: bool,
     /// Whether forward navigation is currently available.
     pub can_go_forward: bool,
+    /// IME state of the page's focused editable control, in viewport CSS pixels.
+    pub text_input: Option<BrowserTextInput>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserTextInput {
+    pub cursor_rect: [f32; 4],
+    pub surrounding_text: String,
+    pub cursor_byte: u32,
+    pub anchor_byte: u32,
 }
 
 /// Mouse buttons understood by browser backends.
@@ -124,6 +139,13 @@ pub enum BrowserInput {
         modifiers: BrowserModifiers,
     },
     Text(char),
+    ImePreedit {
+        text: String,
+        cursor: usize,
+        anchor: usize,
+    },
+    ImeCommit(String),
+    FocusLost,
 }
 
 /// Error returned when a browser backend rejects an operation.
@@ -165,7 +187,7 @@ pub trait BrowserBackend {
     fn tick(&mut self) -> bool;
 
     /// Build a retained SGFX frame for the current web view.
-    fn render(&mut self, width: u32, height: u32, scale: f32) -> Arc<SgfxCanvasFrame>;
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame;
 
     /// Deliver input localized to the web view.
     ///

@@ -16,8 +16,9 @@ use blitz_html::HtmlDocument;
 use blitz_html::HtmlProvider;
 use blitz_paint::paint_scene;
 use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, KeyState,
-    MouseEventButton, MouseEventButtons, Point, PointerCoords, PointerDetails, UiEvent,
+    BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
+    BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, Point, PointerCoords,
+    PointerDetails, UiEvent,
 };
 use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
 use blitz_traits::net::{AbortController, AbortSignal, Request, Url};
@@ -29,8 +30,8 @@ use blitz_vibey_script::{
 use keyboard_types::{Code, Key, Location, Modifiers};
 
 use super::{
-    BackendError, BrowserBackend, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
-    BrowserSnapshot, LoadState, WakeCallback,
+    BackendError, BrowserBackend, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers,
+    BrowserMouseButton, BrowserSnapshot, BrowserTextInput, LoadState, WakeCallback,
 };
 use crate::network::{FetchResponse, NetworkService};
 use crate::sgfx_scene::SgfxSceneRenderer;
@@ -162,7 +163,7 @@ fn submit_prefetch_wave(
                     let mut pending = batch.lock().expect("prefetch batch lock poisoned");
                     match result {
                         Ok(response) if (200..400).contains(&response.status) => {
-                            let source = String::from_utf8_lossy(&response.body).into_owned();
+                            let source = response.text().into_owned();
                             pending
                                 .sources
                                 .insert(requested_script.clone(), source.clone());
@@ -269,6 +270,7 @@ pub struct BlitzBackend {
     current_abort: Option<AbortController>,
     started_at: Instant,
     mouse_buttons: MouseEventButtons,
+    key_modifiers: BrowserModifiers,
 }
 
 impl BlitzBackend {
@@ -302,6 +304,7 @@ impl BlitzBackend {
                 load_state: LoadState::Idle,
                 can_go_back: false,
                 can_go_forward: false,
+                text_input: None,
             },
             history: Vec::new(),
             history_index: None,
@@ -309,6 +312,7 @@ impl BlitzBackend {
             current_abort: None,
             started_at: Instant::now(),
             mouse_buttons: MouseEventButtons::None,
+            key_modifiers: BrowserModifiers::default(),
         };
         backend.document = Some(backend.build_document(WELCOME_HTML, None, None, HashMap::new()));
         Ok(backend)
@@ -403,7 +407,7 @@ impl BlitzBackend {
             return false;
         }
 
-        let html = String::from_utf8_lossy(&response.body);
+        let html = response.text();
         let probe = ScriptDocument::from_html(
             &html,
             DocumentConfig {
@@ -471,8 +475,8 @@ impl BlitzBackend {
 
         match result {
             Ok(response) => {
-                let resolved_url = response.final_url;
-                let html = String::from_utf8_lossy(&response.body);
+                let html = response.text();
+                let resolved_url = response.final_url.clone();
                 let abort_signal = self
                     .current_abort
                     .as_ref()
@@ -564,12 +568,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
         self.started_at.elapsed().as_secs_f64()
     }
 
-    fn render_document(
-        &mut self,
-        width: u32,
-        height: u32,
-        scale: f32,
-    ) -> Arc<scarlet_ui::SgfxCanvasFrame> {
+    fn render_document(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
         let animation_time = self.animation_time();
         let Some(document) = self.document.as_mut() else {
             return self.renderer.empty_frame(width, height);
@@ -604,6 +603,48 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
             (self.wake)();
         }
         frame
+    }
+
+    fn text_input_state(&self) -> Option<BrowserTextInput> {
+        let document = self.document.as_ref()?.inner();
+        let node = document.get_node(document.get_focussed_node_id()?)?;
+        let element = node.element_data()?;
+        let input = element.text_input_data()?;
+        let layout = input.editor.try_layout()?;
+        let caret = input.editor.cursor_geometry(1.0)?;
+        let scale = layout.scale();
+        let scroll = document.viewport_scroll();
+        let pos = node.absolute_position(-scroll.x as f32, -scroll.y as f32);
+        let box_layout = node.final_layout();
+        let (scroll_x, scroll_y) = if input.is_multiline {
+            (0.0, input.scroll_offset)
+        } else {
+            (input.scroll_offset, 0.0)
+        };
+        let selection = input.editor.raw_selection();
+        let (surrounding_text, cursor_byte, anchor_byte) = if element
+            .attr(blitz_dom::local_name!("type"))
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+        {
+            (String::new(), 0, 0)
+        } else {
+            ime_surrounding_text(
+                input.editor.raw_text(),
+                selection.focus().index(),
+                selection.anchor().index(),
+            )
+        };
+        Some(BrowserTextInput {
+            cursor_rect: [
+                pos.x + box_layout.content_box_x() + caret.x0 as f32 / scale - scroll_x,
+                pos.y + box_layout.content_box_y() + caret.y0 as f32 / scale - scroll_y,
+                (caret.width() as f32 / scale).max(1.0),
+                (caret.height() as f32 / scale).max(1.0),
+            ],
+            surrounding_text,
+            cursor_byte,
+            anchor_byte,
+        })
     }
 
     fn pointer_event(&self, x: f32, y: f32, button: MouseEventButton) -> BlitzPointerEvent {
@@ -808,7 +849,7 @@ impl BrowserBackend for BlitzBackend {
         changed
     }
 
-    fn render(&mut self, width: u32, height: u32, scale: f32) -> Arc<scarlet_ui::SgfxCanvasFrame> {
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
         self.tick();
         self.render_document(width, height, scale)
     }
@@ -878,17 +919,42 @@ impl BrowserBackend for BlitzBackend {
                 key,
                 pressed,
                 modifiers,
-            } => Self::dispatch_key(
-                self.document
+            } => {
+                self.key_modifiers = modifiers;
+                // ScarletUI sends printable text separately from physical keys.
+                // Inserting on both Key and Text would duplicate every character.
+                if matches!(key, BrowserKey::Character(_) | BrowserKey::Space)
+                    && !modifiers.control
+                    && !modifiers.super_key
+                {
+                    return true;
+                }
+                let document = self
+                    .document
                     .as_mut()
-                    .expect("document existence was checked")
-                    .as_mut(),
-                key,
-                pressed,
-                modifiers,
-                None,
-            ),
+                    .expect("document existence was checked");
+                // Blitz's macOS editor delegates backspace to Cocoa key bindings.
+                #[cfg(target_os = "macos")]
+                if key == BrowserKey::Backspace && pressed {
+                    let command = if modifiers.super_key {
+                        "deleteToBeginningOfLine:"
+                    } else if modifiers.alt {
+                        "deleteWordBackward:"
+                    } else {
+                        "deleteBackward:"
+                    };
+                    document.handle_ui_event(UiEvent::AppleStandardKeybinding(command.into()));
+                    return true;
+                }
+                Self::dispatch_key(document.as_mut(), key, pressed, modifiers, None);
+            }
             BrowserInput::Text(character) => {
+                if self.key_modifiers.control
+                    || self.key_modifiers.super_key
+                    || character.is_control()
+                {
+                    return true;
+                }
                 let text = character.to_string();
                 Self::dispatch_key(
                     self.document
@@ -897,7 +963,7 @@ impl BrowserBackend for BlitzBackend {
                         .as_mut(),
                     BrowserKey::Character(character),
                     true,
-                    BrowserModifiers::default(),
+                    self.key_modifiers,
                     Some(text),
                 );
                 Self::dispatch_key(
@@ -907,17 +973,64 @@ impl BrowserBackend for BlitzBackend {
                         .as_mut(),
                     BrowserKey::Character(character),
                     false,
-                    BrowserModifiers::default(),
+                    self.key_modifiers,
                     None,
                 );
+            }
+            BrowserInput::ImePreedit {
+                text,
+                cursor,
+                anchor,
+            } => {
+                self.document
+                    .as_mut()
+                    .unwrap()
+                    .handle_ui_event(UiEvent::Ime(BlitzImeEvent::Preedit(
+                        text,
+                        Some((cursor, anchor)),
+                    )));
+            }
+            BrowserInput::ImeCommit(text) => {
+                let document = self.document.as_mut().unwrap();
+                // ScarletUI folds the empty preedit preceding a commit into the
+                // commit itself. Blitz expects the composition to be cleared first.
+                document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
+                document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(text)));
+            }
+            BrowserInput::FocusLost => {
+                self.key_modifiers = BrowserModifiers::default();
+                self.document
+                    .as_mut()
+                    .unwrap()
+                    .handle_ui_event(UiEvent::Ime(BlitzImeEvent::Disabled));
             }
         }
         true
     }
 
     fn snapshot(&self) -> BrowserSnapshot {
-        self.snapshot.clone()
+        let mut snapshot = self.snapshot.clone();
+        snapshot.text_input = self.text_input_state();
+        snapshot
     }
+}
+
+fn ime_surrounding_text(text: &str, cursor: usize, anchor: usize) -> (String, u32, u32) {
+    // Keep chrome/IME updates bounded even for a large textarea. Positions in
+    // Parley are UTF-8 boundaries; trim the surrounding window at boundaries too.
+    let mut start = cursor.saturating_sub(2048);
+    let mut end = cursor.saturating_add(2048).min(text.len());
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        text[start..end].to_owned(),
+        (cursor - start) as u32,
+        (anchor.clamp(start, end) - start) as u32,
+    )
 }
 
 fn normalize_location(location: &str) -> Result<Url, BackendError> {
@@ -1038,6 +1151,16 @@ mod tests {
     }
 
     #[test]
+    fn ime_surrounding_text_is_bounded_at_utf8_boundaries() {
+        let text = "日本語".repeat(2000);
+        let (surrounding, cursor, anchor) = super::ime_surrounding_text(&text, 9000, 0);
+        assert!(surrounding.len() <= 4096);
+        assert!(surrounding.is_char_boundary(cursor as usize));
+        assert_eq!(anchor, 0);
+        assert_eq!(&surrounding[cursor as usize..cursor as usize + 9], "日本語");
+    }
+
+    #[test]
     fn welcome_page_builds_sgfx_draws() {
         let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
         let frame = backend.render(320, 240, 1.0);
@@ -1067,6 +1190,129 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn input_backend() -> BlitzBackend {
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.document = Some(backend.build_document(
+            r#"<!doctype html><style>body{margin:0}input,textarea{display:block;width:250px;height:50px;font:20px sans-serif}</style>
+            <input id="single"><textarea id="multi"></textarea>"#,
+            None, None, HashMap::new(),
+        ));
+        backend.render(400, 300, 1.0);
+        backend
+    }
+
+    fn click_input(backend: &mut BlitzBackend, selector: &str) {
+        let (x, y) = {
+            let document = backend.document.as_ref().unwrap().inner();
+            let node = document.query_selector(selector).unwrap().unwrap();
+            let rect = document.get_client_bounding_rect(node).unwrap();
+            ((rect.x + 8.0) as f32, (rect.y + rect.height / 2.0) as f32)
+        };
+        backend.handle_input(super::BrowserInput::PointerMoved { x, y });
+        for pressed in [true, false] {
+            backend.handle_input(super::BrowserInput::PointerButton {
+                button: super::BrowserMouseButton::Primary,
+                pressed,
+                x,
+                y,
+            });
+        }
+    }
+
+    fn press_key(backend: &mut BlitzBackend, key: super::BrowserKey) {
+        for pressed in [true, false] {
+            backend.handle_input(super::BrowserInput::Key {
+                key,
+                pressed,
+                modifiers: super::BrowserModifiers::default(),
+            });
+        }
+    }
+
+    #[test]
+    fn focused_input_accepts_text_once_and_supports_editing() {
+        use super::{BrowserInput, BrowserKey};
+        let mut backend = input_backend();
+        click_input(&mut backend, "#single");
+        assert!(backend.snapshot().text_input.is_some());
+        // Same physical-key + character sequence produced by ScarletUI.
+        for c in ['a', 'b'] {
+            press_key(&mut backend, BrowserKey::Character(c));
+            backend.handle_input(BrowserInput::Text(c));
+        }
+        assert_eq!(
+            backend.snapshot().text_input.unwrap().surrounding_text,
+            "ab"
+        );
+        press_key(&mut backend, BrowserKey::Left);
+        press_key(&mut backend, BrowserKey::Backspace);
+        assert_eq!(backend.snapshot().text_input.unwrap().surrounding_text, "b");
+        press_key(&mut backend, BrowserKey::Delete);
+        assert_eq!(backend.snapshot().text_input.unwrap().surrounding_text, "");
+    }
+
+    #[test]
+    fn space_is_inserted_once_in_single_and_multiline_inputs() {
+        use super::{BrowserInput, BrowserKey, BrowserModifiers};
+        let mut backend = input_backend();
+        for selector in ["#single", "#multi"] {
+            click_input(&mut backend, selector);
+            backend.handle_input(BrowserInput::Text('a'));
+            for _ in 0..2 {
+                backend.handle_input(BrowserInput::Key {
+                    key: BrowserKey::Space,
+                    pressed: true,
+                    modifiers: BrowserModifiers::default(),
+                });
+                backend.handle_input(BrowserInput::Text(' '));
+                backend.handle_input(BrowserInput::Key {
+                    key: BrowserKey::Space,
+                    pressed: false,
+                    modifiers: BrowserModifiers::default(),
+                });
+            }
+            backend.handle_input(BrowserInput::Text('b'));
+            assert_eq!(
+                backend.snapshot().text_input.unwrap().surrounding_text,
+                "a  b"
+            );
+        }
+    }
+
+    #[test]
+    fn textarea_accepts_newlines_and_japanese_ime_composition() {
+        use super::{BrowserInput, BrowserKey};
+        let mut backend = input_backend();
+        click_input(&mut backend, "#multi");
+        backend.handle_input(BrowserInput::Text('A'));
+        press_key(&mut backend, BrowserKey::Enter);
+        backend.handle_input(BrowserInput::ImePreedit {
+            text: "にほん".into(),
+            cursor: 9,
+            anchor: 9,
+        });
+        assert_eq!(
+            backend.snapshot().text_input.unwrap().surrounding_text,
+            "A\nにほん"
+        );
+        backend.handle_input(BrowserInput::ImeCommit("日本語".into()));
+        backend.render(400, 300, 1.0);
+        let state = backend.snapshot().text_input.unwrap();
+        assert_eq!(state.surrounding_text, "A\n日本語");
+        assert_eq!(state.cursor_byte, 11);
+        assert!(state.cursor_rect[3] > 0.0);
+        backend.handle_input(BrowserInput::ImePreedit {
+            text: "あ".into(),
+            cursor: 3,
+            anchor: 3,
+        });
+        backend.handle_input(BrowserInput::FocusLost);
+        assert_eq!(
+            backend.snapshot().text_input.unwrap().surrounding_text,
+            "A\n日本語"
+        );
     }
 
     #[cfg(feature = "javascript")]
@@ -1169,6 +1415,59 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shift_jis_page_uses_the_http_charset() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                if let Ok((stream, _)) = listener.accept() {
+                    break stream;
+                }
+                assert!(Instant::now() < deadline, "no page request");
+                thread::sleep(Duration::from_millis(10));
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 2048];
+            let received = stream.read(&mut request).unwrap();
+            assert!(received > 0, "empty page request");
+            let html = "<!doctype html><title>日本語のページ</title><p id='result'>検索結果</p><script>document.querySelector('title').textContent='日本語の検索';</script>";
+            let (body, _, _) = encoding_rs::SHIFT_JIS.encode(html);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=Shift_JIS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.navigate(&format!("http://{address}/")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            backend.tick();
+            if matches!(backend.snapshot().load_state, super::LoadState::Ready) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "page never finished loading");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let expected_title = if cfg!(feature = "javascript") {
+            "日本語の検索"
+        } else {
+            "日本語のページ"
+        };
+        assert_eq!(backend.snapshot().title, expected_title);
+        let document = backend.document.as_ref().unwrap().inner();
+        let result = document.query_selector("#result").unwrap().unwrap();
+        assert_eq!(
+            document.get_node(result).unwrap().text_content(),
+            "検索結果"
+        );
         server.join().unwrap();
     }
 

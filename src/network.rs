@@ -1,11 +1,13 @@
 //! Small asynchronous HTTP executor shared by the Blitz document loader.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use blitz_traits::net::{Body, Bytes, NetHandler, NetProvider, Request};
 use data_url::DataUrl;
+use encoding_rs::{Encoding, UTF_8};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{BackendError, WakeCallback};
@@ -18,6 +20,24 @@ pub struct FetchResponse {
     pub final_url: String,
     pub status: u16,
     pub body: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+impl FetchResponse {
+    /// Decode text using the HTTP charset, with a Unicode BOM taking priority.
+    /// Binary resources retain their original bytes for their own decoders.
+    pub fn text(&self) -> Cow<'_, str> {
+        let mime = self
+            .content_type
+            .as_deref()
+            .and_then(|value| value.parse::<mime::Mime>().ok());
+        let encoding = mime
+            .as_ref()
+            .and_then(|mime| mime.get_param(mime::CHARSET))
+            .and_then(|charset| Encoding::for_label(charset.as_str().as_bytes()))
+            .unwrap_or(UTF_8);
+        encoding.decode(&self.body).0
+    }
 }
 
 type Completion = Box<dyn FnOnce(Result<FetchResponse, String>) + Send + 'static>;
@@ -124,10 +144,12 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
         let (body, _) = data_url
             .decode_to_vec()
             .map_err(|error| format!("invalid data URL payload: {error:?}"))?;
+        let content_type = Some(data_url.mime_type().to_string());
         return Ok(FetchResponse {
             final_url,
             status: 200,
             body,
+            content_type,
         });
     }
 
@@ -161,6 +183,11 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
 
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let body = response
         .bytes()
         .await
@@ -179,5 +206,52 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
         final_url,
         status,
         body,
+        content_type,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use encoding_rs::SHIFT_JIS;
+
+    #[test]
+    fn shift_jis_http_response_decodes_japanese_without_changing_bytes() {
+        let html = "<p>Google 検索にアクセスできない場合はこちら</p>";
+        let (bytes, _, errors) = SHIFT_JIS.encode(html);
+        assert!(!errors);
+        let body = bytes.into_owned();
+        let response = FetchResponse {
+            final_url: "https://example.com/".into(),
+            status: 200,
+            content_type: Some("text/html; charset=Shift_JIS".into()),
+            body: body.clone(),
+        };
+        assert_eq!(response.text(), html);
+        assert_eq!(response.body, body);
+    }
+
+    #[test]
+    fn unicode_bom_overrides_header_charset() {
+        let response = FetchResponse {
+            final_url: "https://example.com/".into(),
+            status: 200,
+            content_type: Some("text/html; charset=Shift_JIS".into()),
+            body: "\u{feff}<p>日本語</p>".as_bytes().to_vec(),
+        };
+        assert_eq!(response.text(), "<p>日本語</p>");
+    }
+
+    #[test]
+    fn unknown_or_missing_charset_defaults_to_utf8() {
+        for content_type in [None, Some("text/html; charset=unknown".into())] {
+            let response = FetchResponse {
+                final_url: "https://example.com/".into(),
+                status: 200,
+                content_type,
+                body: "日本語".as_bytes().to_vec(),
+            };
+            assert_eq!(response.text(), "日本語");
+        }
+    }
 }

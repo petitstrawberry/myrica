@@ -3,8 +3,8 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
+use scarlet_ui::element::TextInputElementState;
 use scarlet_ui::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
 use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
@@ -16,28 +16,27 @@ use scarlet_ui::{
 use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
-    BrowserBackend, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
-    BrowserSnapshot, WakeCallback, create_backend,
+    BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton, BrowserSnapshot,
+    BrowserViewport, BrowserWorker, WakeCallback,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
 const WINDOW_HEIGHT: f32 = 760.0;
 const BROWSER_CHROME_HEIGHT: f32 = 86.0;
-const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 
 /// Myrica's browser chrome and selected embedded engine.
 #[derive(Clone)]
 pub struct MyricaApp {
-    backend: Rc<RefCell<Box<dyn BrowserBackend>>>,
+    backend: Rc<RefCell<BrowserWorker>>,
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
     repaint_revision: State<u64>,
-    rendered_revision: Rc<Cell<u64>>,
-    last_rendered_at: Rc<Cell<Instant>>,
     canvas_handle: SgfxCanvasHandle,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
     webview_size: State<Size>,
     webview_focused: State<bool>,
+    webview_text_input: State<Option<TextInputElementState>>,
+    last_webview_focused: Rc<Cell<bool>>,
     last_backend_url: Rc<RefCell<String>>,
 }
 
@@ -50,28 +49,26 @@ impl MyricaApp {
             wake_revision.update(|revision| *revision = revision.wrapping_add(1));
         });
 
-        let mut backend = create_backend(wake).map_err(|error| error.to_string())?;
-        if let Err(error) = backend.navigate(initial_location) {
-            eprintln!("myrica: {error}");
-        }
+        let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
+        let viewport = viewport_for_size(webview_size);
+        let backend = BrowserWorker::new(initial_location, viewport, wake)
+            .map_err(|error| error.to_string())?;
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
-        let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
         let initial_frame =
-            backend.render(webview_size.width as u32, webview_size.height as u32, 1.0);
-        let initial_revision = repaint_revision.get();
+            BrowserFrame::empty(viewport.width, viewport.height).into_canvas_frame();
 
         Ok(Self {
             backend: Rc::new(RefCell::new(backend)),
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
             repaint_revision,
-            rendered_revision: Rc::new(Cell::new(initial_revision)),
-            last_rendered_at: Rc::new(Cell::new(Instant::now())),
             canvas_handle: SgfxCanvasHandle::new(),
             canvas_frame: State::new(generate_state_id(), initial_frame),
             webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
+            webview_text_input: State::new(generate_state_id(), None),
+            last_webview_focused: Rc::new(Cell::new(false)),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
         })
     }
@@ -123,6 +120,7 @@ impl MyricaApp {
         )
         .on_event(move |event| dispatch_webview_event(&event_backend, event))
         .focusable(self.webview_focused.clone())
+        .text_input(self.webview_text_input.clone())
         .frame(f32::INFINITY, f32::INFINITY);
 
         let status = Text::new(format!(
@@ -143,8 +141,34 @@ impl MyricaApp {
     }
 
     fn synchronize_backend_state(&self) {
-        let backend_changed = self.backend.borrow_mut().tick();
+        let focused = self.webview_focused.get();
+        if self.last_webview_focused.replace(focused) && !focused {
+            self.backend.borrow().handle_input(BrowserInput::FocusLost);
+        }
+        let frame = {
+            let mut backend = self.backend.borrow_mut();
+            backend.resize(viewport_for_size(self.webview_size.get()));
+            backend.poll()
+        };
+        if let Some(frame) = frame {
+            self.canvas_frame.set(frame.into_canvas_frame());
+        }
         let latest = self.backend.borrow().snapshot();
+        if latest.text_input != self.snapshot.get().text_input {
+            self.webview_text_input
+                .set(latest.text_input.as_ref().map(|input| {
+                    let [x, y, width, height] = input.cursor_rect;
+                    TextInputElementState {
+                        cursor_rect: scarlet_ui::Rect::new(
+                            scarlet_ui::Point::new(x, y),
+                            Size::new(width, height),
+                        ),
+                        surrounding_text: input.surrounding_text.clone(),
+                        cursor_byte: input.cursor_byte,
+                        anchor_byte: input.anchor_byte,
+                    }
+                }));
+        }
         if latest != self.snapshot.get() {
             self.snapshot.set(latest.clone());
         }
@@ -153,20 +177,6 @@ impl MyricaApp {
         if latest.url != *last_url {
             self.address.set(latest.url.clone());
             *last_url = latest.url;
-        }
-
-        let requested_revision = self.repaint_revision.get();
-        let animation_frame_due = requested_revision != self.rendered_revision.get()
-            && self.last_rendered_at.get().elapsed() >= ANIMATION_FRAME_INTERVAL;
-        if backend_changed || animation_frame_due {
-            let size = self.webview_size.get();
-            let scale = graphics::current_scale_milli().max(1) as f32 / 1_000.0;
-            let width = (size.width.max(1.0) * scale).ceil() as u32;
-            let height = (size.height.max(1.0) * scale).ceil() as u32;
-            let frame = self.backend.borrow_mut().render(width, height, scale);
-            self.canvas_frame.set(frame);
-            self.rendered_revision.set(requested_revision);
-            self.last_rendered_at.set(Instant::now());
         }
     }
 }
@@ -221,6 +231,15 @@ impl Application for MyricaApp {
     }
 }
 
+fn viewport_for_size(size: Size) -> BrowserViewport {
+    let scale = graphics::current_scale_milli().max(1) as f32 / 1_000.0;
+    BrowserViewport {
+        width: (size.width.max(1.0) * scale).ceil() as u32,
+        height: (size.height.max(1.0) * scale).ceil() as u32,
+        scale,
+    }
+}
+
 fn webview_size_for_window(width: f32, height: f32) -> Size {
     let decoration =
         WindowContentLayout::for_decoration(WindowDecoration::CUSTOM).decoration_size();
@@ -230,13 +249,13 @@ fn webview_size_for_window(width: f32, height: f32) -> Size {
     )
 }
 
-fn navigate_from_address(backend: &Rc<RefCell<Box<dyn BrowserBackend>>>, address: &State<String>) {
+fn navigate_from_address(backend: &Rc<RefCell<BrowserWorker>>, address: &State<String>) {
     if let Err(error) = backend.borrow_mut().navigate(&address.get()) {
         eprintln!("myrica: {error}");
     }
 }
 
-fn dispatch_webview_event(backend: &Rc<RefCell<Box<dyn BrowserBackend>>>, event: &Event) -> bool {
+fn dispatch_webview_event(backend: &Rc<RefCell<BrowserWorker>>, event: &Event) -> bool {
     let input = match event {
         Event::Mouse(MouseEvent::Moved { x, y }) | Event::Mouse(MouseEvent::Entered { x, y }) => {
             BrowserInput::PointerMoved {
@@ -285,6 +304,18 @@ fn dispatch_webview_event(backend: &Rc<RefCell<Box<dyn BrowserBackend>>>, event:
             modifiers: map_modifiers(*modifiers),
         },
         Event::Keyboard(KeyEvent::Char { c }) => BrowserInput::Text(*c),
+        Event::TextInputPreedit {
+            text,
+            cursor_byte,
+            anchor_byte,
+            ..
+        } => BrowserInput::ImePreedit {
+            text: text.clone(),
+            cursor: *cursor_byte as usize,
+            anchor: *anchor_byte as usize,
+        },
+        Event::TextInputCommit { text, .. } => BrowserInput::ImeCommit(text.clone()),
+        Event::TextInputDone { .. } => return true,
         _ => return false,
     };
     backend.borrow_mut().handle_input(input)

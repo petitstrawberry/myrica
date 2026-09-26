@@ -17,15 +17,14 @@ use peniko::{
     BlendMode, Color as PaintColor, Extend, Fill, FontData, Gradient, GradientKind, ImageAlphaType,
     ImageData, ImageFormat, StyleRef,
 };
-use scarlet_ui::{
-    Color as UiColor, SgfxCanvasDraw, SgfxCanvasFrame, SgfxCanvasVertex, SgfxMesh, SgfxMeshHandle,
-    SgfxTexture, SgfxTextureHandle,
-};
+use scarlet_ui::{SgfxCanvasVertex, SgfxMesh, SgfxMeshHandle, SgfxTextureHandle};
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, GlyphId, MetadataProvider, instance::Size};
 use swash::scale::{Render as SwashRender, ScaleContext, Source, StrikeWith, image::Content};
 use swash::zeno::{Format as SwashFormat, Vector as SwashVector};
 use swash::{FontRef as SwashFontRef, GlyphId as SwashGlyphId};
+
+use crate::backend::{BrowserDraw, BrowserFrame, BrowserTexture};
 
 const PATH_TOLERANCE: f64 = 0.15;
 const MAX_CANVAS_DRAWS: usize = 240;
@@ -44,7 +43,7 @@ pub struct SgfxSceneRenderer {
     layers: Vec<LayerState>,
     layer: LayerState,
     mesh_handles: Vec<SgfxMeshHandle>,
-    textures: HashMap<u64, Arc<SgfxTexture>>,
+    textures: HashMap<u64, Arc<BrowserTexture>>,
     glyphs: HashMap<GlyphCacheKey, Arc<[[f32; 2]]>>,
     scale_context: ScaleContext,
     raster_glyphs: HashMap<RasterGlyphKey, CachedRasterGlyph>,
@@ -80,7 +79,7 @@ impl SgfxSceneRenderer {
     }
 
     /// Return an empty, valid frame while no document is available.
-    pub fn empty_frame(&mut self, width: u32, height: u32) -> Arc<SgfxCanvasFrame> {
+    pub fn empty_frame(&mut self, width: u32, height: u32) -> BrowserFrame {
         self.begin_frame(width, height);
         self.finish_frame()
     }
@@ -91,7 +90,7 @@ impl SgfxSceneRenderer {
     }
 
     /// Finish recording and build the retained ScarletUI frame.
-    pub fn finish_frame(&mut self) -> Arc<SgfxCanvasFrame> {
+    pub fn finish_frame(&mut self) -> BrowserFrame {
         for atlas in &mut self.glyph_atlases {
             atlas.finish_snapshot();
         }
@@ -100,10 +99,11 @@ impl SgfxSceneRenderer {
             .iter()
             .map(|atlas| atlas.texture.clone())
             .collect();
-        let aspect = self.width as f32 / self.height.max(1) as f32;
         let transform = pixel_to_clip(self.width, self.height);
-        let mut frame = SgfxCanvasFrame::new(self.revision, UiColor::rgb(255_u8, 255_u8, 255_u8))
-            .reference_aspect(aspect);
+        let mut frame = BrowserFrame {
+            revision: self.revision,
+            ..BrowserFrame::empty(self.width, self.height)
+        };
 
         for (index, batch) in self
             .batches
@@ -117,7 +117,6 @@ impl SgfxSceneRenderer {
             }
             let mesh =
                 SgfxMesh::with_handle(self.mesh_handles[index], self.revision, batch.vertices);
-            let mut draw = SgfxCanvasDraw::new(mesh, transform);
             let texture = match batch.texture_key {
                 Some(BatchTextureKey::GlyphAtlas(page)) => atlas_textures
                     .get(page)
@@ -125,13 +124,14 @@ impl SgfxSceneRenderer {
                     .map(Arc::clone),
                 Some(BatchTextureKey::Image(_)) | None => batch.texture,
             };
-            if let Some(texture) = texture {
-                draw = draw.texture(texture);
-            }
-            frame = frame.draw(draw);
+            frame.draws.push(BrowserDraw {
+                mesh,
+                transform,
+                texture,
+            });
         }
 
-        Arc::new(frame)
+        frame
     }
 
     fn push_clip(&mut self, transform: Affine, clip: &impl Shape, alpha: f32) {
@@ -243,7 +243,7 @@ impl SgfxSceneRenderer {
     fn batch_for(
         &mut self,
         texture_key: Option<BatchTextureKey>,
-        texture: Option<Arc<SgfxTexture>>,
+        texture: Option<Arc<BrowserTexture>>,
     ) -> &mut Batch {
         if self
             .batches
@@ -289,7 +289,7 @@ impl SgfxSceneRenderer {
         }
     }
 
-    fn texture(&mut self, image: &ImageData) -> Option<Arc<SgfxTexture>> {
+    fn texture(&mut self, image: &ImageData) -> Option<Arc<BrowserTexture>> {
         let key = image.data.id();
         if let Some(texture) = self.textures.get(&key) {
             return Some(Arc::clone(texture));
@@ -324,7 +324,13 @@ impl SgfxSceneRenderer {
             }
         }
 
-        let texture = SgfxTexture::rgba8(image.width, image.height, rgba);
+        let texture = Arc::new(BrowserTexture {
+            handle: SgfxTextureHandle::new(),
+            revision: 0,
+            width: image.width,
+            height: image.height,
+            pixels: rgba.into(),
+        });
         self.textures.insert(key, Arc::clone(&texture));
         Some(texture)
     }
@@ -733,7 +739,7 @@ enum BatchTextureKey {
 
 struct Batch {
     texture_key: Option<BatchTextureKey>,
-    texture: Option<Arc<SgfxTexture>>,
+    texture: Option<Arc<BrowserTexture>>,
     vertices: Vec<SgfxCanvasVertex>,
 }
 
@@ -802,7 +808,7 @@ struct GlyphAtlasPage {
     shelf_y: u32,
     shelf_height: u32,
     dirty: bool,
-    texture: Option<Arc<SgfxTexture>>,
+    texture: Option<Arc<BrowserTexture>>,
 }
 
 impl GlyphAtlasPage {
@@ -859,13 +865,13 @@ impl GlyphAtlasPage {
             return;
         }
         self.revision = self.revision.wrapping_add(1).max(1);
-        self.texture = Some(SgfxTexture::rgba8_with_handle(
-            self.handle,
-            self.revision,
-            GLYPH_ATLAS_SIZE,
-            GLYPH_ATLAS_SIZE,
-            self.pixels.clone(),
-        ));
+        self.texture = Some(Arc::new(BrowserTexture {
+            handle: self.handle,
+            revision: self.revision,
+            width: GLYPH_ATLAS_SIZE,
+            height: GLYPH_ATLAS_SIZE,
+            pixels: self.pixels.clone().into(),
+        }));
         self.dirty = false;
     }
 }
@@ -880,7 +886,7 @@ enum ResolvedPaint {
     },
     Image {
         key: u64,
-        texture: Arc<SgfxTexture>,
+        texture: Arc<BrowserTexture>,
         inverse: Affine,
         width: f32,
         height: f32,
@@ -896,7 +902,7 @@ impl ResolvedPaint {
         }
     }
 
-    fn texture(&self) -> Option<Arc<SgfxTexture>> {
+    fn texture(&self) -> Option<Arc<BrowserTexture>> {
         match self {
             Self::Image { texture, .. } => Some(Arc::clone(texture)),
             Self::Solid(_) | Self::Gradient { .. } => None,

@@ -1,0 +1,13 @@
+<!doctype html><html><head><title>Myrica worker/input QA</title><style>
+html,body{margin:0;background:#f7f5f2;color:#242424;font:20px sans-serif}
+main{padding:24px}h1{font-size:28px;margin:0 0 20px}label{display:block;margin-top:18px}
+input,textarea{display:block;width:560px;padding:10px;font:22px sans-serif;border:2px solid #777;background:white;color:#222}input{height:48px}textarea{height:140px}button{display:block;margin-top:20px;padding:12px;font:20px sans-serif}
+</style></head><body><main><h1>Worker and text input QA</h1><label>Single line</label><input id="single"><label>Multiline / IME</label><textarea id="multi"></textarea><button id="busy">Run JavaScript for 8 seconds</button><p id="state">Ready for input</p></main>
+<script>
+document.getElementById('busy').addEventListener('click', function(){
+ document.querySelector('title').textContent='JS busy - UI should respond';
+ document.getElementById('state').textContent='Running JavaScript for 8 seconds';
+ setTimeout(function(){var end=Date.now()+8000;while(Date.now()<end){} document.querySelector('title').textContent='JS completed';document.getElementById('state').textContent='JavaScript completed';},250);
+});
+document.getElementById('single').addEventListener('input',function(){document.getElementById('state').textContent='input event received';});
+</script></body></html>
