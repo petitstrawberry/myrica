@@ -19,14 +19,21 @@ use peniko::{
 };
 use scarlet_ui::{
     Color as UiColor, SgfxCanvasDraw, SgfxCanvasFrame, SgfxCanvasVertex, SgfxMesh, SgfxMeshHandle,
-    SgfxTexture,
+    SgfxTexture, SgfxTextureHandle,
 };
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::{FontRef, GlyphId, MetadataProvider, instance::Size};
+use swash::scale::{Render as SwashRender, ScaleContext, Source, StrikeWith, image::Content};
+use swash::zeno::{Format as SwashFormat, Vector as SwashVector};
+use swash::{FontRef as SwashFontRef, GlyphId as SwashGlyphId};
 
 const PATH_TOLERANCE: f64 = 0.15;
 const MAX_CANVAS_DRAWS: usize = 240;
 const MAX_GLYPH_CACHE_ENTRIES: usize = 4096;
+const GLYPH_ATLAS_SIZE: u32 = 1_024;
+const GLYPH_ATLAS_PADDING: u32 = 1;
+const MAX_GLYPH_ATLAS_PAGES: usize = 8;
+const SUBPIXEL_PHASES: f64 = 4.0;
 
 /// Persistent AnyRender sink that turns Blitz paint commands into SGFX meshes.
 pub struct SgfxSceneRenderer {
@@ -39,6 +46,9 @@ pub struct SgfxSceneRenderer {
     mesh_handles: Vec<SgfxMeshHandle>,
     textures: HashMap<u64, Arc<SgfxTexture>>,
     glyphs: HashMap<GlyphCacheKey, Arc<[[f32; 2]]>>,
+    scale_context: ScaleContext,
+    raster_glyphs: HashMap<RasterGlyphKey, CachedRasterGlyph>,
+    glyph_atlases: Vec<GlyphAtlasPage>,
 }
 
 impl SgfxSceneRenderer {
@@ -53,6 +63,9 @@ impl SgfxSceneRenderer {
             mesh_handles: Vec::new(),
             textures: HashMap::new(),
             glyphs: HashMap::new(),
+            scale_context: ScaleContext::new(),
+            raster_glyphs: HashMap::new(),
+            glyph_atlases: Vec::new(),
         }
     }
 
@@ -79,6 +92,14 @@ impl SgfxSceneRenderer {
 
     /// Finish recording and build the retained ScarletUI frame.
     pub fn finish_frame(&mut self) -> Arc<SgfxCanvasFrame> {
+        for atlas in &mut self.glyph_atlases {
+            atlas.finish_snapshot();
+        }
+        let atlas_textures: Vec<_> = self
+            .glyph_atlases
+            .iter()
+            .map(|atlas| atlas.texture.clone())
+            .collect();
         let aspect = self.width as f32 / self.height.max(1) as f32;
         let transform = pixel_to_clip(self.width, self.height);
         let mut frame = SgfxCanvasFrame::new(self.revision, UiColor::rgb(255_u8, 255_u8, 255_u8))
@@ -97,7 +118,14 @@ impl SgfxSceneRenderer {
             let mesh =
                 SgfxMesh::with_handle(self.mesh_handles[index], self.revision, batch.vertices);
             let mut draw = SgfxCanvasDraw::new(mesh, transform);
-            if let Some(texture) = batch.texture {
+            let texture = match batch.texture_key {
+                Some(BatchTextureKey::GlyphAtlas(page)) => atlas_textures
+                    .get(page)
+                    .and_then(|texture| texture.as_ref())
+                    .map(Arc::clone),
+                Some(BatchTextureKey::Image(_)) | None => batch.texture,
+            };
+            if let Some(texture) = texture {
                 draw = draw.texture(texture);
             }
             frame = frame.draw(draw);
@@ -160,9 +188,61 @@ impl SgfxSceneRenderer {
         }
     }
 
+    fn append_textured_quad(
+        &mut self,
+        rect: [f32; 4],
+        uv: [f32; 4],
+        color: [f32; 4],
+        texture_key: BatchTextureKey,
+    ) {
+        let [x0, y0, x1, y1] = rect;
+        let [u0, v0, u1, v1] = uv;
+        let vertices = [
+            Vertex {
+                position: [x0, y0],
+                color,
+                uv: [u0, v0],
+            },
+            Vertex {
+                position: [x1, y0],
+                color,
+                uv: [u1, v0],
+            },
+            Vertex {
+                position: [x1, y1],
+                color,
+                uv: [u1, v1],
+            },
+            Vertex {
+                position: [x0, y1],
+                color,
+                uv: [u0, v1],
+            },
+        ];
+        for indices in [[0, 1, 2], [0, 2, 3]] {
+            let mut polygon = indices
+                .into_iter()
+                .map(|index| vertices[index])
+                .collect::<Vec<_>>();
+            polygon = clip_polygon(polygon, self.layer.clip);
+            if polygon.len() < 3 {
+                continue;
+            }
+            let batch = self.batch_for(Some(texture_key), None);
+            for index in 1..polygon.len() - 1 {
+                let triangle = [polygon[0], polygon[index], polygon[index + 1]];
+                if triangle.iter().all(Vertex::is_finite) {
+                    batch
+                        .vertices
+                        .extend(triangle.into_iter().map(Vertex::to_sgfx));
+                }
+            }
+        }
+    }
+
     fn batch_for(
         &mut self,
-        texture_key: Option<u64>,
+        texture_key: Option<BatchTextureKey>,
         texture: Option<Arc<SgfxTexture>>,
     ) -> &mut Batch {
         if self
@@ -295,6 +375,129 @@ impl SgfxSceneRenderer {
         self.glyphs.insert(key, Arc::clone(&triangles));
         Some(triangles)
     }
+
+    fn raster_glyph(
+        &mut self,
+        font_data: &FontData,
+        font_size: f32,
+        hint: bool,
+        normalized_coords: &[NormalizedCoord],
+        glyph_id: u32,
+        phase: [u8; 2],
+    ) -> CachedRasterGlyph {
+        let [phase_x, phase_y] = phase;
+        let key = RasterGlyphKey {
+            font_id: font_data.data.id(),
+            font_index: font_data.index,
+            glyph_id,
+            font_size: font_size.to_bits(),
+            hint,
+            phase_x,
+            phase_y,
+            coords: normalized_coords.into(),
+        };
+        if let Some(glyph) = self.raster_glyphs.get(&key) {
+            return *glyph;
+        }
+
+        let rendered = (|| {
+            if !font_size.is_finite() || font_size <= 0.0 {
+                return None;
+            }
+            let glyph_id = SwashGlyphId::try_from(glyph_id).ok()?;
+            let font = SwashFontRef::from_index(
+                font_data.data.data(),
+                usize::try_from(font_data.index).ok()?,
+            )?;
+            let mut scaler = self
+                .scale_context
+                .builder_with_id(font, [font_data.data.id(), u64::from(font_data.index)])
+                .size(font_size)
+                .hint(hint)
+                .normalized_coords(normalized_coords.iter().copied())
+                .build();
+            let sources = [
+                Source::ColorOutline(0),
+                Source::ColorBitmap(StrikeWith::BestFit),
+                Source::Outline,
+            ];
+            let mut render = SwashRender::new(&sources);
+            render.format(SwashFormat::Alpha).offset(SwashVector::new(
+                f32::from(phase_x) / SUBPIXEL_PHASES as f32,
+                -f32::from(phase_y) / SUBPIXEL_PHASES as f32,
+            ));
+            render.render(&mut scaler, glyph_id)
+        })();
+
+        let cached = match rendered {
+            Some(image) if image.placement.width == 0 || image.placement.height == 0 => {
+                CachedRasterGlyph::Empty
+            }
+            Some(image) => self
+                .cache_raster_image(image)
+                .map(CachedRasterGlyph::Atlas)
+                .unwrap_or(CachedRasterGlyph::Unavailable),
+            None => CachedRasterGlyph::Unavailable,
+        };
+        self.raster_glyphs.insert(key, cached);
+        cached
+    }
+
+    fn cache_raster_image(&mut self, image: swash::scale::image::Image) -> Option<AtlasGlyph> {
+        let width = image.placement.width;
+        let height = image.placement.height;
+        let (pixels, is_color) = swash_image_pixels(&image)?;
+
+        for page_index in 0..self.glyph_atlases.len() {
+            if let Some(allocation) = self.glyph_atlases[page_index].allocate(width, height) {
+                self.glyph_atlases[page_index].write(allocation, width, height, &pixels);
+                return Some(AtlasGlyph::new(page_index, allocation, &image, is_color));
+            }
+        }
+        if self.glyph_atlases.len() >= MAX_GLYPH_ATLAS_PAGES {
+            return None;
+        }
+
+        let mut page = GlyphAtlasPage::new();
+        let allocation = page.allocate(width, height)?;
+        page.write(allocation, width, height, &pixels);
+        let page_index = self.glyph_atlases.len();
+        self.glyph_atlases.push(page);
+        Some(AtlasGlyph::new(page_index, allocation, &image, is_color))
+    }
+
+    fn append_cached_glyph(
+        &mut self,
+        glyph: CachedRasterGlyph,
+        origin_x: i32,
+        origin_y: i32,
+        text_color: [f32; 4],
+    ) -> bool {
+        let CachedRasterGlyph::Atlas(glyph) = glyph else {
+            return glyph == CachedRasterGlyph::Empty;
+        };
+        let x0 = origin_x as f32 + glyph.left as f32;
+        let y0 = origin_y as f32 - glyph.top as f32;
+        let x1 = x0 + glyph.width as f32;
+        let y1 = y0 + glyph.height as f32;
+        let atlas_size = GLYPH_ATLAS_SIZE as f32;
+        let u0 = glyph.x as f32 / atlas_size;
+        let v0 = glyph.y as f32 / atlas_size;
+        let u1 = (glyph.x + glyph.width) as f32 / atlas_size;
+        let v1 = (glyph.y + glyph.height) as f32 / atlas_size;
+        let color = if glyph.is_color {
+            [1.0, 1.0, 1.0, text_color[3]]
+        } else {
+            text_color
+        };
+        self.append_textured_quad(
+            [x0, y0, x1, y1],
+            [u0, v0, u1, v1],
+            color,
+            BatchTextureKey::GlyphAtlas(glyph.page),
+        );
+        true
+    }
 }
 
 impl RenderContext for SgfxSceneRenderer {}
@@ -374,9 +577,9 @@ impl PaintScene for SgfxSceneRenderer {
         &'s mut self,
         font_data: &'a FontData,
         font_size: f32,
-        _hint: bool,
+        hint: bool,
         normalized_coords: &'a [NormalizedCoord],
-        _embolden: Vec2,
+        embolden: Vec2,
         style: impl Into<StyleRef<'a>>,
         paint: impl Into<PaintRef<'a>>,
         brush_alpha: f32,
@@ -393,12 +596,43 @@ impl PaintScene for SgfxSceneRenderer {
             return;
         };
         let style = style.into();
+        let raster_color = match (&style, &resolved) {
+            (StyleRef::Fill(Fill::NonZero), ResolvedPaint::Solid(color))
+                if glyph_transform.is_none()
+                    && affine_is_translation(transform)
+                    && embolden.x.abs() <= f64::EPSILON
+                    && embolden.y.abs() <= f64::EPSILON =>
+            {
+                Some(color.components)
+            }
+            _ => None,
+        };
 
         for glyph in glyphs {
-            let glyph_transform =
+            if let Some(color) = raster_color {
+                let baseline = transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
+                if let (Some((origin_x, phase_x)), Some((origin_y, phase_y))) = (
+                    quantized_pixel_origin(baseline.x),
+                    quantized_pixel_origin(baseline.y),
+                ) {
+                    let cached = self.raster_glyph(
+                        font_data,
+                        font_size,
+                        hint,
+                        normalized_coords,
+                        glyph.id,
+                        [phase_x, phase_y],
+                    );
+                    if self.append_cached_glyph(cached, origin_x, origin_y, color) {
+                        continue;
+                    }
+                }
+            }
+
+            let glyph_to_local =
                 Affine::new([1.0, 0.0, 0.0, -1.0, f64::from(glyph.x), f64::from(glyph.y)])
                     * glyph_transform.unwrap_or(Affine::IDENTITY);
-            let world_transform = transform * glyph_transform;
+            let world_transform = transform * glyph_to_local;
             match style {
                 StyleRef::Fill(fill) => {
                     let Some(geometry) = self.glyph_geometry(
@@ -491,10 +725,149 @@ impl LayerState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchTextureKey {
+    Image(u64),
+    GlyphAtlas(usize),
+}
+
 struct Batch {
-    texture_key: Option<u64>,
+    texture_key: Option<BatchTextureKey>,
     texture: Option<Arc<SgfxTexture>>,
     vertices: Vec<SgfxCanvasVertex>,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct RasterGlyphKey {
+    font_id: u64,
+    font_index: u32,
+    glyph_id: u32,
+    font_size: u32,
+    hint: bool,
+    phase_x: u8,
+    phase_y: u8,
+    coords: Box<[i16]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CachedRasterGlyph {
+    Empty,
+    Atlas(AtlasGlyph),
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AtlasGlyph {
+    page: usize,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    left: i32,
+    top: i32,
+    is_color: bool,
+}
+
+impl AtlasGlyph {
+    fn new(
+        page: usize,
+        allocation: AtlasAllocation,
+        image: &swash::scale::image::Image,
+        is_color: bool,
+    ) -> Self {
+        Self {
+            page,
+            x: allocation.x,
+            y: allocation.y,
+            width: image.placement.width,
+            height: image.placement.height,
+            left: image.placement.left,
+            top: image.placement.top,
+            is_color,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AtlasAllocation {
+    x: u32,
+    y: u32,
+}
+
+struct GlyphAtlasPage {
+    handle: SgfxTextureHandle,
+    revision: u64,
+    pixels: Vec<u8>,
+    shelf_x: u32,
+    shelf_y: u32,
+    shelf_height: u32,
+    dirty: bool,
+    texture: Option<Arc<SgfxTexture>>,
+}
+
+impl GlyphAtlasPage {
+    fn new() -> Self {
+        Self {
+            handle: SgfxTextureHandle::new(),
+            revision: 0,
+            pixels: vec![0; GLYPH_ATLAS_SIZE as usize * GLYPH_ATLAS_SIZE as usize * 4],
+            shelf_x: 0,
+            shelf_y: 0,
+            shelf_height: 0,
+            dirty: false,
+            texture: None,
+        }
+    }
+
+    fn allocate(&mut self, width: u32, height: u32) -> Option<AtlasAllocation> {
+        let padded_width = width.checked_add(GLYPH_ATLAS_PADDING * 2)?;
+        let padded_height = height.checked_add(GLYPH_ATLAS_PADDING * 2)?;
+        if padded_width > GLYPH_ATLAS_SIZE || padded_height > GLYPH_ATLAS_SIZE {
+            return None;
+        }
+        if self.shelf_x + padded_width > GLYPH_ATLAS_SIZE {
+            self.shelf_y = self.shelf_y.checked_add(self.shelf_height)?;
+            self.shelf_x = 0;
+            self.shelf_height = 0;
+        }
+        if self.shelf_y + padded_height > GLYPH_ATLAS_SIZE {
+            return None;
+        }
+        let allocation = AtlasAllocation {
+            x: self.shelf_x + GLYPH_ATLAS_PADDING,
+            y: self.shelf_y + GLYPH_ATLAS_PADDING,
+        };
+        self.shelf_x += padded_width;
+        self.shelf_height = self.shelf_height.max(padded_height);
+        Some(allocation)
+    }
+
+    fn write(&mut self, allocation: AtlasAllocation, width: u32, height: u32, pixels: &[u8]) {
+        let row_bytes = width as usize * 4;
+        let atlas_row_bytes = GLYPH_ATLAS_SIZE as usize * 4;
+        for row in 0..height as usize {
+            let source = &pixels[row * row_bytes..(row + 1) * row_bytes];
+            let destination_start =
+                (allocation.y as usize + row) * atlas_row_bytes + allocation.x as usize * 4;
+            self.pixels[destination_start..destination_start + row_bytes].copy_from_slice(source);
+        }
+        self.dirty = true;
+    }
+
+    fn finish_snapshot(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.revision = self.revision.wrapping_add(1).max(1);
+        self.texture = Some(SgfxTexture::rgba8_with_handle(
+            self.handle,
+            self.revision,
+            GLYPH_ATLAS_SIZE,
+            GLYPH_ATLAS_SIZE,
+            self.pixels.clone(),
+        ));
+        self.dirty = false;
+    }
 }
 
 #[derive(Clone)]
@@ -516,9 +889,9 @@ enum ResolvedPaint {
 }
 
 impl ResolvedPaint {
-    fn texture_key(&self) -> Option<u64> {
+    fn texture_key(&self) -> Option<BatchTextureKey> {
         match self {
-            Self::Image { key, .. } => Some(*key),
+            Self::Image { key, .. } => Some(BatchTextureKey::Image(*key)),
             Self::Solid(_) | Self::Gradient { .. } => None,
         }
     }
@@ -684,6 +1057,80 @@ fn glyph_outline(
         )
         .ok()?;
     Some(pen.path)
+}
+
+fn affine_is_translation(transform: Affine) -> bool {
+    let [a, b, c, d, _, _] = transform.as_coeffs();
+    (a - 1.0).abs() <= 1e-6 && b.abs() <= 1e-6 && c.abs() <= 1e-6 && (d - 1.0).abs() <= 1e-6
+}
+
+fn quantized_pixel_origin(value: f64) -> Option<(i32, u8)> {
+    if !value.is_finite() {
+        return None;
+    }
+    let floor = value.floor();
+    if floor < f64::from(i32::MIN) || floor > f64::from(i32::MAX) {
+        return None;
+    }
+    let mut origin = floor as i64;
+    let mut phase = ((value - floor) * SUBPIXEL_PHASES).round() as i64;
+    if phase >= SUBPIXEL_PHASES as i64 {
+        origin += 1;
+        phase = 0;
+    }
+    Some((i32::try_from(origin).ok()?, u8::try_from(phase).ok()?))
+}
+
+fn swash_image_pixels(image: &swash::scale::image::Image) -> Option<(Vec<u8>, bool)> {
+    let pixel_count = usize::try_from(image.placement.width)
+        .ok()?
+        .checked_mul(usize::try_from(image.placement.height).ok()?)?;
+    match image.content {
+        Content::Mask => {
+            if image.data.len() != pixel_count {
+                return None;
+            }
+            let mut pixels = Vec::with_capacity(pixel_count.checked_mul(4)?);
+            for &alpha in &image.data {
+                pixels.extend_from_slice(&[255, 255, 255, alpha]);
+            }
+            Some((pixels, false))
+        }
+        Content::SubpixelMask => {
+            if image.data.len() != pixel_count.checked_mul(4)? {
+                return None;
+            }
+            let mut pixels = Vec::with_capacity(image.data.len());
+            for mask in image.data.chunks_exact(4) {
+                let alpha = mask[0].max(mask[1]).max(mask[2]);
+                pixels.extend_from_slice(&[255, 255, 255, alpha]);
+            }
+            Some((pixels, false))
+        }
+        Content::Color => {
+            if image.data.len() != pixel_count.checked_mul(4)? {
+                return None;
+            }
+            let mut pixels = image.data.clone();
+            if matches!(image.source, Source::ColorOutline(_)) {
+                unpremultiply_rgba(&mut pixels);
+            }
+            Some((pixels, true))
+        }
+    }
+}
+
+fn unpremultiply_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u32::from(pixel[3]);
+        if alpha == 0 {
+            pixel[..3].fill(0);
+        } else if alpha < 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]

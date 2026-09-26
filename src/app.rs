@@ -10,7 +10,8 @@ use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     Application, ComponentElement, Element, Listenable, SgfxCanvas, SgfxCanvasFrame,
-    SgfxCanvasHandle, Size, View, Window, WindowContext, generate_state_id,
+    SgfxCanvasHandle, Size, View, Window, WindowContentLayout, WindowContext, WindowDecoration,
+    generate_state_id,
 };
 use scarlet_ui::{hstack, vstack};
 
@@ -55,7 +56,7 @@ impl MyricaApp {
         }
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
-        let webview_size = Size::new(WINDOW_WIDTH, WINDOW_HEIGHT - BROWSER_CHROME_HEIGHT);
+        let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
         let initial_frame =
             backend.render(webview_size.width as u32, webview_size.height as u32, 1.0);
         let initial_revision = repaint_revision.get();
@@ -209,10 +210,8 @@ impl Application for MyricaApp {
     }
 
     fn on_window_resize(&mut self, _ctx: &WindowContext, width: u32, height: u32) {
-        self.webview_size.set(Size::new(
-            width.max(1) as f32,
-            (height as f32 - BROWSER_CHROME_HEIGHT).max(1.0),
-        ));
+        self.webview_size
+            .set(webview_size_for_window(width as f32, height as f32));
         self.repaint_revision
             .update(|revision| *revision = revision.wrapping_add(1));
     }
@@ -220,6 +219,15 @@ impl Application for MyricaApp {
     fn debug_logging(&self) -> bool {
         false
     }
+}
+
+fn webview_size_for_window(width: f32, height: f32) -> Size {
+    let decoration =
+        WindowContentLayout::for_decoration(WindowDecoration::CUSTOM).decoration_size();
+    Size::new(
+        (width - decoration.width).max(1.0),
+        (height - decoration.height - BROWSER_CHROME_HEIGHT).max(1.0),
+    )
 }
 
 fn navigate_from_address(backend: &Rc<RefCell<Box<dyn BrowserBackend>>>, address: &State<String>) {
@@ -318,5 +326,23 @@ fn map_key(key: KeyCode) -> BrowserKey {
         KeyCode::Delete => BrowserKey::Delete,
         KeyCode::Char(character) => BrowserKey::Character(character),
         KeyCode::Unknown | KeyCode::F(_) => BrowserKey::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webview_size_excludes_window_and_browser_chrome() {
+        let decoration =
+            WindowContentLayout::for_decoration(WindowDecoration::CUSTOM).decoration_size();
+        let webview = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
+
+        assert_eq!(webview.width + decoration.width, WINDOW_WIDTH);
+        assert_eq!(
+            webview.height + decoration.height + BROWSER_CHROME_HEIGHT,
+            WINDOW_HEIGHT
+        );
     }
 }
