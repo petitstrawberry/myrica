@@ -10,8 +10,7 @@ use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
     Application, ComponentElement, Element, Listenable, SgfxCanvas, SgfxCanvasFrame,
-    SgfxCanvasHandle, Size, View, Window, WindowContentLayout, WindowContext, WindowDecoration,
-    generate_state_id,
+    SgfxCanvasHandle, Size, View, Window, WindowContentLayout, WindowDecoration, generate_state_id,
 };
 use scarlet_ui::{hstack, vstack};
 
@@ -107,11 +106,20 @@ impl MyricaApp {
 
         let event_backend = Rc::clone(&self.backend);
         let webview_size = self.webview_size.get();
+        let observed_webview_size = self.webview_size.clone();
         let canvas = SgfxCanvas::from_state(
             self.canvas_handle,
             webview_size.width,
             webview_size.height,
             self.canvas_frame.clone(),
+        )
+        .on_geometry_change(
+            |geometry| geometry.size(),
+            move |size| {
+                if observed_webview_size.get() != size {
+                    observed_webview_size.set(size);
+                }
+            },
         )
         .on_event(move |event| dispatch_webview_event(&event_backend, event))
         .focusable(self.webview_focused.clone())
@@ -210,11 +218,6 @@ impl Application for MyricaApp {
 
     fn on_idle(&mut self) {
         self.synchronize_backend_state();
-    }
-
-    fn on_window_resize(&mut self, _ctx: &WindowContext, width: u32, height: u32) {
-        self.webview_size
-            .set(webview_size_for_window(width as f32, height as f32));
     }
 
     fn debug_logging(&self) -> bool {
@@ -380,6 +383,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(2));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -464,25 +468,37 @@ mod tests {
             assert!(dispatch_webview_event(&app.backend, &Event::Mouse(event)));
         }
         wait_for_page(&mut app, "/linked", "timer completed");
+
+        fn canvas_size(element: &dyn Element) -> Option<Size> {
+            if let Some(render) = element.render_object()
+                && render.as_any().is::<scarlet_ui::SgfxCanvasRenderObject>()
+            {
+                return Some(render.size());
+            }
+            element
+                .children()
+                .iter()
+                .find_map(|child| canvas_size(child.as_ref()))
+        }
+
+        let mut content_tree = scarlet_ui::ElementTree::new();
+        content_tree.set_root(app.content().create_element());
+        content_tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let first_size = canvas_size(content_tree.root().unwrap()).unwrap();
+        assert_eq!(app.webview_size.get(), first_size);
+
         let previous = app.canvas_frame.get();
-        let context = WindowContext {
-            window_id: scarlet_ui::WindowId::generate(),
-            scene_key: "test".into(),
-            pipeline_id: Default::default(),
-            platform_window_id: 0,
-            is_primary: true,
-        };
-        app.on_window_resize(&context, 420, 340);
+        content_tree.layout(LayoutConstraints::tight(420.0, 340.0));
+        let resized_size = canvas_size(content_tree.root().unwrap()).unwrap();
+        assert_eq!(app.webview_size.get(), resized_size);
+        assert_ne!(resized_size, first_size);
         let deadline = Instant::now() + Duration::from_secs(2);
         while Arc::ptr_eq(&previous, &app.canvas_frame.get()) {
             app.on_idle();
             assert!(Instant::now() < deadline, "resize never reached the canvas");
             thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(
-            app.webview_size.get(),
-            webview_size_for_window(420.0, 340.0)
-        );
+        assert_eq!(app.webview_size.get(), resized_size);
         assert!(
             !wrong_thread.load(Ordering::Acquire),
             "UI state changed on the engine thread"

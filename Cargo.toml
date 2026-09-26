@@ -63,11 +63,11 @@ getrandom = { version = "0.2.16", default-features = false, features = ["custom"
 getrandom-v04 = { package = "getrandom", version = "0.4.3", optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", package = "scarlet-os", default-features = false, features = ["std"] }
 scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", package = "scarlet-sys" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "6a571733b9794a31ee8c76e7ddc5d220de2cbd58", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "91238ed12c3379c0aea7e7ba86e73139cfb1f550", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", default-features = false, features = ["system-fonts", "woff"], optional = true }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "6a571733b9794a31ee8c76e7ddc5d220de2cbd58", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "91238ed12c3379c0aea7e7ba86e73139cfb1f550", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [patch.crates-io]
 ring = { git = "https://github.com/petitstrawberry/ring.git", branch = "scarlet" }
