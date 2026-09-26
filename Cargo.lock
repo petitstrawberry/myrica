@@ -243,7 +243,7 @@ dependencies = [
 [[package]]
 name = "blitz-dom"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "app_units",
  "atomic_refcell",
@@ -284,7 +284,7 @@ dependencies = [
 [[package]]
 name = "blitz-html"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "blitz-dom",
  "blitz-traits",
@@ -295,7 +295,7 @@ dependencies = [
 [[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "anyrender",
  "blitz-dom",
@@ -314,7 +314,7 @@ dependencies = [
 [[package]]
 name = "blitz-traits"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "atomic_refcell",
  "bitflags 2.13.1",
@@ -330,7 +330,7 @@ dependencies = [
 [[package]]
 name = "blitz-vibey-script"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "blitz-dom",
  "blitz-html",
@@ -364,8 +364,7 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9221b0a090572b4a118b46c5874c0781fe4bc9546b85f0a615b8bfb609ca4ed7"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "bitflags 2.13.1",
  "boa_interner",
@@ -380,8 +379,7 @@ dependencies = [
 [[package]]
 name = "boa_engine"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d6aaf7fdc4299df68adb67e1a5440a51d34630a1f5271b9698fd74bc97b60d9"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "aligned-vec",
  "arrayvec",
@@ -437,8 +435,7 @@ dependencies = [
 [[package]]
 name = "boa_gc"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af82119558ab1002d1978c8459b53a3ebb506177d29a3aca37c07c1777b1d966"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "arrayvec",
  "boa_macros",
@@ -451,8 +448,7 @@ dependencies = [
 [[package]]
 name = "boa_interner"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "317c631e791f5cb7d0017e43c0a758b0eaffd40c34c4c360e2a6be7752b78cd1"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "boa_gc",
  "boa_macros",
@@ -467,8 +463,7 @@ dependencies = [
 [[package]]
 name = "boa_macros"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b882fd440dc0f4b7441367cf89567bb077920356750c9a76a16c002d8ec2fa5c"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "cfg-if",
  "cow-utils",
@@ -481,8 +476,7 @@ dependencies = [
 [[package]]
 name = "boa_parser"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "641e81b3c8cbb7a2140547fb3ea534e9edf210b4e8c920b5fa864a919e11fbcf"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "bitflags 2.13.1",
  "boa_ast",
@@ -499,8 +493,7 @@ dependencies = [
 [[package]]
 name = "boa_runtime"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4f64cd1483c17ad23f3c9792cc1f949618178b79b0b25d3fee8f07d3019edd5"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "boa_engine",
  "boa_gc",
@@ -518,8 +511,7 @@ dependencies = [
 [[package]]
 name = "boa_string"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30bf86c2bcff5bf2547acbfc516c5d3108ca527cb131511d749bf6fbef762c0e"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "fast-float2",
  "itoa",
@@ -532,8 +524,7 @@ dependencies = [
 [[package]]
 name = "boa_wintertc"
 version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c66d29a1e767039bfa1981bf149966d4a4d7453190abe13ffccd8aaf95031299"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "base64 0.23.1",
  "boa_engine",
@@ -725,6 +716,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "cookie"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+dependencies = [
+ "percent-encoding",
+ "time",
+ "version_check",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "log",
+ "publicsuffix",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
 ]
 
 [[package]]
@@ -921,7 +941,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "debug_timer"
 version = "0.1.3"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 
 [[package]]
 name = "deranged"
@@ -1136,7 +1156,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2393,6 +2413,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "blitz-vibey-script",
+ "cookie_store",
  "data-url",
  "encoding_rs",
  "getrandom 0.2.17",
@@ -2404,6 +2425,7 @@ dependencies = [
  "mime",
  "parley",
  "peniko",
+ "psl",
  "reqwest",
  "scarlet-os",
  "scarlet-sys",
@@ -3246,6 +3268,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
+name = "psl"
+version = "2.1.238"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e6aa2cd4e8e062e78ac5d7df6206e2f8e39b624f658efd6f34f9aa1928ac5da"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
+
+[[package]]
+name = "publicsuffix"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
+dependencies = [
+ "idna",
+ "psl-types",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3319,7 +3366,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3462,6 +3509,8 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "cookie",
+ "cookie_store",
  "encoding_rs",
  "futures-core",
  "http",
@@ -3560,7 +3609,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3642,7 +3691,7 @@ dependencies = [
 [[package]]
 name = "scarlet-scroll-motion"
 version = "0.1.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "libm",
 ]
@@ -3658,7 +3707,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-platform-sws",
@@ -3668,7 +3717,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-core"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "ab_glyph",
  "bitflags 2.13.1",
@@ -3686,7 +3735,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-icons-tabler"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "svgtypes",
 ]
@@ -3694,7 +3743,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-macros"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3704,7 +3753,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-sws"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "scarlet-ui-core",
  "scarlet-ui-renderer-sgfx",
@@ -3716,7 +3765,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-platform-winit"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "objc2-app-kit",
  "objc2-quartz-core 0.2.2",
@@ -3731,7 +3780,7 @@ dependencies = [
 [[package]]
 name = "scarlet-ui-renderer-sgfx"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=a735bae0a8970b44cf6192a6851da5dc9cf47e1a#a735bae0a8970b44cf6192a6851da5dc9cf47e1a"
+source = "git+https://github.com/petitstrawberry/scarlet-ui?rev=6a571733b9794a31ee8c76e7ddc5d220de2cbd58#6a571733b9794a31ee8c76e7ddc5d220de2cbd58"
 dependencies = [
  "libm",
  "scarlet-ui-core",
@@ -4024,8 +4073,7 @@ dependencies = [
 [[package]]
 name = "small_btree"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ba60d2df92ba73864714808ca68c059734853e6ab722b40e1cf543ebb3a057a"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 dependencies = [
  "arrayvec",
 ]
@@ -4337,7 +4385,7 @@ dependencies = [
 [[package]]
 name = "stylo_taffy"
 version = "0.3.0-beta.2"
-source = "git+https://github.com/petitstrawberry/blitz?rev=65b6d6ca7a3334710a161850595a00d87dcc4ccf#65b6d6ca7a3334710a161850595a00d87dcc4ccf"
+source = "git+https://github.com/petitstrawberry/blitz?rev=2ff62c576f2648b8d44f4bae53ec328030ded8ae#2ff62c576f2648b8d44f4bae53ec328030ded8ae"
 dependencies = [
  "bitflags 2.13.1",
  "stylo",
@@ -4474,8 +4522,7 @@ dependencies = [
 [[package]]
 name = "tag_ptr"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0e973b34477b7823833469eb0f5a3a60370fef7a453e02d751b59180d0a5a05"
+source = "git+https://github.com/petitstrawberry/boa?rev=d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862#d41a2b5f06ecb1bb12d59f8d9df6a8caeaebc862"
 
 [[package]]
 name = "tap"
@@ -5308,7 +5355,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

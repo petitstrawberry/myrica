@@ -11,6 +11,10 @@ use super::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
+// Before the worker split, Application::on_idle drove tick every UI cycle.
+// Preserve that contract: a backend wake is an early-poll hint, not a promise
+// that every pending operation will notify us before it can make progress.
+const ENGINE_POLL_INTERVAL: Duration = FRAME_INTERVAL;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrowserViewport {
@@ -45,7 +49,6 @@ struct Mailbox {
 struct Shared {
     mailbox: Mutex<Mailbox>,
     ready: Condvar,
-    wake_ui: WakeCallback,
 }
 
 /// UI-side proxy. No document, JS runtime, or layout code runs in these methods.
@@ -56,18 +59,13 @@ pub struct BrowserWorker {
 }
 
 impl BrowserWorker {
-    pub fn new(
-        location: &str,
-        viewport: BrowserViewport,
-        wake_ui: WakeCallback,
-    ) -> Result<Self, BackendError> {
-        Self::with_factory(location, viewport, wake_ui, create_backend)
+    pub fn new(location: &str, viewport: BrowserViewport) -> Result<Self, BackendError> {
+        Self::with_factory(location, viewport, create_backend)
     }
 
     fn with_factory(
         location: &str,
         viewport: BrowserViewport,
-        wake_ui: WakeCallback,
         factory: impl FnOnce(WakeCallback) -> Result<Box<dyn BrowserBackend>, BackendError>
         + Send
         + 'static,
@@ -91,7 +89,6 @@ impl BrowserWorker {
                 update: None,
             }),
             ready: Condvar::new(),
-            wake_ui,
         });
         let worker_shared = Arc::clone(&shared);
         let failure_snapshot = snapshot.clone();
@@ -278,7 +275,6 @@ impl Shared {
         };
         // Destruction of obsolete scene data must happen outside the shared lock.
         drop(previous);
-        (self.wake_ui)();
     }
 }
 
@@ -286,9 +282,11 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
     let mut generation = 0;
     let mut dirty = false;
     let mut next_frame_at = Instant::now();
+    let mut next_poll_at = Instant::now();
     let mut last_snapshot = None;
+    let mut rendered_viewport = None;
     loop {
-        let (commands, viewport, woken) = {
+        let (commands, viewport) = {
             let mut mailbox = shared.mailbox.lock().unwrap();
             loop {
                 if mailbox.shutdown {
@@ -296,31 +294,29 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
                 }
                 if !mailbox.commands.is_empty()
                     || mailbox.engine_woken
+                    || Instant::now() >= next_poll_at
                     || (dirty && Instant::now() >= next_frame_at)
                 {
                     break;
                 }
-                mailbox = if dirty {
-                    shared
-                        .ready
-                        .wait_timeout(
-                            mailbox,
-                            next_frame_at.saturating_duration_since(Instant::now()),
-                        )
-                        .unwrap()
-                        .0
+                let deadline = if dirty {
+                    next_frame_at.min(next_poll_at)
                 } else {
-                    shared.ready.wait(mailbox).unwrap()
+                    next_poll_at
                 };
+                mailbox = shared
+                    .ready
+                    .wait_timeout(mailbox, deadline.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                    .0;
             }
-            (
-                std::mem::take(&mut mailbox.commands),
-                mailbox.viewport,
-                std::mem::take(&mut mailbox.engine_woken),
-            )
+            mailbox.engine_woken = false;
+            (std::mem::take(&mut mailbox.commands), mailbox.viewport)
         };
 
-        dirty |= woken || !commands.is_empty();
+        // A wake asks us to poll asynchronous work. Only the backend can tell
+        // whether that work changed the page (a JS timer may change nothing).
+        dirty |= !commands.is_empty() || rendered_viewport != Some(viewport);
         for (command_generation, command) in commands {
             match command {
                 Command::Input(input) => {
@@ -345,6 +341,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
             }
         }
         dirty |= backend.tick();
+        next_poll_at = Instant::now() + ENGINE_POLL_INTERVAL;
         let snapshot = backend.snapshot();
         if last_snapshot.as_ref() != Some(&(generation, snapshot.clone())) {
             shared.publish(generation, snapshot.clone(), None);
@@ -354,6 +351,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
             next_frame_at = Instant::now() + FRAME_INTERVAL;
             let frame = backend.render(viewport.width, viewport.height, viewport.scale);
             shared.publish(generation, backend.snapshot(), Some((viewport, frame)));
+            rendered_viewport = Some(viewport);
             dirty = false;
         }
     }
@@ -402,6 +400,8 @@ mod tests {
         gate: Gate,
         snapshot: BrowserSnapshot,
         dropped: Sender<()>,
+        pending: Option<Receiver<String>>,
+        revision: u64,
         _thread_local: Rc<()>,
     }
 
@@ -418,11 +418,18 @@ mod tests {
         fn go_forward(&mut self) {}
         fn tick(&mut self) -> bool {
             self.gate.enter(Stage::Tick);
+            if let Some(title) = self.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                self.snapshot.title = title;
+                return true;
+            }
             false
         }
         fn render(&mut self, width: u32, height: u32, _: f32) -> BrowserFrame {
             self.gate.enter(Stage::Render);
-            BrowserFrame::empty(width, height)
+            self.revision += 1;
+            let mut frame = BrowserFrame::empty(width, height);
+            frame.revision = self.revision;
+            frame
         }
         fn handle_input(&mut self, _: BrowserInput) -> bool {
             self.gate.enter(Stage::Input);
@@ -443,7 +450,7 @@ mod tests {
         let (entered, entered_rx) = mpsc::channel();
         let (release, release_rx) = mpsc::channel();
         let (dropped, dropped_rx) = mpsc::channel();
-        let worker = BrowserWorker::with_factory("first", VIEWPORT, Arc::new(|| {}), move |_| {
+        let worker = BrowserWorker::with_factory("first", VIEWPORT, move |_| {
             let mut gate = Gate {
                 stage,
                 entered,
@@ -454,6 +461,8 @@ mod tests {
             Ok(Box::new(TestBackend {
                 gate,
                 dropped,
+                pending: None,
+                revision: 0,
                 _thread_local: Rc::new(()),
                 snapshot: BrowserSnapshot {
                     backend_name: "test",
@@ -538,6 +547,103 @@ mod tests {
         }
         drop(worker);
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn idle_wakes_do_not_render_but_resize_does() {
+        let (mut worker, entered, release, dropped) = gated_worker(Stage::Render);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.poll().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..10 {
+            worker.shared.mailbox.lock().unwrap().engine_woken = true;
+            worker.shared.ready.notify_one();
+            thread::sleep(Duration::from_millis(20));
+            assert!(
+                worker.poll().is_none(),
+                "a poll wake generated an unchanged frame"
+            );
+        }
+        worker.resize(BrowserViewport {
+            width: 200,
+            height: 150,
+            ..VIEWPORT
+        });
+        loop {
+            if let Some(frame) = worker.poll() {
+                assert_eq!((frame.width, frame.height), (200, 150));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        drop(worker);
+        dropped.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn pending_engine_work_reaches_ui_without_another_input_or_notification() {
+        let (pending, pending_rx) = mpsc::channel();
+        let (entered, _) = mpsc::channel();
+        let (_, release) = mpsc::channel();
+        let (dropped, dropped_rx) = mpsc::channel();
+        let mut worker = BrowserWorker::with_factory("first", VIEWPORT, move |_| {
+            Ok(Box::new(TestBackend {
+                gate: Gate {
+                    stage: Stage::Tick,
+                    entered,
+                    release,
+                    used: true,
+                },
+                snapshot: BrowserSnapshot {
+                    backend_name: "test",
+                    url: String::new(),
+                    title: String::new(),
+                    load_state: LoadState::Idle,
+                    can_go_back: false,
+                    can_go_forward: false,
+                    text_input: None,
+                },
+                pending: Some(pending_rx),
+                revision: 0,
+                dropped,
+                _thread_local: Rc::new(()),
+            }))
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let initial_frame = loop {
+            if let Some(frame) = worker.poll() {
+                break frame;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initial frame never reached the UI"
+            );
+            thread::sleep(Duration::from_millis(2));
+        };
+        // Work becomes available after the worker has gone idle. Its contract
+        // is to make progress on tick, even if no event-loop wake was emitted.
+        thread::sleep(ENGINE_POLL_INTERVAL * 2);
+        pending.send("loaded after idle".into()).unwrap();
+        loop {
+            if let Some(frame) = worker.poll() {
+                assert!(frame.revision > initial_frame.revision);
+                assert_eq!(worker.snapshot().title, "loaded after idle");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine work stalled waiting for a notification"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        drop(worker);
+        dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

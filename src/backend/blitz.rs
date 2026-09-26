@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(feature = "javascript")]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::task::{Context, Wake, Waker};
 use std::time::Instant;
@@ -77,7 +78,7 @@ enum HistoryAction {
 }
 
 enum BackendMessage {
-    Navigate(Request),
+    Navigate(NavigationOptions),
     RootLoaded {
         generation: u64,
         requested_url: String,
@@ -231,11 +232,7 @@ struct NavigationSink {
 
 impl NavigationProvider for NavigationSink {
     fn navigate_to(&self, options: NavigationOptions) {
-        if self
-            .sender
-            .send(BackendMessage::Navigate(options.into_request()))
-            .is_ok()
-        {
+        if self.sender.send(BackendMessage::Navigate(options)).is_ok() {
             (self.wake)();
         }
     }
@@ -243,10 +240,12 @@ impl NavigationProvider for NavigationSink {
 
 struct RedrawSink {
     wake: WakeCallback,
+    pending: Arc<AtomicBool>,
 }
 
 impl ShellProvider for RedrawSink {
     fn request_redraw(&self) {
+        self.pending.store(true, Ordering::Release);
         (self.wake)();
     }
 }
@@ -259,6 +258,7 @@ pub struct BlitzBackend {
     message_receiver: Receiver<BackendMessage>,
     navigation_provider: Arc<dyn NavigationProvider>,
     shell_provider: Arc<dyn ShellProvider>,
+    redraw_pending: Arc<AtomicBool>,
     font_context: FontContext,
     document: Option<Box<dyn Document>>,
     waker: Waker,
@@ -282,8 +282,10 @@ impl BlitzBackend {
             sender: message_sender.clone(),
             wake: Arc::clone(&wake),
         });
+        let redraw_pending = Arc::new(AtomicBool::new(false));
         let shell_provider: Arc<dyn ShellProvider> = Arc::new(RedrawSink {
             wake: Arc::clone(&wake),
+            pending: Arc::clone(&redraw_pending),
         });
 
         let mut backend = Self {
@@ -294,6 +296,7 @@ impl BlitzBackend {
             message_receiver,
             navigation_provider,
             shell_provider,
+            redraw_pending,
             font_context: fonts::load_font_context(),
             document: None,
             renderer: SgfxSceneRenderer::new(),
@@ -600,6 +603,7 @@ main{{width:min(42rem,82vw)}}h1{{color:#a41e35}}code{{word-break:break-all}}
         let frame = self.renderer.finish_frame();
 
         if inner.is_animating() {
+            self.redraw_pending.store(true, Ordering::Release);
             (self.wake)();
         }
         frame
@@ -766,8 +770,20 @@ impl BrowserBackend for BlitzBackend {
         let mut changed = false;
         while let Ok(message) = self.message_receiver.try_recv() {
             match message {
-                BackendMessage::Navigate(request) => {
-                    self.start_request(request, HistoryAction::Push);
+                BackendMessage::Navigate(options) => {
+                    if self
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.inner().id() != options.source_document)
+                    {
+                        continue;
+                    }
+                    let action = if options.replace {
+                        HistoryAction::Reload
+                    } else {
+                        HistoryAction::Push
+                    };
+                    self.start_request(options.into_request(), action);
                     changed = true;
                 }
                 BackendMessage::RootLoaded {
@@ -825,7 +841,10 @@ impl BrowserBackend for BlitzBackend {
             }
         }
         if let Some(document) = self.document.as_mut() {
-            changed |= document.poll(Some(Context::from_waker(&self.waker)));
+            // ScriptDocument reports whether JS ran, including timers that
+            // never touched the page. DOM/resource changes request a redraw
+            // through the shell provider instead.
+            document.poll(Some(Context::from_waker(&self.waker)));
             let title = document
                 .inner()
                 .find_title_node()
@@ -846,7 +865,7 @@ impl BrowserBackend for BlitzBackend {
                 }
             }
         }
-        changed
+        changed | self.redraw_pending.swap(false, Ordering::AcqRel)
     }
 
     fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
@@ -1359,6 +1378,44 @@ mod tests {
 
     #[cfg(feature = "javascript")]
     #[test]
+    fn timer_without_dom_changes_does_not_request_a_frame() {
+        use blitz_vibey_script::ScriptDocument;
+        use std::sync::atomic::Ordering;
+
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.document = Some(backend.build_document(
+            "<title>timers</title><p id='value'>before</p>",
+            None,
+            None,
+            HashMap::new(),
+        ));
+        backend.render(400, 300, 1.0);
+        backend.tick();
+        let script = (backend.document.as_mut().unwrap().as_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<ScriptDocument>()
+            .unwrap();
+        script.eval("setTimeout(() => { globalThis.timerRan = true; }, 0);");
+        backend.redraw_pending.store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(5));
+        assert!(
+            !backend.tick(),
+            "a timer with no DOM changes repainted the page"
+        );
+        let script = (backend.document.as_mut().unwrap().as_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<ScriptDocument>()
+            .unwrap();
+        script.eval("if (globalThis.timerRan !== true) throw Error('timer did not run');");
+        assert!(script.take_js_errors().is_empty());
+        script.eval(
+            "setTimeout(() => { document.getElementById('value').textContent = 'after'; }, 0);",
+        );
+        backend.redraw_pending.store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(5));
+        assert!(backend.tick(), "a timer that changes the DOM must repaint");
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
     fn external_script_is_prefetched_before_execution() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1541,6 +1598,89 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out loading module page");
             thread::sleep(Duration::from_millis(10));
         }
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn script_cookie_and_replace_continue_navigation_with_http_cookies() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut served = 0;
+            while served < 3 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|s| s == b"\r\n\r\n") {
+                    let mut buffer = [0; 2048];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let (body, headers) = match served {
+                    0 => (
+                        r#"<title>checking</title><script>
+                        if (document.cookie === 'visible=http') {
+                            document.cookie = 'script=ready; Path=/';
+                            location.replace('/verified');
+                        }
+                        </script>"#,
+                        "Set-Cookie: secret=http; HttpOnly; Path=/\r\nSet-Cookie: visible=http; Path=/\r\n",
+                    ),
+                    1 => {
+                        assert!(request.starts_with("GET /verified "));
+                        assert!(request.contains("secret=http"));
+                        assert!(request.contains("script=ready"));
+                        (
+                            r#"<title>fetching</title><script>
+                            if (document.cookie.includes('script=ready') && !document.cookie.includes('secret=')) {
+                                fetch('/data').then(r => r.text()).then(t => document.querySelector('title').textContent = t);
+                            }
+                            </script>"#,
+                            "",
+                        )
+                    }
+                    _ => {
+                        assert!(request.starts_with("GET /data "));
+                        assert!(request.contains("script=ready"));
+                        ("verified", "")
+                    }
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}", body.len()).unwrap();
+                served += 1;
+            }
+            assert_eq!(served, 3);
+        });
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend
+            .navigate(&format!("http://{address}/check"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            backend.tick();
+            if backend.snapshot().title == "verified" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "script navigation/cookie flow stalled: {:?}",
+                backend.snapshot()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(backend.history, [format!("http://{address}/verified")]);
         server.join().unwrap();
     }
 

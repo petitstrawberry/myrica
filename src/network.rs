@@ -12,6 +12,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{BackendError, WakeCallback};
 
+mod cookies;
+use cookies::BrowserCookies;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const USER_AGENT: &str = "Myrica/0.1 (+https://github.com/petitstrawberry/myrica)";
 
@@ -52,12 +55,15 @@ struct NetworkJob {
 pub struct NetworkService {
     sender: UnboundedSender<NetworkJob>,
     wake: WakeCallback,
+    cookies: Arc<BrowserCookies>,
 }
 
 impl NetworkService {
     /// Start the network worker.
     pub fn new(wake: WakeCallback) -> Result<Self, BackendError> {
+        let cookies = Arc::new(BrowserCookies::default());
         let client = reqwest::Client::builder()
+            .cookie_provider(Arc::clone(&cookies))
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(10))
             .timeout(REQUEST_TIMEOUT)
@@ -71,10 +77,18 @@ impl NetworkService {
 
         thread::Builder::new()
             .name(String::from("myrica-network"))
+            // Completion handlers parse module imports and decode resources.
+            // Scarlet's 64 KiB default cannot accommodate those parsers; the
+            // worker can otherwise terminate without delivering its response.
+            .stack_size(8 * 1024 * 1024)
             .spawn(move || runtime.block_on(run_worker(client, receiver)))
             .map_err(|error| BackendError::new(format!("start network worker: {error}")))?;
 
-        Ok(Self { sender, wake })
+        Ok(Self {
+            sender,
+            wake,
+            cookies,
+        })
     }
 
     /// Submit one request without blocking the browser's UI thread.
@@ -91,6 +105,14 @@ impl NetworkService {
 }
 
 impl NetProvider for NetworkService {
+    fn document_cookies(&self, url: &reqwest::Url) -> String {
+        self.cookies.document_cookies(url)
+    }
+
+    fn set_document_cookie(&self, url: &reqwest::Url, cookie: &str) {
+        self.cookies.set_document_cookie(url, cookie);
+    }
+
     fn fetch(&self, _document_id: usize, request: Request, handler: Box<dyn NetHandler>) {
         let requested_url = request.url.to_string();
         let wake = Arc::clone(&self.wake);

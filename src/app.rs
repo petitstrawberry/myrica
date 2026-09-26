@@ -17,7 +17,7 @@ use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
     BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton, BrowserSnapshot,
-    BrowserViewport, BrowserWorker, WakeCallback,
+    BrowserViewport, BrowserWorker,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
@@ -30,7 +30,6 @@ pub struct MyricaApp {
     backend: Rc<RefCell<BrowserWorker>>,
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
-    repaint_revision: State<u64>,
     canvas_handle: SgfxCanvasHandle,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
     webview_size: State<Size>,
@@ -43,16 +42,13 @@ pub struct MyricaApp {
 impl MyricaApp {
     /// Construct the browser and begin loading its initial location.
     pub fn new(initial_location: &str) -> std::result::Result<Self, String> {
-        let repaint_revision = State::new(generate_state_id(), 0_u64);
-        let wake_revision = repaint_revision.clone();
-        let wake: WakeCallback = Arc::new(move || {
-            wake_revision.update(|revision| *revision = revision.wrapping_add(1));
-        });
-
         let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
         let viewport = viewport_for_size(webview_size);
-        let backend = BrowserWorker::new(initial_location, viewport, wake)
-            .map_err(|error| error.to_string())?;
+        // The application loop calls on_idle at least every 16 ms. Keep UI
+        // state and its subscribers on that thread; a worker notification
+        // must not rebuild the entire window before its result is consumed.
+        let backend =
+            BrowserWorker::new(initial_location, viewport).map_err(|error| error.to_string())?;
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
         let initial_frame =
@@ -62,7 +58,6 @@ impl MyricaApp {
             backend: Rc::new(RefCell::new(backend)),
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
-            repaint_revision,
             canvas_handle: SgfxCanvasHandle::new(),
             canvas_frame: State::new(generate_state_id(), initial_frame),
             webview_size: State::new(generate_state_id(), webview_size),
@@ -190,8 +185,6 @@ impl View for MyricaApp {
         vec![
             &self.address,
             &self.snapshot,
-            &self.repaint_revision,
-            &self.canvas_frame,
             &self.webview_size,
             &self.webview_focused,
         ]
@@ -222,8 +215,6 @@ impl Application for MyricaApp {
     fn on_window_resize(&mut self, _ctx: &WindowContext, width: u32, height: u32) {
         self.webview_size
             .set(webview_size_for_window(width as f32, height as f32));
-        self.repaint_revision
-            .update(|revision| *revision = revision.wrapping_add(1));
     }
 
     fn debug_logging(&self) -> bool {
@@ -363,6 +354,141 @@ fn map_key(key: KeyCode) -> BrowserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn idle_pump_applies_navigation_link_timer_and_resize_frames() {
+        use crate::backend::LoadState;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = Vec::new();
+            while served.len() < 3 {
+                assert!(
+                    Instant::now() < deadline,
+                    "navigation never requested all pages"
+                );
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(2));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = [0; 2048];
+                let count = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let path = request.split_whitespace().nth(1).unwrap().to_owned();
+                let title = if path == "/first" {
+                    "first"
+                } else if path == "/address" {
+                    "address"
+                } else {
+                    "linked"
+                };
+                let script = if path == "/linked" {
+                    "<script>setTimeout(() => { document.querySelector('title').textContent = 'timer completed'; document.querySelector('a').textContent = 'updated by timer'; }, 20);</script>"
+                } else {
+                    ""
+                };
+                let body = format!(
+                    "<title>{title}</title><style>body{{margin:0}}a{{display:block;position:absolute;left:0;top:0;width:200px;height:80px}}</style><a href='/linked'>next page</a>{script}"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                served.push(path);
+            }
+            served
+        });
+        let mut app = MyricaApp::new(&format!("{base}/first")).unwrap();
+        let ui_thread = thread::current().id();
+        let wrong_thread = Arc::new(AtomicBool::new(false));
+        let callback: Arc<dyn Fn() + Send + Sync> = {
+            let wrong_thread = Arc::clone(&wrong_thread);
+            Arc::new(move || {
+                if thread::current().id() != ui_thread {
+                    wrong_thread.store(true, Ordering::Release);
+                }
+            })
+        };
+        app.canvas_frame.subscribe_any(Arc::clone(&callback));
+        app.snapshot.subscribe_any(callback);
+
+        let wait_for_page = |app: &mut MyricaApp, path: &str, title: &str| {
+            let previous = app.canvas_frame.get();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                app.on_idle();
+                let snapshot = app.snapshot.get();
+                if snapshot.url == format!("{base}{path}")
+                    && snapshot.title == title
+                    && snapshot.load_state == LoadState::Ready
+                    && !Arc::ptr_eq(&previous, &app.canvas_frame.get())
+                {
+                    assert!(app.canvas_frame.get().draw_count() > 0);
+                    assert_eq!(app.address.get(), snapshot.url);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "UI stayed at {snapshot:?}");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait_for_page(&mut app, "/first", "first");
+        thread::sleep(Duration::from_millis(40));
+        app.address.set(format!("{base}/address"));
+        // Enter and Go share this callback.
+        navigate_from_address(&app.backend, &app.address);
+        wait_for_page(&mut app, "/address", "address");
+        for event in [
+            MouseEvent::Moved { x: 20, y: 20 },
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 20,
+                y: 20,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: 20,
+                y: 20,
+                click_count: 1,
+            },
+        ] {
+            assert!(dispatch_webview_event(&app.backend, &Event::Mouse(event)));
+        }
+        wait_for_page(&mut app, "/linked", "timer completed");
+        let previous = app.canvas_frame.get();
+        let context = WindowContext {
+            window_id: scarlet_ui::WindowId::generate(),
+            scene_key: "test".into(),
+            pipeline_id: Default::default(),
+            platform_window_id: 0,
+            is_primary: true,
+        };
+        app.on_window_resize(&context, 420, 340);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Arc::ptr_eq(&previous, &app.canvas_frame.get()) {
+            app.on_idle();
+            assert!(Instant::now() < deadline, "resize never reached the canvas");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.webview_size.get(),
+            webview_size_for_window(420.0, 340.0)
+        );
+        assert!(
+            !wrong_thread.load(Ordering::Acquire),
+            "UI state changed on the engine thread"
+        );
+        assert_eq!(server.join().unwrap(), ["/first", "/address", "/linked"]);
+    }
 
     #[test]
     fn webview_size_excludes_window_and_browser_chrome() {

@@ -76,6 +76,11 @@ pub(super) fn load_font_context() -> FontContext {
                 continue;
             };
             for entry in entries.flatten() {
+                // Native getdents implementations can expose these entries.
+                // Recursing into them revisits the font tree (and its parents).
+                if entry.file_name() == "." || entry.file_name() == ".." {
+                    continue;
+                }
                 let path = entry.path();
                 if path.is_dir() {
                     if depth < MAX_DEPTH {
