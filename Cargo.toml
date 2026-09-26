@@ -31,10 +31,10 @@ backend-blitz = [
 [dependencies]
 anyrender = { version = "0.13.0", optional = true }
 anyrender_vello_cpu = { version = "0.17.0", optional = true }
-blitz-html = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", optional = true }
-blitz-vibey-script = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", optional = true }
-blitz-paint = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", default-features = false, features = ["scrollbars"], optional = true }
-blitz-traits = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", default-features = false, optional = true }
+blitz-html = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", optional = true }
+blitz-vibey-script = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", optional = true }
+blitz-paint = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", default-features = false, features = ["scrollbars"], optional = true }
+blitz-traits = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", default-features = false, optional = true }
 data-url = { version = "0.3.1", optional = true }
 image = { version = "0.25.6", default-features = false, features = ["gif", "ico", "jpeg", "webp"], optional = true }
 keyboard-types = { version = "0.7", optional = true }
@@ -44,7 +44,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["charset"
 tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
-blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", default-features = false, features = ["woff"], optional = true }
+blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", default-features = false, features = ["woff"], optional = true }
 getrandom = { version = "0.2.16", default-features = false, features = ["custom"] }
 getrandom-v04 = { package = "getrandom", version = "0.4.3", optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a55740a3d2ca49daad0ec7baba233f706f7a", package = "scarlet-os", default-features = false, features = ["std"] }
@@ -52,7 +52,7 @@ scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "b3d2a
 scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "e6e00f11c95de371057899ec05b7a832d04adc7f", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
-blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "b28dde82e79397d85db7c7c0b0d39ae03fe457cf", default-features = false, features = ["system-fonts", "woff"], optional = true }
+blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "ece9e08532c2e060242877d99937a0d634abbc8c", default-features = false, features = ["system-fonts", "woff"], optional = true }
 scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "e6e00f11c95de371057899ec05b7a832d04adc7f", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [patch.crates-io]

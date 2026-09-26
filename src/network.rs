@@ -79,13 +79,17 @@ impl NetProvider for NetworkService {
             Box::new(move |result| {
                 match result {
                     Ok(response) => {
-                        handler.bytes(response.final_url, Bytes::from(response.body));
+                        handler.bytes_with_status(
+                            response.status,
+                            response.final_url,
+                            Bytes::from(response.body),
+                        );
                     }
                     Err(error) => {
                         eprintln!("[myrica:network] {requested_url}: {error}");
                         // Delivering an empty response lets Blitz retire critical resource
                         // bookkeeping instead of leaving the document permanently blocked.
-                        handler.bytes(requested_url, Bytes::new());
+                        handler.bytes_with_status(0, requested_url, Bytes::new());
                     }
                 }
                 wake();

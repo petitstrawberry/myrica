@@ -1288,6 +1288,70 @@ mod tests {
 
     #[cfg(feature = "javascript")]
     #[test]
+    fn javascript_fetch_resolves_with_the_http_response() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        use super::LoadState;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while served < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = [0_u8; 2048];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let body = if request.starts_with("GET /data.json ") {
+                    r#"{"name":"fetched-name"}"#
+                } else {
+                    r#"<html><head><title>waiting</title></head><body>
+                    <script>
+                      fetch("/data.json").then((response) => response.json()).then((data) => {
+                        document.querySelector("title").textContent = data.name;
+                      });
+                    </script></body></html>"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                served += 1;
+            }
+            assert_eq!(served, 2, "browser did not request both page and data");
+        });
+
+        let mut backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
+        backend.navigate(&format!("http://{address}/page")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            backend.tick();
+            let snapshot = backend.snapshot();
+            if matches!(snapshot.load_state, LoadState::Ready) && snapshot.title == "fetched-name" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for fetch promise"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
     fn javascript_web_storage_is_available() {
         let backend = BlitzBackend::new(Arc::new(|| {})).unwrap();
         let document = backend.build_document(
