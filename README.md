@@ -75,7 +75,7 @@ cargo build --locked --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit
 ```
 
-Use the published Scarlet branches of WebKit and LLVM (`eeab068866d3156b27c937a6979e506daa736e93`)
+Use the published Scarlet branches of WebKit and LLVM (`ff2458b51386d6b08bf2b4cff867d6271a1f1fef`)
 and native dependency libraries built from WebKit's dependency source lock.
 The producer installs into `target/native-webkit`; the sys crate discovers its
 `share/scarlet/ScarletWebView.link` automatically. `MYRICA_WEBKIT_LINK_MANIFEST`
