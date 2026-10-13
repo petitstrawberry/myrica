@@ -56,12 +56,25 @@ def main():
     environment["PKG_CONFIG_LIBDIR"] = ":".join(str(p / d) for p in (fonts, deps, runtime)
                                                for d in ("lib/pkgconfig", "share/pkgconfig"))
     commands = []
+    logs = build / "logs"
+    logs.mkdir(exist_ok=True)
 
     def run(command, cwd=None, extra_environment=None):
         command = [str(x) for x in command]
-        commands.append({"argv": command, "cwd": str(cwd or Path.cwd())})
+        log = logs / f"{len(commands):02d}-{Path(command[0]).name}.log"
+        commands.append({"argv": command, "cwd": str(cwd or Path.cwd()), "log": str(log)})
         (build / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
-        subprocess.run(command, cwd=cwd, env=environment | (extra_environment or {}), check=True)
+        with log.open("w") as stream:
+            result = subprocess.run(command, cwd=cwd, env=environment | (extra_environment or {}),
+                                    stdout=stream, stderr=subprocess.STDOUT)
+        if result.returncode:
+            lines = log.read_text(errors="replace").splitlines()
+            for index, line in enumerate(lines):
+                if "error:" in line or "CMake Error" in line:
+                    print("\n".join(lines[max(0, index - 1):index + 7]), flush=True)
+            print("\n".join(lines[-80:]), flush=True)
+            print(f"Full native build log: {log}", flush=True)
+            raise subprocess.CalledProcessError(result.returncode, command)
 
     toolchain = runtime / "share/scarlet/cmake/aarch64-scarlet.cmake"
     if not toolchain.is_file():
