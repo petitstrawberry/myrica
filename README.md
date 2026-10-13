@@ -61,24 +61,24 @@ The experimental backend uses the Scarlet branch of the
 [WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
 `ScarletWebView` C ABI with JavaScriptCore.
 
-The Scarlet development environment provides `MYRICA_WEBKIT_LINK_MANIFEST`
-from the `scarlet-webkit` Nix package. Building the ordinary release desktop
-bundle consumes that immutable installation; no local `artifacts` prefix or
-manual engine checkout is required.
+Scarlet's desktop bundle selects the Myrica Cargo package. Myrica owns the
+WebKit integration; Scarlet's flake provides common compilers and the SDK
+runtime, not application source pins or engine packages.
 
-`platforms/scarlet/webkit.nix` builds the embedding libraries from the published
-WebKit fork and uses its native dependency package. WebKit owns Cairo, ICU,
-Fontconfig, SQLite and the other engine dependencies. The SDK owns libc,
-libc++ and libc++abi. Myrica supplies Brotli/WOFF2 and its embedding build.
-Nix retrieves the pinned sources and keeps intermediate files and installations
-in its own build directories and store.
+The native producer is `platforms/scarlet/build-webkit.py`. It accepts supplied
+WebKit sources, `--runtime`, `--dependencies`, `--font-sources` (Brotli and
+WOFF2), and a required caller-owned `--output` directory. Set
+`MYRICA_WEBKIT_LINK_MANIFEST` to that output's
+`prefix/share/scarlet/ScarletWebView.link` when building with `backend-webkit`.
+The SDK owns libc, libc++ and libc++abi; the WebKit fork owns Cairo, ICU,
+Fontconfig, SQLite and its other engine dependencies. Myrica consumes these
+libraries without rebuilding Fontconfig or SQLite.
 
-For a custom source build, `build-webkit.py` accepts supplied source directories,
-`--runtime`, `--dependencies`, `--font-sources` (Brotli and WOFF2), and a required
-caller-owned `--output` directory. Set `MYRICA_WEBKIT_LINK_MANIFEST` to that
-output's `prefix/share/scarlet/ScarletWebView.link`. The native library list is
-required only when `backend-webkit` is enabled. The SGFX userspace Cargo
-configuration supplies the ordinary native loader link flags.
+Automatic preparation of that native installation during the Myrica Cargo
+build is still pending. A successful ordinary desktop bundle build with
+WebKit has not yet been established. The native library list is required only
+when `backend-webkit` is enabled; the SGFX userspace Cargo configuration
+supplies the ordinary native loader link flags.
 
 The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
 retain Blitz for desktop development and other Scarlet architectures.
