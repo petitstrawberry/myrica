@@ -13,7 +13,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scarlet-source", required=True, type=Path)
     parser.add_argument("--webkit-source", required=True, type=Path)
-    parser.add_argument("--llvm-source", required=True, type=Path)
+    parser.add_argument("--runtime", type=Path,
+                        default=os.environ.get("SCARLET_NATIVE_RUNTIME"),
+                        help="Installed scarlet-sdk C/C++ runtime (or SCARLET_NATIVE_RUNTIME)")
+    parser.add_argument("--output", required=True, type=Path,
+                        help="Caller-owned build directory; Cargo callers use OUT_DIR")
     parser.add_argument("--dependencies", required=True, type=Path)
     parser.add_argument("--font-sources", required=True, type=Path)
     parser.add_argument("--sqlite-source", required=True, type=Path)
@@ -33,15 +37,20 @@ def main():
         if resolved is None:
             parser.error(f"Tool not found: {value}")
         setattr(args, name, resolved)
-    myrica = Path(__file__).resolve().parents[2]
     root = args.scarlet_source.resolve()
     webkit = args.webkit_source.resolve()
-    llvm = args.llvm_source.resolve()
+    if args.runtime is None:
+        parser.error("--runtime or SCARLET_NATIVE_RUNTIME is required")
+    runtime = args.runtime.resolve()
+    for name in ("libscarlet_c.a", "libscarlet_cxx_support.a", "libscarlet_c_startup.a",
+                 "libc++.a", "libc++abi.a"):
+        if not (runtime / "lib" / name).is_file():
+            parser.error(f"SDK runtime library is missing: {runtime / 'lib' / name}")
     deps = args.dependencies.resolve()
-    build = myrica / "target/native-webkit-build"
-    runtime = myrica / "target/native-webkit-runtime"
-    prefix = myrica / "target/native-webkit"
-    fonts = myrica / "target/native-webkit-fonts"
+    build = args.output.resolve()
+    prefix = build / "prefix"
+    fonts = build / "fonts-prefix"
+    memory = build / "memory-prefix"
     build.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     for key in list(environment):
@@ -58,16 +67,18 @@ def main():
         (build / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
         subprocess.run(command, cwd=cwd, env=environment | (extra_environment or {}), check=True)
 
-    for crate, library in (("scarlet-libc", "libscarlet_c.a"),
-                           ("scarlet-webcore-native-memory", "libscarlet_webcore_native_memory.a")):
-        package = root / "user/lib" / crate
-        run(["cargo", "build", "--manifest-path", package / "Cargo.toml", "--locked",
-             "--release", "--target", "aarch64-unknown-scarlet"], root,
-            {"CARGO_TARGET_DIR": str(package / "target")})
-        (runtime / "lib").mkdir(parents=True, exist_ok=True)
-        shutil.copy2(package / "target/aarch64-unknown-scarlet/release" / library, runtime / "lib")
+    package = root / "user/lib/scarlet-webcore-native-memory"
+    memory_target = build / "native-memory"
+    run(["cargo", "build", "--manifest-path", package / "Cargo.toml", "--locked",
+         "--release", "--target", "aarch64-unknown-scarlet"], root,
+        {"CARGO_TARGET_DIR": str(memory_target)})
+    (memory / "lib").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(memory_target / "aarch64-unknown-scarlet/release/libscarlet_webcore_native_memory.a",
+                 memory / "lib/libscarlet_webcore_native_memory.a")
 
-    toolchain = root / "user/lib/scarlet-libc/native/cmake/aarch64-scarlet.cmake"
+    toolchain = runtime / "share/scarlet/cmake/aarch64-scarlet.cmake"
+    if not toolchain.is_file():
+        parser.error(f"SDK CMake toolchain is missing: {toolchain}")
     resource = subprocess.check_output([args.cc, "-print-resource-dir"], text=True).strip()
     cflags = f'-nostdinc -isystem "{resource}/include" -isystem "{runtime}/include" -D__scarlet__=1 -fno-stack-protector -mno-outline-atomics'
     common = ["-G", "Ninja", f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
@@ -84,21 +95,6 @@ def main():
         run(command)
         run(["cmake", "--install", directory])
 
-    configure_build_install(root / "user/lib/scarlet-libc/native", build / "c-support", runtime,
-                            [f"-DSCARLET_LLVM_LIBC_SOURCE_DIR={llvm}/libc"])
-    options = ["-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi",
-               "-DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-unknown-none-elf",
-               "-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=OFF", "-DLIBCXXABI_BAREMETAL=ON",
-               "-DLIBCXX_ENABLE_FILESYSTEM=ON", "-DLIBCXX_HAS_PTHREAD_API=ON",
-               "-DLIBCXXABI_HAS_PTHREAD_API=ON", f"-DCMAKE_C_FLAGS={cflags}",
-               f"-DCMAKE_CXX_FLAGS={cflags} -nostdinc++ -D_LIBCPP_HAS_CLOCK_GETTIME"]
-    options += [f"-D{name}=OFF" for name in (
-        "LLVM_INCLUDE_TESTS", "LLVM_INCLUDE_DOCS", "LIBCXX_INCLUDE_BENCHMARKS",
-        "LIBCXX_ENABLE_SHARED", "LIBCXXABI_ENABLE_SHARED", "LIBCXX_ENABLE_EXCEPTIONS",
-        "LIBCXXABI_ENABLE_EXCEPTIONS", "LIBCXXABI_USE_LLVM_UNWINDER", "LIBCXXABI_USE_COMPILER_RT",
-        "LIBCXX_ENABLE_RANDOM_DEVICE", "LIBCXX_ENABLE_LOCALIZATION", "LIBCXX_ENABLE_WIDE_CHARACTERS",
-        "LIBCXX_ENABLE_TIME_ZONE_DATABASE", "LIBCXX_HAS_TERMINAL_AVAILABLE")]
-    configure_build_install(llvm / "runtimes", build / "cxx", runtime, options)
     build_font_dependencies(args.font_sources, build / "fonts", fonts, runtime, deps,
                             args, common, cflags, resource, run)
     sqlite_source = args.sqlite_source.resolve()
@@ -123,8 +119,8 @@ def main():
         f"-DFontconfig_LIBRARY={fonts}/lib/libfontconfig.a", f"-DFontconfig_INCLUDE_DIR={fonts}/include",
         f"-DSQLite3_LIBRARY={fonts}/lib/libsqlite3.a", f"-DSQLite3_INCLUDE_DIR={fonts}/include",
         "-DUSE_WOFF2=ON", "-DENABLE_VIDEO=ON",
-        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps}",
-        f"-DSCARLET_NATIVE_MEMORY_LIBRARY={runtime}/lib/libscarlet_webcore_native_memory.a",
+        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps};{memory}",
+        f"-DSCARLET_NATIVE_MEMORY_LIBRARY={memory}/lib/libscarlet_webcore_native_memory.a",
         f"-DSCARLET_CXX_RUNTIME_SUPPORT_LIBRARY={runtime}/lib/libscarlet_cxx_support.a",
         f"-DSCARLET_EMBEDDING_RUNTIME_LIBRARIES={libraries}",
         "-DSCARLET_EMBEDDING_LINK_OPTIONS=--wrap=main;--undefined=__wrap_main",

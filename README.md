@@ -61,13 +61,14 @@ The experimental backend uses the Scarlet branch of the
 [WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
 `ScarletWebView` C ABI with JavaScriptCore.
 
-Build the native C/C++ runtimes and WebKit with the existing Scarlet CMake
-toolchain and raw Clang. No SDK modification or linker wrapper is required:
+Build WebKit against the C/C++ runtime supplied by scarlet-sdk, using its
+installed CMake toolchain and raw Clang:
 
 ```bash
 python3 platforms/scarlet/build-webkit.py \
   --scarlet-source ../Scarlet --webkit-source "$WEBKIT_SOURCE" \
-  --llvm-source "$LLVM_SOURCE" --dependencies "$NATIVE_DEPENDENCY_PREFIX" \
+  --runtime "$SCARLET_NATIVE_RUNTIME" --output "$WEBKIT_BUILD_DIR" \
+  --dependencies "$NATIVE_DEPENDENCY_PREFIX" \
   --font-sources "$PINNED_FONT_SOURCES" \
   --sqlite-source "$PINNED_SQLITE_SOURCE" \
   --cc "$RAW_CLANG" --cxx "$RAW_CLANGXX" \
@@ -77,8 +78,12 @@ cargo build --locked --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit
 ```
 
-Use the published Scarlet branches of WebKit and LLVM (`5733bea91affcb26db1f9f4d7459b22c79756c13`)
-and native dependency libraries built from WebKit's dependency source lock.
+The SDK owns libc, libc++, libc++abi and their pinned LLVM source. Myrica builds
+WebKit from its published Scarlet branch, using native dependency libraries
+built from WebKit's dependency source lock. All engine outputs stay below the
+caller-provided `WEBKIT_BUILD_DIR`; Cargo callers use their `OUT_DIR`. Set
+`MYRICA_WEBKIT_LINK_MANIFEST` to the produced
+`WEBKIT_BUILD_DIR/prefix/share/scarlet/ScarletWebView.link` when building Myrica.
 `PINNED_FONT_SOURCES` contains clean `brotli`, `woff2`, and `fontconfig` Git
 checkouts at the revisions recorded in `platforms/scarlet/font_dependencies.py`.
 The producer builds native static font libraries with raw Clang and Meson;
