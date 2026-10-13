@@ -61,41 +61,24 @@ The experimental backend uses the Scarlet branch of the
 [WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
 `ScarletWebView` C ABI with JavaScriptCore.
 
-Build WebKit against the C/C++ runtime supplied by scarlet-sdk, using its
-installed CMake toolchain and raw Clang:
+The Scarlet development environment provides `MYRICA_WEBKIT_LINK_MANIFEST`
+from the `scarlet-webkit` Nix package. Building the ordinary release desktop
+bundle consumes that immutable installation; no local `artifacts` prefix or
+manual engine checkout is required.
 
-```bash
-python3 platforms/scarlet/build-webkit.py \
-  --scarlet-source ../Scarlet --webkit-source "$WEBKIT_SOURCE" \
-  --runtime "$SCARLET_NATIVE_RUNTIME" --output "$WEBKIT_BUILD_DIR" \
-  --dependencies "$NATIVE_DEPENDENCY_PREFIX" \
-  --font-sources "$PINNED_FONT_SOURCES" \
-  --sqlite-source "$PINNED_SQLITE_SOURCE" \
-  --cc "$RAW_CLANG" --cxx "$RAW_CLANGXX" \
-  --ar "$LLVM_AR" --ranlib "$LLVM_RANLIB" --pkg-config "$HOST_PKG_CONFIG"
-cargo build --locked --release --target aarch64-unknown-scarlet \
-  --config ../Scarlet/projects/aarch64-limine-full/.scarlet/sgfx/userspace.toml \
-  --no-default-features --features backend-webkit
-```
+`platforms/scarlet/webkit.nix` builds the embedding libraries from the published
+WebKit fork and uses its native dependency package. WebKit owns Cairo, ICU,
+Fontconfig, SQLite and the other engine dependencies. The SDK owns libc,
+libc++ and libc++abi. Myrica supplies Brotli/WOFF2 and its embedding build.
+Nix retrieves the pinned sources and keeps intermediate files and installations
+in its own build directories and store.
 
-The SDK owns libc, libc++, libc++abi and their pinned LLVM source. Myrica builds
-WebKit from its published Scarlet branch, using native dependency libraries
-built from WebKit's dependency source lock. All engine outputs stay below the
-caller-provided `WEBKIT_BUILD_DIR`; Cargo callers use their `OUT_DIR`. Set
-`MYRICA_WEBKIT_LINK_MANIFEST` to the produced
-`WEBKIT_BUILD_DIR/prefix/share/scarlet/ScarletWebView.link` when building Myrica.
-`PINNED_FONT_SOURCES` contains clean `brotli`, `woff2`, and `fontconfig` Git
-checkouts at the revisions recorded in `platforms/scarlet/font_dependencies.py`.
-The producer builds native static font libraries with raw Clang and Meson;
-Fontconfig uses the Scarlet fork's supported cache-lock directory mode.
-`PINNED_SQLITE_SOURCE` uses the SQLite fork's Scarlet commit
-`a6a2a07c6537d8745a1d132be084ad84794901bc`. Its native `flock` VFS and
-rollback journal retain real file locking without requiring POSIX range locks.
-The producer installs into `target/native-webkit`; the sys crate discovers its
-`share/scarlet/ScarletWebView.link` automatically. `MYRICA_WEBKIT_LINK_MANIFEST`
-can select a different installation. The native library list is required only
-when `backend-webkit` is enabled. The existing SGFX userspace Cargo configuration
-provides the ordinary native loader link flags.
+For a custom source build, `build-webkit.py` accepts supplied source directories,
+`--runtime`, `--dependencies`, `--font-sources` (Brotli and WOFF2), and a required
+caller-owned `--output` directory. Set `MYRICA_WEBKIT_LINK_MANIFEST` to that
+output's `prefix/share/scarlet/ScarletWebView.link`. The native library list is
+required only when `backend-webkit` is enabled. The SGFX userspace Cargo
+configuration supplies the ordinary native loader link flags.
 
 The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
 retain Blitz for desktop development and other Scarlet architectures.

@@ -20,7 +20,6 @@ def main():
                         help="Caller-owned build directory; Cargo callers use OUT_DIR")
     parser.add_argument("--dependencies", required=True, type=Path)
     parser.add_argument("--font-sources", required=True, type=Path)
-    parser.add_argument("--sqlite-source", required=True, type=Path)
     parser.add_argument("--meson", default="meson")
     parser.add_argument("--cc", required=True, help="Raw cross-capable Clang, without a host wrapper")
     parser.add_argument("--cxx", required=True)
@@ -97,16 +96,6 @@ def main():
 
     build_font_dependencies(args.font_sources, build / "fonts", fonts, runtime, deps,
                             args, common, cflags, resource, run)
-    sqlite_source = args.sqlite_source.resolve()
-    sqlite_revision = subprocess.check_output(["git", "-C", sqlite_source, "rev-parse", "HEAD"], text=True).strip()
-    if sqlite_revision != "a6a2a07c6537d8745a1d132be084ad84794901bc":
-        parser.error("--sqlite-source must use the pinned Scarlet SQLite fork revision")
-    sqlite_host = build / "sqlite-host"
-    sqlite_host.mkdir(parents=True, exist_ok=True)
-    run([sqlite_source / "configure", "--disable-shared", "--disable-readline"], sqlite_host)
-    run(["make", "sqlite3.c"], sqlite_host)
-    configure_build_install(webkit / "Source/WebCore/scarlet/Dependencies/SQLite", build / "sqlite", fonts,
-                            [f"-DSCARLET_SQLITE_SOURCE_DIR={sqlite_host}", f"-DCMAKE_C_FLAGS={cflags}"])
     libraries = ";".join(str(runtime / "lib" / name) for name in (
         "libc++.a", "libc++abi.a", "libscarlet_cxx_support.a", "libscarlet_c_startup.a", "libscarlet_c.a"))
     configure_build_install(webkit, build / "webkit", prefix, [
@@ -116,8 +105,8 @@ def main():
         f'-DCMAKE_CXX_FLAGS=-nostdinc++ -isystem "{runtime}/include/c++/v1" {cflags} -fno-exceptions -fno-rtti',
         f"-DCMAKE_ASM_COMPILER={args.cc}", f"-DCMAKE_ASM_FLAGS=--target=aarch64-unknown-none-elf {cflags}",
         f"-DCMAKE_FIND_ROOT_PATH={fonts};{runtime};{deps}", f"-DCMAKE_PREFIX_PATH={fonts};{runtime};{deps}",
-        f"-DFontconfig_LIBRARY={fonts}/lib/libfontconfig.a", f"-DFontconfig_INCLUDE_DIR={fonts}/include",
-        f"-DSQLite3_LIBRARY={fonts}/lib/libsqlite3.a", f"-DSQLite3_INCLUDE_DIR={fonts}/include",
+        f"-DFontconfig_LIBRARY={deps}/lib/libfontconfig.a", f"-DFontconfig_INCLUDE_DIR={deps}/include",
+        f"-DSQLite3_LIBRARY={deps}/lib/libsqlite3.a", f"-DSQLite3_INCLUDE_DIR={deps}/include",
         "-DUSE_WOFF2=ON", "-DENABLE_VIDEO=ON",
         f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps};{memory}",
         f"-DSCARLET_NATIVE_MEMORY_LIBRARY={memory}/lib/libscarlet_webcore_native_memory.a",
