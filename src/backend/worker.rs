@@ -380,6 +380,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
     let mut next_poll_at = Instant::now();
     let mut last_snapshot = None;
     let mut rendered_viewport = None;
+    let mut published_frame = None;
     loop {
         let (commands, viewport) = {
             let mut mailbox = shared.mailbox.lock().unwrap();
@@ -411,7 +412,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
 
         // A wake asks us to poll asynchronous work. Only the backend can tell
         // whether that work changed the page (a JS timer may change nothing).
-        dirty |= !commands.is_empty() || rendered_viewport != Some(viewport);
+        dirty |= rendered_viewport != Some(viewport);
         for (command_generation, command) in commands {
             match command {
                 Command::Input(input) => {
@@ -421,6 +422,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
                 }
                 navigation => {
                     generation = command_generation;
+                    dirty = true;
                     match navigation {
                         Command::Navigate(location) => {
                             if let Err(error) = backend.navigate(&location) {
@@ -445,7 +447,11 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
         if dirty && Instant::now() >= next_frame_at {
             next_frame_at = Instant::now() + FRAME_INTERVAL;
             let frame = backend.render(viewport.width, viewport.height, viewport.scale);
-            shared.publish(generation, backend.snapshot(), Some((viewport, frame)));
+            let identity = (generation, viewport, frame.revision);
+            if published_frame != Some(identity) {
+                shared.publish(generation, backend.snapshot(), Some((viewport, frame)));
+                published_frame = Some(identity);
+            }
             rendered_viewport = Some(viewport);
             dirty = false;
         }

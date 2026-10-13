@@ -106,6 +106,40 @@ document.title = 'hung-entered'; while (true) {}
 """
 
 
+STORAGE = b"""<!doctype html><title>storage-loading</title>
+<script>
+(async () => {
+  try {
+    localStorage.setItem('probe', 'local');
+    sessionStorage.setItem('probe', 'session');
+    if (localStorage.getItem('probe') !== 'local' || sessionStorage.getItem('probe') !== 'session') throw Error('storage readback');
+    if (document.cookie.includes('secret=')) throw Error('HttpOnly exposed');
+    if (!document.cookie.includes('network=visible')) throw Error('HTTP cookie missing');
+    document.cookie = 'script=written; Path=/; SameSite=Lax';
+    document.cookie = 'secret=overwritten; Path=/';
+    const echo = await (await fetch('/cookie-echo', {credentials:'include'})).text();
+    if (!echo.includes('network=visible') || !echo.includes('script=written') || !echo.includes('secret=hidden') || echo.includes('overwritten')) throw Error('cookie sharing: '+echo);
+    const omitted = await (await fetch('/cookie-echo', {credentials:'omit'})).text();
+    if (omitted !== '') throw Error('omit sent cookie');
+    const blob = new Blob(['native-blob'], {type:'text/plain'});
+    const url = URL.createObjectURL(blob);
+    const text = await (await fetch(url)).text();
+    URL.revokeObjectURL(url);
+    if (text !== 'native-blob') throw Error('blob fetch');
+    const frame = document.createElement('iframe');
+    frame.src = '/child';
+    frame.onload = () => {
+      if (frame.contentDocument.body.textContent.trim() !== 'child-body') throw Error('iframe body');
+      if (frame.contentWindow.sessionStorage.getItem('probe') !== 'session') throw Error('iframe session');
+      document.title = 'storage-blob-iframe-ready';
+    };
+    document.body.appendChild(frame);
+  } catch (error) { document.title = 'failed:'+error; }
+})();
+</script><body></body>"""
+
+FRAMESET = b'<html><head><title>frames-loading</title></head><frameset cols="200,*"><frame src="/frame-left"><frame src="/frame-right"></frameset></html>'
+
 def png_chunk(kind: bytes, data: bytes) -> bytes:
     """Encode a PNG chunk with its required big-endian length and CRC."""
     return (
@@ -204,6 +238,18 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MAIN)
         elif path == "/second":
             self.reply(200, "text/html; charset=utf-8", SECOND)
+        elif path == "/storage":
+            self.reply(200, "text/html; charset=utf-8", STORAGE, (("Set-Cookie", "network=visible; Path=/; SameSite=Lax"), ("Set-Cookie", "secret=hidden; HttpOnly; Path=/; SameSite=Lax")))
+        elif path == "/cookie-echo":
+            self.reply(200, "text/plain", self.headers.get("Cookie", "").encode())
+        elif path == "/child":
+            self.reply(200, "text/html", b"<html><body style='margin:0;background:#2468ac'>child-body</body></html>")
+        elif path == "/frames":
+            self.reply(200, "text/html", FRAMESET)
+        elif path == "/frame-left":
+            self.reply(200, "text/html", b"<html><body style='margin:0;background:#2468ac'>left</body></html>")
+        elif path == "/frame-right":
+            self.reply(200, "text/html", b"<html><body style='margin:0;background:#ac6824'>right<script>window.addEventListener('load',()=>parent.document.title='frames-ready')</script></body></html>")
         elif path == "/hung":
             self.reply(200, "text/html; charset=utf-8", HUNG)
         elif path == "/style.css":

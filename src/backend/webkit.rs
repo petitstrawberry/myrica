@@ -98,6 +98,16 @@ impl WebKitBackend {
         })
     }
 
+    /// Read actual DOM text without running host-supplied JavaScript.
+    pub fn text_content(&mut self, id: &str) -> Result<Option<String>, BackendError> {
+        let mut text = ffi::Bytes::empty();
+        // SAFETY: The view belongs to this owner; output is cloned before another call.
+        let status = unsafe { ffi::scarlet_webview_text_content(self.view.as_ptr(), ffi::Bytes::from_str(id), &mut text) };
+        if status == ffi::EMPTY { return Ok(None); }
+        check(status, "inspect WebCore DOM text")?;
+        Ok(Some(read_string(text)?))
+    }
+
     fn start_navigation(&mut self, location: &str) -> Result<(), BackendError> {
         let url = normalize_location(location)?;
         // SAFETY: This live view and borrowed URL are used only on their owner.

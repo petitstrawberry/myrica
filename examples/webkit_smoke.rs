@@ -88,14 +88,14 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let base = std::env::args()
-        .nth(1)
-        .ok_or("usage: webkit-smoke http://HOST:PORT")?;
+    let base = std::env::args().nth(1).ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
+    let pages: Vec<String> = if base == "--pages" { std::env::args().skip(2).collect() } else { Vec::new() };
+    if base == "--pages" && pages.is_empty() { return Err(String::from("--pages requires URLs")); }
     let (sender, receiver) = mpsc::channel();
     let worker = thread::Builder::new()
         .name(String::from("myrica-webkit-smoke"))
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || engine_probe(&base, sender))
+        .spawn(move || engine_probe(&base, sender, &pages))
         .map_err(|error| error.to_string())?;
     let mut owner = Owner {
         worker: Some(worker),
@@ -135,7 +135,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>) -> Result<(), String> {
+fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
     let mut engine = WebKitBackend::new(wake).map_err(|error| error.to_string())?;
     sender
@@ -145,6 +145,44 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>) -> Result<(), St
                 .ok_or("missing native interruption hook")?,
         ))
         .map_err(|error| error.to_string())?;
+    if !pages.is_empty() {
+        for url in pages {
+            engine.render(1280, 720, 1.0);
+            engine.navigate(url).map_err(|error| error.to_string())?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                engine.tick();
+                let state = engine.snapshot();
+                if matches!(state.load_state, LoadState::Failed(_)) { return Err(format!("page failed: {state:?}")); }
+                if state.load_state == LoadState::Ready && !state.title.is_empty() { break; }
+                if Instant::now() >= deadline { return Err(format!("page stalled: {state:?}")); }
+                thread::sleep(Duration::from_millis(10));
+            }
+            pump(&mut engine, Duration::from_secs(3));
+            if url == "https://ichigo.dev/" {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    engine.tick();
+                    let text = engine.text_content("lastfm-placeholder").map_err(|error| error.to_string())?;
+                    if let Some(text) = text.as_ref() {
+                        if !text.contains("Loading...") && !text.trim().is_empty() {
+                            println!("MYRICA_WEBKIT_DOM url={url} id=lastfm-placeholder text={text:?}");
+                            break;
+                        }
+                    }
+                    if Instant::now() >= deadline { return Err(format!("Recent Tracks was not replaced: {text:?}")); }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let frame = engine.render(1280, 720, 1.0);
+            let texture = frame.draws.first().and_then(|draw| draw.texture.as_ref()).ok_or("page has no pixels")?;
+            let nonwhite = texture.pixels.chunks_exact(4).filter(|pixel| pixel[3] != 0 && pixel[..3] != [255, 255, 255]).count();
+            println!("MYRICA_WEBKIT_PAGE url={url} nonwhite={nonwhite} revision={} state={:?}", frame.revision, engine.snapshot());
+            if nonwhite < 100 { return Err(format!("page remains blank: {url}")); }
+        }
+        drop(engine);
+        return Ok(());
+    }
     engine.render(800, 600, 1.0);
     engine
         .navigate(&format!("{base}/redirect"))
@@ -177,6 +215,19 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>) -> Result<(), St
         ));
     }
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=idle-frame revision={revision}");
+
+    // Plain pointer movement over an unchanged background must retain pixels.
+    engine.handle_input(BrowserInput::PointerMoved { x: 350.0, y: 300.0 });
+    engine.tick();
+    let pointer_revision = engine.render(800, 600, 1.0).revision;
+    for index in 0..100 {
+        engine.handle_input(BrowserInput::PointerMoved { x: 350.0 + (index % 10) as f32, y: 300.0 });
+        engine.tick();
+    }
+    if engine.render(800, 600, 1.0).revision != pointer_revision {
+        return Err(String::from("plain pointer motion repainted native pixels"));
+    }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=pointer-move-retains-pixels");
 
     engine.render(500, 400, 2.0);
     wait_title(&mut engine, "width:250")?;
@@ -259,6 +310,16 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>) -> Result<(), St
     });
     wait_title(&mut engine, "scroll:240")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=native-scroll");
+
+    engine.navigate(&format!("{base}/storage")).map_err(|error| error.to_string())?;
+    wait_title(&mut engine, "storage-blob-iframe-ready")?;
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=storage-cookie-blob-iframe");
+    engine.navigate(&format!("{base}/frames")).map_err(|error| error.to_string())?;
+    wait_title(&mut engine, "frames-ready")?;
+    let frame = engine.render(800, 600, 1.0);
+    assert_pixel(&frame, 20, 100, [0x24, 0x68, 0xac, 255])?;
+    assert_pixel(&frame, 300, 100, [0xac, 0x68, 0x24, 255])?;
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=frameset-child-pixels");
 
     engine
         .navigate(&format!("{base}/hung"))

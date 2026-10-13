@@ -103,9 +103,12 @@ uploads WebCore's Cairo framebuffer into its SGFX canvas. The font configuration
 defaults to `/etc/fonts/fonts.conf`; `MYRICA_WEBKIT_FONT_CONFIG` can select another
 installed configuration. Install its referenced fonts in the guest.
 
-The initial Scarlet WebKit profile supports one main browsing frame. Media,
-WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
-service workers, persistent storage, cookies, and IME preedit are unavailable.
+The Scarlet WebKit profile uses WebKit storage namespaces for localStorage and
+sessionStorage, a shared native CookieJarDB for HTTP and document.cookie, and
+BlobRegistryImpl for object URLs. Local storage and persistent cookies use
+$HOME/.local/share/myrica. Subframes retain WebCore sandbox and origin policies.
+Media, WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
+service workers, and IME preedit are unavailable.
 URLs containing embedded usernames or passwords are rejected explicitly.
 Committed Unicode text is delivered to WebCore. Compatibility with general
 websites therefore remains limited.
