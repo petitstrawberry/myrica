@@ -68,6 +68,8 @@ toolchain and raw Clang. No SDK modification or linker wrapper is required:
 python3 platforms/scarlet/build-webkit.py \
   --scarlet-source ../Scarlet --webkit-source "$WEBKIT_SOURCE" \
   --llvm-source "$LLVM_SOURCE" --dependencies "$NATIVE_DEPENDENCY_PREFIX" \
+  --font-sources "$PINNED_FONT_SOURCES" \
+  --sqlite-source "$PINNED_SQLITE_SOURCE" \
   --cc "$RAW_CLANG" --cxx "$RAW_CLANGXX" \
   --ar "$LLVM_AR" --ranlib "$LLVM_RANLIB" --pkg-config "$HOST_PKG_CONFIG"
 cargo build --locked --release --target aarch64-unknown-scarlet \
@@ -75,8 +77,15 @@ cargo build --locked --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit
 ```
 
-Use the published Scarlet branches of WebKit and LLVM (`ff2458b51386d6b08bf2b4cff867d6271a1f1fef`)
+Use the published Scarlet branches of WebKit and LLVM (`5733bea91affcb26db1f9f4d7459b22c79756c13`)
 and native dependency libraries built from WebKit's dependency source lock.
+`PINNED_FONT_SOURCES` contains clean `brotli`, `woff2`, and `fontconfig` Git
+checkouts at the revisions recorded in `platforms/scarlet/font_dependencies.py`.
+The producer builds native static font libraries with raw Clang and Meson;
+Fontconfig uses the Scarlet fork's supported cache-lock directory mode.
+`PINNED_SQLITE_SOURCE` uses the SQLite fork's Scarlet commit
+`a6a2a07c6537d8745a1d132be084ad84794901bc`. Its native `flock` VFS and
+rollback journal retain real file locking without requiring POSIX range locks.
 The producer installs into `target/native-webkit`; the sys crate discovers its
 `share/scarlet/ScarletWebView.link` automatically. `MYRICA_WEBKIT_LINK_MANIFEST`
 can select a different installation. The native library list is required only

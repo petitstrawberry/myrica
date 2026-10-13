@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from font_dependencies import build_font_dependencies
 
 
 def main():
@@ -14,6 +15,9 @@ def main():
     parser.add_argument("--webkit-source", required=True, type=Path)
     parser.add_argument("--llvm-source", required=True, type=Path)
     parser.add_argument("--dependencies", required=True, type=Path)
+    parser.add_argument("--font-sources", required=True, type=Path)
+    parser.add_argument("--sqlite-source", required=True, type=Path)
+    parser.add_argument("--meson", default="meson")
     parser.add_argument("--cc", required=True, help="Raw cross-capable Clang, without a host wrapper")
     parser.add_argument("--cxx", required=True)
     parser.add_argument("--ar", default="llvm-ar")
@@ -23,7 +27,7 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    for name in ("cc", "cxx", "ar", "ranlib", "pkg_config"):
+    for name in ("cc", "cxx", "ar", "ranlib", "pkg_config", "meson"):
         value = getattr(args, name)
         resolved = shutil.which(value)
         if resolved is None:
@@ -37,13 +41,14 @@ def main():
     build = myrica / "target/native-webkit-build"
     runtime = myrica / "target/native-webkit-runtime"
     prefix = myrica / "target/native-webkit"
+    fonts = myrica / "target/native-webkit-fonts"
     build.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     for key in list(environment):
         if key.startswith(("NIX_CFLAGS", "NIX_LDFLAGS", "NIX_PKG_CONFIG", "PKG_CONFIG_")):
             environment.pop(key)
     environment["PKG_CONFIG_PATH"] = ""
-    environment["PKG_CONFIG_LIBDIR"] = ":".join(str(p / d) for p in (deps, runtime)
+    environment["PKG_CONFIG_LIBDIR"] = ":".join(str(p / d) for p in (fonts, deps, runtime)
                                                for d in ("lib/pkgconfig", "share/pkgconfig"))
     commands = []
 
@@ -94,6 +99,18 @@ def main():
         "LIBCXX_ENABLE_RANDOM_DEVICE", "LIBCXX_ENABLE_LOCALIZATION", "LIBCXX_ENABLE_WIDE_CHARACTERS",
         "LIBCXX_ENABLE_TIME_ZONE_DATABASE", "LIBCXX_HAS_TERMINAL_AVAILABLE")]
     configure_build_install(llvm / "runtimes", build / "cxx", runtime, options)
+    build_font_dependencies(args.font_sources, build / "fonts", fonts, runtime, deps,
+                            args, common, cflags, resource, run)
+    sqlite_source = args.sqlite_source.resolve()
+    sqlite_revision = subprocess.check_output(["git", "-C", sqlite_source, "rev-parse", "HEAD"], text=True).strip()
+    if sqlite_revision != "a6a2a07c6537d8745a1d132be084ad84794901bc":
+        parser.error("--sqlite-source must use the pinned Scarlet SQLite fork revision")
+    sqlite_host = build / "sqlite-host"
+    sqlite_host.mkdir(parents=True, exist_ok=True)
+    run([sqlite_source / "configure", "--disable-shared", "--disable-readline"], sqlite_host)
+    run(["make", "sqlite3.c"], sqlite_host)
+    configure_build_install(webkit / "Source/WebCore/scarlet/Dependencies/SQLite", build / "sqlite", fonts,
+                            [f"-DSCARLET_SQLITE_SOURCE_DIR={sqlite_host}", f"-DCMAKE_C_FLAGS={cflags}"])
     libraries = ";".join(str(runtime / "lib" / name) for name in (
         "libc++.a", "libc++abi.a", "libscarlet_cxx_support.a", "libscarlet_c_startup.a", "libscarlet_c.a"))
     configure_build_install(webkit, build / "webkit", prefix, [
@@ -102,8 +119,11 @@ def main():
         f"-DCMAKE_C_FLAGS={cflags}",
         f'-DCMAKE_CXX_FLAGS=-nostdinc++ -isystem "{runtime}/include/c++/v1" {cflags} -fno-exceptions -fno-rtti',
         f"-DCMAKE_ASM_COMPILER={args.cc}", f"-DCMAKE_ASM_FLAGS=--target=aarch64-unknown-none-elf {cflags}",
-        f"-DCMAKE_FIND_ROOT_PATH={runtime};{deps}", f"-DCMAKE_PREFIX_PATH={runtime};{deps}",
-        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={runtime};{deps}",
+        f"-DCMAKE_FIND_ROOT_PATH={fonts};{runtime};{deps}", f"-DCMAKE_PREFIX_PATH={fonts};{runtime};{deps}",
+        f"-DFontconfig_LIBRARY={fonts}/lib/libfontconfig.a", f"-DFontconfig_INCLUDE_DIR={fonts}/include",
+        f"-DSQLite3_LIBRARY={fonts}/lib/libsqlite3.a", f"-DSQLite3_INCLUDE_DIR={fonts}/include",
+        "-DUSE_WOFF2=ON", "-DENABLE_VIDEO=ON",
+        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps}",
         f"-DSCARLET_NATIVE_MEMORY_LIBRARY={runtime}/lib/libscarlet_webcore_native_memory.a",
         f"-DSCARLET_CXX_RUNTIME_SUPPORT_LIBRARY={runtime}/lib/libscarlet_cxx_support.a",
         f"-DSCARLET_EMBEDDING_RUNTIME_LIBRARIES={libraries}",

@@ -51,6 +51,10 @@ impl Default for Bytes {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct PaintStatistics { pub paints: u64, pub painted_pixels: u64 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct Header {
     pub name: Bytes,
     pub value: Bytes,
@@ -227,6 +231,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn scarlet_webview_focus(view: *mut ScarletWebView, focused: u32) -> c_int;
     pub fn scarlet_webview_tick(view: *mut ScarletWebView) -> c_int;
+    pub fn scarlet_webview_needs_paint(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_pixels(view: *mut ScarletWebView, out_pixels: *mut Pixels) -> c_int;
     pub fn scarlet_webview_state(view: *mut ScarletWebView, out_state: *mut State) -> c_int;
     pub fn scarlet_webview_mouse(
@@ -252,6 +257,7 @@ unsafe extern "C" {
         view: *mut ScarletWebView,
         response: *const Response,
     ) -> c_int;
+    pub fn scarlet_webview_paint_statistics(view: *mut ScarletWebView, out: *mut PaintStatistics) -> c_int;
     pub fn scarlet_webview_text_content(
         view: *mut ScarletWebView,
         element_id: Bytes,

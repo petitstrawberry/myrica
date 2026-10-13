@@ -121,6 +121,25 @@ STORAGE = b"""<!doctype html><title>storage-loading</title>
     if (!echo.includes('network=visible') || !echo.includes('script=written') || !echo.includes('secret=hidden') || echo.includes('overwritten')) throw Error('cookie sharing: '+echo);
     const omitted = await (await fetch('/cookie-echo', {credentials:'omit'})).text();
     if (omitted !== '') throw Error('omit sent cookie');
+    const opened = indexedDB.open('myrica-probe', 1);
+    opened.onupgradeneeded = () => opened.result.createObjectStore('records');
+    const db = await new Promise((resolve, reject) => {
+      opened.onsuccess = () => resolve(opened.result);
+      opened.onerror = () => reject(opened.error);
+    });
+    const written = db.transaction('records', 'readwrite');
+    written.objectStore('records').put('indexed-value', 'probe');
+    await new Promise((resolve, reject) => {
+      written.oncomplete = resolve;
+      written.onabort = () => reject(written.error);
+    });
+    const read = db.transaction('records').objectStore('records').get('probe');
+    const value = await new Promise((resolve, reject) => {
+      read.onsuccess = () => resolve(read.result);
+      read.onerror = () => reject(read.error);
+    });
+    db.close();
+    if (value !== 'indexed-value') throw Error('IndexedDB transaction readback');
     const blob = new Blob(['native-blob'], {type:'text/plain'});
     const url = URL.createObjectURL(blob);
     const text = await (await fetch(url)).text();
@@ -238,6 +257,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MAIN)
         elif path == "/second":
             self.reply(200, "text/html; charset=utf-8", SECOND)
+        elif path == "/damage":
+            self.reply(200, "text/html", b"<!doctype html><title>damage-ready</title><body style='margin:0'><div style='position:absolute;left:20px;top:20px;width:20px;height:20px;background:#123456' id='patch'></div><script>window.addEventListener('keydown',()=>{document.getElementById('patch').style.backgroundColor='#654321';document.title='damage-changed'})</script></body>")
         elif path == "/storage":
             self.reply(200, "text/html; charset=utf-8", STORAGE, (("Set-Cookie", "network=visible; Path=/; SameSite=Lax"), ("Set-Cookie", "secret=hidden; HttpOnly; Path=/; SameSite=Lax")))
         elif path == "/cookie-echo":

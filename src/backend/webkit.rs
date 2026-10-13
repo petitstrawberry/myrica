@@ -98,6 +98,14 @@ impl WebKitBackend {
         })
     }
 
+    /// Inspect the engine's actual raster work for native integration checks.
+    pub fn paint_statistics(&mut self) -> Result<ffi::PaintStatistics, BackendError> {
+        let mut statistics = ffi::PaintStatistics::default();
+        // SAFETY: This native view belongs to the current owner thread.
+        check(unsafe { ffi::scarlet_webview_paint_statistics(self.view.as_ptr(), &mut statistics) }, "inspect WebCore paint statistics")?;
+        Ok(statistics)
+    }
+
     /// Read actual DOM text without running host-supplied JavaScript.
     pub fn text_content(&mut self, id: &str) -> Result<Option<String>, BackendError> {
         let mut text = ffi::Bytes::empty();
@@ -378,7 +386,10 @@ impl BrowserBackend for WebKitBackend {
                 "tick WebCore",
             )?;
             self.poll_requests()?;
-            Ok::<_, BackendError>(completed | self.refresh_state()?)
+            let mut needs_paint = 0;
+            // SAFETY: Queries pending damage without rasterizing on a network wake.
+            check(unsafe { ffi::scarlet_webview_needs_paint(self.view.as_ptr(), &mut needs_paint) }, "query pending WebCore paint")?;
+            Ok::<_, BackendError>(completed | self.refresh_state()? | (needs_paint != 0))
         })();
         match result {
             Ok(changed) => changed,
@@ -422,6 +433,7 @@ impl BrowserBackend for WebKitBackend {
                     "WebCore returned a mismatched pixel surface",
                 ));
             }
+            self.last_frame = pixels.generation;
             if let Some(frame) =
                 self.renderer
                     .cached_frame(pixels.generation, width, height, pixels.stride as usize)

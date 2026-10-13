@@ -90,12 +90,13 @@ fn main() -> std::process::ExitCode {
 fn run() -> Result<(), String> {
     let base = std::env::args().nth(1).ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
     let pages: Vec<String> = if base == "--pages" { std::env::args().skip(2).collect() } else { Vec::new() };
+    let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
     if base == "--pages" && pages.is_empty() { return Err(String::from("--pages requires URLs")); }
     let (sender, receiver) = mpsc::channel();
     let worker = thread::Builder::new()
         .name(String::from("myrica-webkit-smoke"))
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || engine_probe(&base, sender, &pages))
+        .spawn(move || engine_probe(&base, sender, &pages, fixture_only))
         .map_err(|error| error.to_string())?;
     let mut owner = Owner {
         worker: Some(worker),
@@ -135,7 +136,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]) -> Result<(), String> {
+fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String], fixture_only: bool) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
     let mut engine = WebKitBackend::new(wake).map_err(|error| error.to_string())?;
     sender
@@ -311,6 +312,21 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
     wait_title(&mut engine, "scroll:240")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=native-scroll");
 
+    engine.navigate(&format!("{base}/damage")).map_err(|error| error.to_string())?;
+    wait_title(&mut engine, "damage-ready")?;
+    engine.render(800, 600, 1.0);
+    let before = engine.paint_statistics().map_err(|error| error.to_string())?;
+    key(&mut engine, BrowserKey::Character('a'), true);
+    key(&mut engine, BrowserKey::Character('a'), false);
+    wait_title(&mut engine, "damage-changed")?;
+    let frame = engine.render(800, 600, 1.0);
+    assert_pixel(&frame, 25, 25, [0x65, 0x43, 0x21, 255])?;
+    assert_pixel(&frame, 300, 300, [255, 255, 255, 255])?;
+    let after = engine.paint_statistics().map_err(|error| error.to_string())?;
+    let painted = after.painted_pixels - before.painted_pixels;
+    if painted >= 800 * 600 { return Err(format!("small DOM change repainted the entire viewport: {painted}")); }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=bounded-damage painted_pixels={painted}");
+
     engine.navigate(&format!("{base}/storage")).map_err(|error| error.to_string())?;
     wait_title(&mut engine, "storage-blob-iframe-ready")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=storage-cookie-blob-iframe");
@@ -320,6 +336,12 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
     assert_pixel(&frame, 20, 100, [0x24, 0x68, 0xac, 255])?;
     assert_pixel(&frame, 300, 100, [0xac, 0x68, 0x24, 255])?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=frameset-child-pixels");
+
+    if fixture_only {
+        drop(engine);
+        println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+        return Ok(());
+    }
 
     engine
         .navigate(&format!("{base}/hung"))
