@@ -11,7 +11,6 @@ from font_dependencies import build_font_dependencies
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scarlet-source", required=True, type=Path)
     parser.add_argument("--webkit-source", required=True, type=Path)
     parser.add_argument("--runtime", type=Path,
                         default=os.environ.get("SCARLET_NATIVE_RUNTIME"),
@@ -36,7 +35,6 @@ def main():
         if resolved is None:
             parser.error(f"Tool not found: {value}")
         setattr(args, name, resolved)
-    root = args.scarlet_source.resolve()
     webkit = args.webkit_source.resolve()
     if args.runtime is None:
         parser.error("--runtime or SCARLET_NATIVE_RUNTIME is required")
@@ -49,7 +47,6 @@ def main():
     build = args.output.resolve()
     prefix = build / "prefix"
     fonts = build / "fonts-prefix"
-    memory = build / "memory-prefix"
     build.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     for key in list(environment):
@@ -65,15 +62,6 @@ def main():
         commands.append({"argv": command, "cwd": str(cwd or Path.cwd())})
         (build / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
         subprocess.run(command, cwd=cwd, env=environment | (extra_environment or {}), check=True)
-
-    package = root / "user/lib/scarlet-webcore-native-memory"
-    memory_target = build / "native-memory"
-    run(["cargo", "build", "--manifest-path", package / "Cargo.toml", "--locked",
-         "--release", "--target", "aarch64-unknown-scarlet"], root,
-        {"CARGO_TARGET_DIR": str(memory_target)})
-    (memory / "lib").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(memory_target / "aarch64-unknown-scarlet/release/libscarlet_webcore_native_memory.a",
-                 memory / "lib/libscarlet_webcore_native_memory.a")
 
     toolchain = runtime / "share/scarlet/cmake/aarch64-scarlet.cmake"
     if not toolchain.is_file():
@@ -108,8 +96,7 @@ def main():
         f"-DFontconfig_LIBRARY={deps}/lib/libfontconfig.a", f"-DFontconfig_INCLUDE_DIR={deps}/include",
         f"-DSQLite3_LIBRARY={deps}/lib/libsqlite3.a", f"-DSQLite3_INCLUDE_DIR={deps}/include",
         "-DUSE_WOFF2=ON", "-DENABLE_VIDEO=ON",
-        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps};{memory}",
-        f"-DSCARLET_NATIVE_MEMORY_LIBRARY={memory}/lib/libscarlet_webcore_native_memory.a",
+        f"-DPKG_CONFIG_EXECUTABLE={args.pkg_config}", f"-DSCARLET_NATIVE_LIBRARY_ROOTS={fonts};{runtime};{deps}",
         f"-DSCARLET_CXX_RUNTIME_SUPPORT_LIBRARY={runtime}/lib/libscarlet_cxx_support.a",
         f"-DSCARLET_EMBEDDING_RUNTIME_LIBRARIES={libraries}",
         "-DSCARLET_EMBEDDING_LINK_OPTIONS=--wrap=main;--undefined=__wrap_main",

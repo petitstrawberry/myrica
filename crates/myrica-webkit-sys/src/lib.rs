@@ -1,5 +1,8 @@
 //! Raw bindings to `ScarletWebView.h`; all calls belong to the creating thread.
 
+#[cfg(target_os = "scarlet")]
+mod native_memory;
+
 use std::ffi::c_int;
 
 pub const ABI_VERSION: u32 = 1;

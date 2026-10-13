@@ -2438,6 +2438,9 @@ dependencies = [
 [[package]]
 name = "myrica-webkit-sys"
 version = "0.1.0"
+dependencies = [
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
+]
 
 [[package]]
 name = "naga"

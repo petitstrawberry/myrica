@@ -65,20 +65,20 @@ Scarlet's desktop bundle selects the Myrica Cargo package. Myrica owns the
 WebKit integration; Scarlet's flake provides common compilers and the SDK
 runtime, not application source pins or engine packages.
 
-The native producer is `platforms/scarlet/build-webkit.py`. It accepts supplied
-WebKit sources, `--runtime`, `--dependencies`, `--font-sources` (Brotli and
-WOFF2), and a required caller-owned `--output` directory. Set
-`MYRICA_WEBKIT_LINK_MANIFEST` to that output's
-`prefix/share/scarlet/ScarletWebView.link` when building with `backend-webkit`.
-The SDK owns libc, libc++ and libc++abi; the WebKit fork owns Cairo, ICU,
-Fontconfig, SQLite and its other engine dependencies. Myrica consumes these
-libraries without rebuilding Fontconfig or SQLite.
+`myrica-webkit-sys` prepares the native installation from its Cargo build script
+when `backend-webkit` is enabled. CMake FetchContent retrieves the pinned WebKit
+fork and upstream font sources inside `OUT_DIR`. The WebKit fork's dependency
+producer owns Cairo, ICU, Fontconfig, SQLite and their source pins. The SDK owns
+libc, libc++ and libc++abi. Myrica supplies the shared-memory C ABI through its
+Rust dependency, alongside its embedding adapter. No nested Cargo build or
+Scarlet source checkout is required.
 
-Automatic preparation of that native installation during the Myrica Cargo
-build is still pending. A successful ordinary desktop bundle build with
-WebKit has not yet been established. The native library list is required only
-when `backend-webkit` is enabled; the SGFX userspace Cargo configuration
-supplies the ordinary native loader link flags.
+All engine build files, downloaded sources and installed archives remain in
+Cargo's build directory. The standard Scarlet development shell provides the
+common SDK runtime and raw compilers. `MYRICA_WEBKIT_LINK_MANIFEST` can explicitly
+select a prebuilt installation; otherwise Cargo builds and uses its own link
+manifest. The SGFX userspace Cargo configuration supplies ordinary native
+loader link flags. Building this CPU Cairo profile does not enable GPU rendering.
 
 The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
 retain Blitz for desktop development and other Scarlet architectures.
