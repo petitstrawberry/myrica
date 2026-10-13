@@ -46,7 +46,11 @@ pub unsafe extern "C" fn scarlet_webcore_memory_close(handle: *mut c_void) -> i3
 
 /// Maps a live native shared-memory object. Ownership of the handle is retained.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn scarlet_webcore_memory_map(handle: *const c_void, size: usize, writable: bool) -> *mut c_void {
+pub unsafe extern "C" fn scarlet_webcore_memory_map(
+    handle: *const c_void,
+    size: usize,
+    writable: bool,
+) -> *mut c_void {
     if size == 0 || size > isize::MAX as usize {
         return std::ptr::null_mut();
     }
@@ -56,7 +60,11 @@ pub unsafe extern "C" fn scarlet_webcore_memory_map(handle: *const c_void, size:
     let Ok(mapping) = handle.as_memory_mapping() else {
         return std::ptr::null_mut();
     };
-    let protection = if writable { prot::READ | prot::WRITE } else { prot::READ };
+    let protection = if writable {
+        prot::READ | prot::WRITE
+    } else {
+        prot::READ
+    };
     match unsafe { mapping.mmap(0, size, protection, flags::SHARED, 0) } {
         Ok(address) => address as *mut c_void,
         Err(_) => std::ptr::null_mut(),
