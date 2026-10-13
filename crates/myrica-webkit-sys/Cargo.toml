@@ -1,0 +1,11 @@
+[package]
+name = "myrica-webkit-sys"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bindings to WebKit's Scarlet embedding API"
+links = "scarlet_webview"
+build = "build.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

@@ -16,6 +16,72 @@ mod blitz;
 #[cfg(feature = "backend-blitz")]
 pub use blitz::BlitzBackend;
 
+#[cfg(feature = "backend-webkit")]
+mod webkit;
+
+// Exercise the texture cache without linking the native C++ engine on the host.
+#[cfg(all(test, not(feature = "backend-webkit")))]
+mod webkit {
+    mod frame;
+    mod pixels;
+}
+
+#[cfg(feature = "backend-webkit")]
+pub use webkit::WebKitBackend;
+
+/// Engine selected for this browser window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Blitz,
+    WebKit,
+}
+
+impl BackendKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Blitz => "Blitz",
+            Self::WebKit => "WebKit",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, BackendError> {
+        let kind = match name {
+            "blitz" => Self::Blitz,
+            "webkit" => Self::WebKit,
+            _ => {
+                return Err(BackendError::new(format!(
+                    "unknown browser backend: {name}"
+                )));
+            }
+        };
+        if kind.enabled() {
+            Ok(kind)
+        } else {
+            Err(BackendError::new(format!(
+                "{} backend was not enabled at build time",
+                kind.name()
+            )))
+        }
+    }
+
+    pub const fn enabled(self) -> bool {
+        match self {
+            Self::Blitz => cfg!(feature = "backend-blitz"),
+            Self::WebKit => cfg!(feature = "backend-webkit"),
+        }
+    }
+}
+
+impl Default for BackendKind {
+    fn default() -> Self {
+        if cfg!(feature = "backend-blitz") {
+            Self::Blitz
+        } else {
+            Self::WebKit
+        }
+    }
+}
+
 /// Thread-safe callback used by a backend to request another application tick.
 pub type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -169,6 +235,12 @@ impl std::error::Error for BackendError {}
 
 /// Narrow WebView-like interface implemented by each embedded browser engine.
 pub trait BrowserBackend {
+    /// Optional thread-safe interruption used before joining a native engine
+    /// during shutdown. The callback must not enter owner-only engine APIs.
+    fn shutdown_callback(&self) -> Option<WakeCallback> {
+        None
+    }
+
     /// Start a new top-level navigation.
     fn navigate(&mut self, location: &str) -> Result<(), BackendError>;
 
@@ -200,11 +272,22 @@ pub trait BrowserBackend {
 
 /// Construct the backend selected at compile time.
 pub fn create_backend(wake: WakeCallback) -> Result<Box<dyn BrowserBackend>, BackendError> {
-    #[cfg(feature = "backend-blitz")]
-    {
-        return Ok(Box::new(BlitzBackend::new(wake)?));
-    }
+    create_backend_selected(BackendKind::default(), wake)
+}
 
-    #[allow(unreachable_code)]
-    Err(BackendError::new("no browser backend is enabled"))
+pub fn create_backend_selected(
+    kind: BackendKind,
+    wake: WakeCallback,
+) -> Result<Box<dyn BrowserBackend>, BackendError> {
+    match kind {
+        #[cfg(feature = "backend-blitz")]
+        BackendKind::Blitz => Ok(Box::new(BlitzBackend::new(wake)?)),
+        #[cfg(feature = "backend-webkit")]
+        BackendKind::WebKit => Ok(Box::new(WebKitBackend::new(wake)?)),
+        #[allow(unreachable_patterns)]
+        _ => Err(BackendError::new(format!(
+            "{} backend was not enabled at build time",
+            kind.name()
+        ))),
+    }
 }

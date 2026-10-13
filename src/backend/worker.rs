@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
-    BackendError, BrowserBackend, BrowserFrame, BrowserInput, BrowserSnapshot, LoadState,
-    WakeCallback, create_backend,
+    BackendError, BackendKind, BrowserBackend, BrowserFrame, BrowserInput, BrowserSnapshot,
+    LoadState, WakeCallback, create_backend, create_backend_selected,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -43,6 +43,7 @@ struct Mailbox {
     generation: u64,
     engine_woken: bool,
     shutdown: bool,
+    shutdown_hook: Option<WakeCallback>,
     update: Option<Update>,
 }
 
@@ -55,14 +56,37 @@ struct Shared {
 pub struct BrowserWorker {
     shared: Arc<Shared>,
     snapshot: BrowserSnapshot,
-    worker: thread::JoinHandle<()>,
+    worker: Option<thread::JoinHandle<()>>,
+    join_on_shutdown: bool,
 }
 
 impl BrowserWorker {
     pub fn new(location: &str, viewport: BrowserViewport) -> Result<Self, BackendError> {
-        Self::with_factory(location, viewport, create_backend)
+        let kind = BackendKind::default();
+        Self::with_factory_named(
+            location,
+            viewport,
+            kind.name(),
+            kind == BackendKind::WebKit,
+            create_backend,
+        )
     }
 
+    pub fn with_backend(
+        location: &str,
+        viewport: BrowserViewport,
+        kind: BackendKind,
+    ) -> Result<Self, BackendError> {
+        Self::with_factory_named(
+            location,
+            viewport,
+            kind.name(),
+            kind == BackendKind::WebKit,
+            move |wake| create_backend_selected(kind, wake),
+        )
+    }
+
+    #[cfg(test)]
     fn with_factory(
         location: &str,
         viewport: BrowserViewport,
@@ -70,8 +94,26 @@ impl BrowserWorker {
         + Send
         + 'static,
     ) -> Result<Self, BackendError> {
+        Self::with_factory_named(
+            location,
+            viewport,
+            BackendKind::default().name(),
+            false,
+            factory,
+        )
+    }
+
+    fn with_factory_named(
+        location: &str,
+        viewport: BrowserViewport,
+        backend_name: &'static str,
+        join_on_shutdown: bool,
+        factory: impl FnOnce(WakeCallback) -> Result<Box<dyn BrowserBackend>, BackendError>
+        + Send
+        + 'static,
+    ) -> Result<Self, BackendError> {
         let snapshot = BrowserSnapshot {
-            backend_name: "Blitz",
+            backend_name,
             url: location.to_owned(),
             title: String::from("Myrica"),
             load_state: LoadState::Loading,
@@ -86,6 +128,7 @@ impl BrowserWorker {
                 generation: 1,
                 engine_woken: true,
                 shutdown: false,
+                shutdown_hook: None,
                 update: None,
             }),
             ready: Condvar::new(),
@@ -117,7 +160,8 @@ impl BrowserWorker {
         Ok(Self {
             shared,
             snapshot,
-            worker,
+            worker: Some(worker),
+            join_on_shutdown,
         })
     }
 
@@ -148,7 +192,11 @@ impl BrowserWorker {
     }
 
     fn send_navigation(&mut self, command: Command) -> Result<(), BackendError> {
-        if self.worker.is_finished() {
+        if self
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+        {
             let error = BackendError::new("browser worker stopped");
             self.snapshot.load_state = LoadState::Failed(error.to_string());
             return Err(error);
@@ -177,7 +225,11 @@ impl BrowserWorker {
     }
 
     pub fn handle_input(&self, input: BrowserInput) -> bool {
-        if self.worker.is_finished() {
+        if self
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+        {
             return false;
         }
         let mut mailbox = self.shared.mailbox.lock().unwrap();
@@ -199,18 +251,60 @@ impl BrowserWorker {
                 (rendered_viewport == viewport).then_some(frame)
             });
         }
-        if self.worker.is_finished() && !matches!(self.snapshot.load_state, LoadState::Failed(_)) {
+        if self
+            .worker
+            .as_ref()
+            .is_none_or(|worker| worker.is_finished())
+            && !matches!(self.snapshot.load_state, LoadState::Failed(_))
+        {
             self.snapshot.load_state = LoadState::Failed(String::from("browser worker stopped"));
         }
         None
+    }
+    /// Close the engine explicitly when the application's event loop ends.
+    /// WebKit's owner is joined before native process finalization.
+    pub fn shutdown(&mut self) {
+        self.shared.mailbox.lock().unwrap().shutdown = true;
+        self.shared.ready.notify_one();
+        if !self.join_on_shutdown {
+            return;
+        }
+        // WebCore owns C++ process globals. Its Page and owner-thread TLS must
+        // be destroyed before main returns and the native CRT finalizes them.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut interrupted = false;
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            if !interrupted {
+                let hook = self.shared.mailbox.lock().unwrap().shutdown_hook.clone();
+                if let Some(hook) = hook {
+                    hook();
+                    interrupted = true;
+                }
+            }
+            if Instant::now() >= deadline {
+                eprintln!("myrica: WebKit owner did not finish shutdown within 30 seconds");
+                // Do not run C++ global finalizers concurrently with a live
+                // engine, or report this shutdown as a normal process exit.
+                std::process::abort();
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                eprintln!("myrica: WebKit owner panicked during shutdown");
+                std::process::abort();
+            }
+        }
     }
 }
 
 impl Drop for BrowserWorker {
     fn drop(&mut self) {
-        self.shared.mailbox.lock().unwrap().shutdown = true;
-        self.shared.ready.notify_one();
-        // Closing the window must not join a worker currently executing page JS.
+        self.shutdown();
     }
 }
 
@@ -279,6 +373,7 @@ impl Shared {
 }
 
 fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
+    shared.mailbox.lock().unwrap().shutdown_hook = backend.shutdown_callback();
     let mut generation = 0;
     let mut dirty = false;
     let mut next_frame_at = Instant::now();

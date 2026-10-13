@@ -9,6 +9,11 @@ license = "MIT"
 name = "myrica"
 path = "src/main.rs"
 
+[[example]]
+name = "webkit-smoke"
+path = "examples/webkit_smoke.rs"
+required-features = ["backend-webkit"]
+
 [features]
 default = ["backend-blitz", "javascript"]
 javascript = ["backend-blitz", "dep:blitz-vibey-script", "dep:getrandom-v04"]
@@ -34,8 +39,18 @@ backend-blitz = [
     "dep:swash",
     "dep:tokio",
 ]
+backend-webkit = [
+    "dep:brotli-decompressor",
+    "dep:flate2",
+    "dep:myrica-webkit-sys",
+    "dep:reqwest",
+    "dep:tokio",
+]
 
 [dependencies]
+brotli-decompressor = { version = "5.0.3", optional = true }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"], optional = true }
+myrica-webkit-sys = { path = "crates/myrica-webkit-sys", optional = true }
 anyrender = { version = "0.13.0", optional = true }
 blitz-html = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", optional = true }
 blitz-vibey-script = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", optional = true }
@@ -63,11 +78,11 @@ getrandom = { version = "0.2.16", default-features = false, features = ["custom"
 getrandom-v04 = { package = "getrandom", version = "0.4.3", optional = true }
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", package = "scarlet-os", default-features = false, features = ["std"] }
 scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", package = "scarlet-sys" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "1b0f08aeb0a7057c9a6d0d7312554372411afff8", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "dcbb7f35ed79c15ae866f17cf884b96963855d13", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", default-features = false, features = ["system-fonts", "woff"], optional = true }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "1b0f08aeb0a7057c9a6d0d7312554372411afff8", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "dcbb7f35ed79c15ae866f17cf884b96963855d13", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [patch.crates-io]
 ring = { git = "https://github.com/petitstrawberry/ring.git", branch = "scarlet" }

@@ -12,6 +12,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::backend::{BackendError, WakeCallback};
 
+#[path = "network/cookies.rs"]
 mod cookies;
 use cookies::BrowserCookies;
 

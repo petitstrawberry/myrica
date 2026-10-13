@@ -17,9 +17,10 @@ The name comes from *Myrica rubra*, an evergreen tree with scarlet fruit.
 - Dedicated engine worker for HTML, JavaScript, layout, and SGFX scene preparation
 - Page `input` and `textarea` editing, including multiline text and IME composition
 - Backend-neutral navigation, input, lifecycle, and retained scene boundary
+- Optional native WebKit backend for AArch64 Scarlet, using a persistent WebCore Page
 
-Blitz is the bring-up backend. Servo is the intended full browser engine once
-its Scarlet platform dependencies have been identified and ported.
+Blitz remains the default engine. The `backend-webkit` feature embeds WebKit's
+Scarlet port through its C ABI; the same ScarletUI chrome can select either engine.
 
 ## Run on desktop
 
@@ -28,6 +29,8 @@ cargo run --release -- https://example.com/
 ```
 
 The URL is optional and defaults to `https://example.com/`.
+Use Ctrl+R to reload and Alt+Left/Alt+Right to move through history, including
+while the address field is focused. The address field accepts a new address with Enter.
 JavaScript is enabled by default. To run without it:
 
 ```bash
@@ -52,9 +55,77 @@ cargo build --release --target riscv64gc-unknown-scarlet
 
 The Scarlet builds also include JavaScript by default.
 
-The Scarlet Rust toolchain input may temporarily lag compiler changes required
-by Myrica's dependencies. Desktop development remains available with an
-ordinary recent Rust toolchain while that input catches up.
+## WebKit on Scarlet
+
+The experimental backend uses the Scarlet branch of the
+[WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
+`ScarletWebView` C ABI with JavaScriptCore.
+
+Build the native C/C++ runtimes and WebKit with the existing Scarlet CMake
+toolchain and raw Clang. No SDK modification or linker wrapper is required:
+
+```bash
+python3 platforms/scarlet/build-webkit.py \
+  --scarlet-source ../Scarlet --webkit-source "$WEBKIT_SOURCE" \
+  --llvm-source "$LLVM_SOURCE" --dependencies "$NATIVE_DEPENDENCY_PREFIX" \
+  --cc "$RAW_CLANG" --cxx "$RAW_CLANGXX" \
+  --ar "$LLVM_AR" --ranlib "$LLVM_RANLIB" --pkg-config "$HOST_PKG_CONFIG"
+cargo build --locked --release --target aarch64-unknown-scarlet \
+  --config ../Scarlet/projects/aarch64-limine-full/.scarlet/sgfx/userspace.toml \
+  --no-default-features --features backend-webkit
+```
+
+Use the published Scarlet branches of WebKit and LLVM (`eeab068866d3156b27c937a6979e506daa736e93`)
+and native dependency libraries built from WebKit's dependency source lock.
+The producer installs into `target/native-webkit`; the sys crate discovers its
+`share/scarlet/ScarletWebView.link` automatically. `MYRICA_WEBKIT_LINK_MANIFEST`
+can select a different installation. The native library list is required only
+when `backend-webkit` is enabled. The existing SGFX userspace Cargo configuration
+provides the ordinary native loader link flags.
+
+The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
+retain Blitz for desktop development and other Scarlet architectures.
+
+Run the installed binary on Scarlet:
+
+```bash
+myrica --backend webkit https://ichigo.dev/
+```
+
+To include both engines, build with the default features plus `backend-webkit`.
+Select `--backend blitz` or `--backend webkit` at startup. Omitting `--backend`
+keeps Blitz when it is available. WebKit uses JavaScriptCore's native C-loop
+interpreter; Myrica's `javascript` feature controls the Blitz/Boa engine only.
+
+WebCore performs navigation, redirects, resource policy, HTML/CSS layout,
+JavaScript, editing, and history. Myrica provides verified HTTP(S) transport and
+uploads WebCore's Cairo framebuffer into its SGFX canvas. The font configuration
+defaults to `/etc/fonts/fonts.conf`; `MYRICA_WEBKIT_FONT_CONFIG` can select another
+installed configuration. Install its referenced fonts in the guest.
+
+The initial Scarlet WebKit profile supports one main browsing frame. Media,
+WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
+service workers, persistent storage, cookies, and IME preedit are unavailable.
+URLs containing embedded usernames or passwords are rejected explicitly.
+Committed Unicode text is delivered to WebCore. Compatibility with general
+websites therefore remains limited.
+
+For native integration checks, start `python3 tests/webkit_server.py --port 0`
+on the host. It prints the actual HTTP base URL and a QEMU guest URL. Build the
+engine-only probe with the same link manifest and ordinary Rust linker:
+
+```bash
+CARGO_TARGET_AARCH64_UNKNOWN_SCARLET_LINKER=rust-lld \
+cargo build --locked --release --target aarch64-unknown-scarlet \
+  --no-default-features --features backend-webkit --example webkit-smoke
+```
+
+Run `webkit-smoke http://10.0.2.2:PORT` in the guest, replacing `PORT` with the
+server's actual port. Use the HTTP base URL without a path.
+The probe checks real HTTP/CSS/image pixels, Retina resizing, native history,
+keyboard editing, POST/reload, scrolling, idle frames, and interruption of an
+actual infinite script. It joins the owner after native Page destruction.
+The host fixture is test input and does not substitute for a live-site GUI check.
 
 ## Architecture
 
@@ -77,8 +148,11 @@ The address field and window controls should remain responsive throughout the
 busy loop. The same page has single-line and multiline fields for editing and
 IME checks.
 
-Backends are selected at compile time. This avoids linking multiple browser
-engines into one process and keeps dependency conflicts isolated.
+Cargo features choose which engines are linked. `--backend` selects an enabled
+engine for the browser window. The default desktop frontend still uses Blitz.
+WebKit shutdown raises JavaScriptCore's concurrent termination trap and joins the
+engine owner before native C++ global finalization. A worker that cannot finish
+within 30 seconds produces an explicit failed process exit.
 
 ## License
 

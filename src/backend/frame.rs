@@ -7,6 +7,7 @@ use scarlet_ui::{
 };
 
 /// CPU-prepared scene. Platform GPU resources are created only on the UI thread.
+#[derive(Clone)]
 pub struct BrowserFrame {
     pub revision: u64,
     pub width: u32,
@@ -14,6 +15,7 @@ pub struct BrowserFrame {
     pub draws: Vec<BrowserDraw>,
 }
 
+#[derive(Clone)]
 pub struct BrowserDraw {
     pub mesh: Arc<SgfxMesh>,
     pub transform: [f32; 16],

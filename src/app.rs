@@ -15,8 +15,8 @@ use scarlet_ui::{
 use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
-    BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton, BrowserSnapshot,
-    BrowserViewport, BrowserWorker,
+    BackendKind, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
+    BrowserSnapshot, BrowserViewport, BrowserWorker,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
@@ -36,18 +36,30 @@ pub struct MyricaApp {
     webview_text_input: State<Option<TextInputElementState>>,
     last_webview_focused: Rc<Cell<bool>>,
     last_backend_url: Rc<RefCell<String>>,
+    browser_shortcut_keys: Rc<RefCell<Vec<KeyCode>>>,
 }
 
 impl MyricaApp {
     /// Construct the browser and begin loading its initial location.
     pub fn new(initial_location: &str) -> std::result::Result<Self, String> {
+        Self::with_backend(initial_location, BackendKind::default())
+    }
+
+    pub fn with_backend(
+        initial_location: &str,
+        kind: BackendKind,
+    ) -> std::result::Result<Self, String> {
         let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
         let viewport = viewport_for_size(webview_size);
         // The application loop calls on_idle at least every 16 ms. Keep UI
         // state and its subscribers on that thread; a worker notification
         // must not rebuild the entire window before its result is consumed.
-        let backend =
-            BrowserWorker::new(initial_location, viewport).map_err(|error| error.to_string())?;
+        let backend = if kind == BackendKind::default() {
+            BrowserWorker::new(initial_location, viewport)
+        } else {
+            BrowserWorker::with_backend(initial_location, viewport, kind)
+        }
+        .map_err(|error| error.to_string())?;
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
         let initial_frame =
@@ -64,6 +76,7 @@ impl MyricaApp {
             webview_text_input: State::new(generate_state_id(), None),
             last_webview_focused: Rc::new(Cell::new(false)),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
+            browser_shortcut_keys: Rc::new(RefCell::new(Vec::new())),
         })
     }
 
@@ -121,9 +134,11 @@ impl MyricaApp {
                 }
             },
         )
-        .on_event(move |event| dispatch_webview_event(&event_backend, event))
         .focusable(self.webview_focused.clone())
         .text_input(self.webview_text_input.clone())
+        // The focused wrapper is the keyboard target. Keep the event handler
+        // outside it so key/IME events reach this ancestor during bubbling.
+        .on_event(move |event| dispatch_webview_event(&event_backend, event))
         .frame(f32::INFINITY, f32::INFINITY);
 
         let status = Text::new(format!(
@@ -135,12 +150,22 @@ impl MyricaApp {
         .padding_insets(EdgeInsets::symmetric(6.0, 10.0))
         .frame(f32::INFINITY, 30.0);
 
-        vstack! {
+        let shortcut_backend = Rc::clone(&self.backend);
+        let shortcut_keys = Rc::clone(&self.browser_shortcut_keys);
+        let content = vstack! {
             header,
             canvas.background(Color::rgb(247, 245, 242)),
             status,
         }
-        .frame(f32::INFINITY, f32::INFINITY)
+        .frame(f32::INFINITY, f32::INFINITY);
+        content.on_event_capture(move |event: &Event| {
+            dispatch_browser_shortcut(&shortcut_backend, &shortcut_keys, event)
+        })
+    }
+
+    /// Stop the owner even if retained window callbacks still hold shell state.
+    pub fn shutdown(&self) {
+        self.backend.borrow_mut().shutdown();
     }
 
     fn synchronize_backend_state(&self) {
@@ -249,6 +274,75 @@ fn navigate_from_address(backend: &Rc<RefCell<BrowserWorker>>, address: &State<S
     }
 }
 
+fn dispatch_browser_shortcut(
+    backend: &Rc<RefCell<BrowserWorker>>,
+    pressed: &Rc<RefCell<Vec<KeyCode>>>,
+    event: &Event,
+) -> bool {
+    match event {
+        Event::Keyboard(KeyEvent::Released { keycode, modifiers }) => {
+            let keycode = normalize_key(*keycode, *modifiers);
+            let mut pressed = pressed.borrow_mut();
+            if let Some(index) = pressed.iter().position(|key| *key == keycode) {
+                pressed.remove(index);
+                return true;
+            }
+        }
+        Event::Keyboard(KeyEvent::Pressed { keycode, modifiers }) => {
+            let keycode = normalize_key(*keycode, *modifiers);
+            let mut backend = backend.borrow_mut();
+            match keycode {
+                KeyCode::Char('r' | 'R')
+                    if modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.super_key =>
+                {
+                    backend.reload()
+                }
+                KeyCode::Left
+                    if modifiers.alt
+                        && !modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.super_key =>
+                {
+                    backend.go_back()
+                }
+                KeyCode::Right
+                    if modifiers.alt
+                        && !modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.super_key =>
+                {
+                    backend.go_forward()
+                }
+                _ => {
+                    // Recover a held shortcut after a platform drops its keyup
+                    // while the window is inactive. Ordinary new presses own
+                    // their following text, regardless of the previous focus.
+                    pressed.borrow_mut().retain(|key| *key != keycode);
+                    return false;
+                }
+            }
+            if !pressed.borrow().contains(&keycode) {
+                pressed.borrow_mut().push(keycode);
+            }
+            return true;
+        }
+        Event::Keyboard(KeyEvent::Char { c }) => {
+            // Winit delivers printable text separately even for Ctrl+R. The
+            // browser owns all phases of a captured shortcut, including text.
+            if pressed.borrow().iter().any(
+                |key| matches!(key, KeyCode::Char(character) if character.eq_ignore_ascii_case(c)),
+            ) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 fn dispatch_webview_event(backend: &Rc<RefCell<BrowserWorker>>, event: &Event) -> bool {
     let input = match event {
         Event::Mouse(MouseEvent::Moved { x, y }) | Event::Mouse(MouseEvent::Entered { x, y }) => {
@@ -288,12 +382,12 @@ fn dispatch_webview_event(backend: &Rc<RefCell<BrowserWorker>>, event: &Event) -
             y: *y as f32,
         },
         Event::Keyboard(KeyEvent::Pressed { keycode, modifiers }) => BrowserInput::Key {
-            key: map_key(*keycode),
+            key: map_key(normalize_key(*keycode, *modifiers)),
             pressed: true,
             modifiers: map_modifiers(*modifiers),
         },
         Event::Keyboard(KeyEvent::Released { keycode, modifiers }) => BrowserInput::Key {
-            key: map_key(*keycode),
+            key: map_key(normalize_key(*keycode, *modifiers)),
             pressed: false,
             modifiers: map_modifiers(*modifiers),
         },
@@ -332,6 +426,20 @@ fn map_modifiers(modifiers: KeyModifiers) -> BrowserModifiers {
     }
 }
 
+fn normalize_key(key: KeyCode, modifiers: KeyModifiers) -> KeyCode {
+    // Native SWS represents Ctrl+A..Z as U+0001..001A in both physical key
+    // phases. Recover the base letter for DOM codes and browser shortcuts;
+    // actual committed text continues through its separate Char event.
+    match key {
+        KeyCode::Char(character)
+            if modifiers.control && ('\u{1}'..='\u{1a}').contains(&character) =>
+        {
+            KeyCode::Char(char::from_u32(character as u32 + 0x60).unwrap())
+        }
+        _ => key,
+    }
+}
+
 fn map_key(key: KeyCode) -> BrowserKey {
     match key {
         KeyCode::Escape => BrowserKey::Escape,
@@ -357,6 +465,288 @@ fn map_key(key: KeyCode) -> BrowserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "backend-blitz")]
+    #[test]
+    fn focused_canvas_routes_keyboard_to_the_real_page_editor() {
+        use crate::backend::LoadState;
+        use scarlet_ui::pipeline::RenderingPipeline;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/input", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for generation in 1..=7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let length = stream.read(&mut request).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&request[..length])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_owned(),
+                );
+                let body = format!(
+                    "<title>ready-{generation}</title><style>body{{margin:0}}input{{position:absolute;left:0;top:0;width:500px;height:200px}}</style><input id='editor'>"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            paths
+        });
+        let mut app = MyricaApp::new(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-1"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "page did not become ready: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        let mut pipeline = RenderingPipeline::new();
+        pipeline.set_root(
+            app.content()
+                .frame(WINDOW_WIDTH, WINDOW_HEIGHT)
+                .create_element(),
+        );
+        pipeline.layout_initial();
+        // Real ScarletUI dispatch chooses the focusable canvas wrapper as the
+        // keyboard target. Its outer event handler must receive the bubble.
+        assert!(
+            pipeline.handle_event(&Event::Mouse(MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            }))
+        );
+        pipeline.handle_event(&Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x: 120,
+            y: 100,
+            click_count: 1,
+        }));
+        assert!(app.webview_focused.get(), "canvas did not gain focus");
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Char('a'),
+            modifiers: KeyModifiers::default(),
+        })));
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Char { c: 'a' })));
+        pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+            keycode: KeyCode::Char('a'),
+            modifiers: KeyModifiers::default(),
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .snapshot
+            .get()
+            .text_input
+            .as_ref()
+            .is_some_and(|input| input.surrounding_text == "a")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "page editor did not receive keyboard events: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Char('r'),
+            modifiers: KeyModifiers {
+                control: true,
+                ..Default::default()
+            },
+        })));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-2"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Ctrl+R did not reload over HTTP: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Keep R physically held while focusing the fresh real page editor.
+        // Winit's following Char('r') must not become text after a shortcut.
+        for event in [
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            },
+        ] {
+            pipeline.handle_event(&Event::Mouse(event));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().text_input.is_none() {
+            assert!(Instant::now() < deadline, "fresh editor did not gain focus");
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Char { c: 'r' })));
+        pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+            keycode: KeyCode::Char('r'),
+            modifiers: KeyModifiers::default(),
+        }));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.snapshot.get().text_input.unwrap().surrounding_text, "");
+        // Exercise SWS's actual Ctrl+R representation separately.
+        for event in [
+            KeyEvent::Pressed {
+                keycode: KeyCode::Char('\u{12}'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            KeyEvent::Released {
+                keycode: KeyCode::Char('\u{12}'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+        ] {
+            assert!(pipeline.handle_event(&Event::Keyboard(event)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-3"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "native-shaped Ctrl+R did not reload: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        let origin = url.trim_end_matches("/input");
+        app.backend
+            .borrow_mut()
+            .navigate(&format!("{origin}/second"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-4" || !app.snapshot.get().can_go_back {
+            assert!(
+                Instant::now() < deadline,
+                "second page did not become ready"
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        // A focused address field consumes Char and arrow events itself.
+        // Browser capture must run before that editor for all shortcut phases.
+        for event in [
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 250,
+                y: 24,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: 250,
+                y: 24,
+                click_count: 1,
+            },
+        ] {
+            pipeline.handle_event(&Event::Mouse(event));
+        }
+        assert!(
+            !app.webview_focused.get(),
+            "address editor did not gain focus"
+        );
+        let original_address = app.address.get();
+        for event in [
+            KeyEvent::Pressed {
+                keycode: KeyCode::Char('r'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            KeyEvent::Char { c: 'r' },
+            KeyEvent::Released {
+                keycode: KeyCode::Char('r'),
+                modifiers: KeyModifiers::default(),
+            },
+        ] {
+            assert!(pipeline.handle_event(&Event::Keyboard(event)));
+        }
+        assert_eq!(
+            app.address.get(),
+            original_address,
+            "shortcut inserted text into the address"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-5"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "address-focused Ctrl+R did not reload"
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        for (keycode, expected) in [(KeyCode::Left, "ready-6"), (KeyCode::Right, "ready-7")] {
+            assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+                keycode,
+                modifiers: KeyModifiers {
+                    alt: true,
+                    ..Default::default()
+                }
+            })));
+            assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+                keycode,
+                modifiers: KeyModifiers::default()
+            })));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.snapshot.get().title != expected
+                || app.snapshot.get().load_state != LoadState::Ready
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "Alt history navigation did not load {expected}: {:?}",
+                    app.snapshot.get()
+                );
+                app.on_idle();
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "/input", "/input", "/input", "/second", "/second", "/input", "/second"
+            ]
+        );
+        app.shutdown();
+    }
 
     #[cfg(feature = "javascript")]
     #[test]
