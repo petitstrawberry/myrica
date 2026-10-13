@@ -5,7 +5,7 @@ find_package(Git REQUIRED)
 
 # Cargo owns this build directory. FetchContent owns downloads and their state;
 # the application source tree never contains a second WebKit checkout.
-set(_webkit_revision "e0f1a9bbff3b782df2301782477ad09288421765")
+set(_webkit_revision "8e86ace29f3851ef481d6b3ba3aba8c138550471")
 FetchContent_Declare(webkit
     DOWNLOAD_COMMAND
         "${GIT_EXECUTABLE}" init <SOURCE_DIR>
@@ -13,7 +13,9 @@ FetchContent_Declare(webkit
         COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> config remote.origin.promisor true
         COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> config remote.origin.partialclonefilter blob:none
         COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> fetch --depth=1 --filter=blob:none origin "${_webkit_revision}"
-        COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> sparse-checkout set Source Tools
+        COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> sparse-checkout set --no-cone
+            "/*" "!/*/" "/Source/" "/Tools/"
+            "!/Source/ThirdParty/skia/" "!/Source/ThirdParty/libwebrtc/"
         COMMAND "${GIT_EXECUTABLE}" -C <SOURCE_DIR> checkout --detach "${_webkit_revision}"
     UPDATE_COMMAND ""
     SOURCE_SUBDIR _myrica_download_only)
