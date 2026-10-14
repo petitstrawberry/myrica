@@ -79,10 +79,10 @@ fn gpu_page_contract() -> Result<(), String> {
         let mut view = std::ptr::null_mut();
         let configuration = ffi::Configuration {
             abi_version: ffi::ABI_VERSION,
-            width: 160,
-            height: 112,
+            width: 320,
+            height: 224,
             script_enabled: 1,
-            device_scale_factor: 1.0,
+            device_scale_factor: 2.0,
         };
         check(
             ffi::scarlet_webview_create(&configuration, &mut view),
@@ -189,7 +189,7 @@ document.getElementById('marker').textContent=green?'clicked':'JS executed';}</s
                 "release third",
             )?;
             println!(
-                "PASS: WebCore DOM/CSS/JS/input GPU pages, two-image backpressure and immutable leased readback"
+                "PASS: WebCore DOM/CSS/JS/input Retina GPU pages, two-image backpressure and immutable leased readback"
             );
             Ok(())
         })();
@@ -225,7 +225,7 @@ unsafe fn verify_gpu_pixels(
     }
     let bytes = unsafe { std::slice::from_raw_parts(pixels.data, pixels.length) };
     for (x, y, expected) in [(0, 0, [255; 4]), (24, 24, [0, 0, 255, 255]), (72, 40, blue)] {
-        let offset = y * pixels.stride as usize + x * 4;
+        let offset = (y * 2) * pixels.stride as usize + (x * 2) * 4;
         if bytes.get(offset..offset + 4) != Some(expected.as_slice()) {
             return Err(format!(
                 "GPU DOM pixel mismatch at {x},{y}: {:?}",
@@ -236,7 +236,7 @@ unsafe fn verify_gpu_pixels(
     let mut ink = 0;
     for y in 88..106 {
         for x in 0..104 {
-            let offset = y * pixels.stride as usize + x * 4;
+            let offset = (y * 2) * pixels.stride as usize + (x * 2) * 4;
             if bytes[offset] < 96 && bytes[offset + 1] < 96 && bytes[offset + 2] < 96 {
                 ink += 1;
             }
@@ -254,10 +254,10 @@ unsafe fn click_fixture(view: *mut myrica_webkit_sys::ScarletWebView) -> Result<
             kind,
             button: 1,
             click_count: 1,
-            x: 120.0,
-            y: 80.0,
-            global_x: 120.0,
-            global_y: 80.0,
+            x: 240.0,
+            y: 160.0,
+            global_x: 240.0,
+            global_y: 160.0,
             ..Default::default()
         };
         let mut handled = 0;
