@@ -260,7 +260,7 @@ fn engine_probe(
         ))
         .map_err(|error| error.to_string())?;
     if media_only {
-        for path in ["normal", "mse", "mse-big"] {
+        for path in ["normal", "normal-main", "normal-high", "mse", "mse-big"] {
             sender
                 .send(OwnerMessage::PageProgress)
                 .map_err(|error| error.to_string())?;
@@ -698,6 +698,67 @@ fn video_page_probe(
     }
 }
 
+fn verify_media_presentation_history(state: &serde_json::Value, path: &str) -> Result<(), String> {
+    let encoding = &state["encoding"];
+    let profile = match path {
+        "normal-main" => "Main",
+        "normal-high" => "High",
+        _ => "Constrained Baseline",
+    };
+    let reordered = matches!(path, "normal-main" | "normal-high");
+    if encoding["profile"] != profile
+        || encoding["frames"] != 24
+        || (encoding["b_frames"].as_u64().unwrap_or(0) > 0) != reordered
+        || (encoding["reorder_depth"].as_u64().unwrap_or(0) > 0) != reordered
+    {
+        return Err(format!(
+            "missing actual encoded profile/reorder evidence ({path}): {encoding}"
+        ));
+    }
+    let pts = encoding["pts"]
+        .as_array()
+        .filter(|values| values.len() == 24)
+        .ok_or_else(|| format!("missing actual ffprobe PTS ({path})"))?;
+    let history = state["frames"]
+        .as_array()
+        .filter(|frames| frames.len() >= 3)
+        .ok_or_else(|| format!("missing native video frame callback history ({path})"))?;
+    let mut previous: Option<(u64, f64, u64)> = None;
+    for metadata in history {
+        let time = metadata["time"]
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("missing native callback mediaTime ({path}): {metadata}"))?;
+        let epoch = metadata["epoch"]
+            .as_u64()
+            .ok_or_else(|| format!("missing callback seek epoch ({path}): {metadata}"))?;
+        let count = metadata["count"]
+            .as_u64()
+            .ok_or_else(|| format!("missing presented-frame count ({path}): {metadata}"))?;
+        if metadata["width"] != 128
+            || metadata["height"] != 96
+            || !pts
+                .iter()
+                .any(|pts| pts.as_f64().is_some_and(|pts| (time - pts).abs() < 0.00001))
+        {
+            return Err(format!(
+                "native frame lost original encoded PTS/extent ({path}): {metadata}"
+            ));
+        }
+        if let Some((previous_epoch, previous_time, previous_count)) = previous {
+            if epoch < previous_epoch
+                || (epoch == previous_epoch && (time <= previous_time || count <= previous_count))
+            {
+                return Err(format!(
+                    "native frames duplicated or presented in decode order ({path}): {previous:?} -> {metadata}"
+                ));
+            }
+        }
+        previous = Some((epoch, time, count));
+    }
+    Ok(())
+}
+
 fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), String> {
     engine.render(400, 240, 1.0)?;
     engine
@@ -813,6 +874,7 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
                     "media frame callbacks/quality lack actual frame metadata ({path}): {state}"
                 ));
             }
+            verify_media_presentation_history(&state, path)?;
             println!(
                 "MYRICA_WEBKIT_SMOKE_PASS stage=media-{path} colours={colours:?} frames={changed_frames} state={state}"
             );

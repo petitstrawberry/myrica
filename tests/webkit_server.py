@@ -195,6 +195,9 @@ const video = document.getElementById('video');
 let frameCallbacks = 0;
 let lastFrameMetadata = null;
 let observingFrames = false;
+let presentationEpoch = 0;
+const frameHistory = [];
+let encodingEvidence = null;
 const mse = location.pathname.endsWith('/mse') || location.pathname.endsWith('/mse-big');
 function fail(error) { document.title = 'media-error:' + String(error); }
 video.addEventListener('error', () => fail('video:' + video.error?.code));
@@ -210,6 +213,8 @@ document.getElementById('play').addEventListener('click', () => {
       ++frameCallbacks;
       lastFrameMetadata = { time:metadata.mediaTime, count:metadata.presentedFrames,
                             width:metadata.width, height:metadata.height };
+      frameHistory.push({...lastFrameMetadata, epoch:presentationEpoch});
+      if (frameHistory.length > 128) frameHistory.shift();
       video.requestVideoFrameCallback(frameReady);
     }
     video.requestVideoFrameCallback(frameReady);
@@ -221,7 +226,8 @@ function updateState() {
     time:video.currentTime, duration:video.duration, paused:video.paused,
     ended:video.ended, ready:video.readyState, width:video.videoWidth, height:video.videoHeight,
     error:video.error?.code || 0, callbacks:frameCallbacks, metadata:lastFrameMetadata,
-    quality:video.getVideoPlaybackQuality().totalVideoFrames
+    quality:video.getVideoPlaybackQuality().totalVideoFrames,
+    frames:frameHistory, encoding:encodingEvidence
   });
 }
 updateState();
@@ -230,7 +236,10 @@ window.addEventListener('keydown', event => {
   if (event.key === 'p') {
     if (video.paused) video.play().catch(fail);
     else { video.pause(); document.title = 'media-paused'; }
-  } else if (event.key === 's') video.currentTime = 0.25;
+  } else if (event.key === 's') {
+    ++presentationEpoch;
+    video.currentTime = 0.25;
+  }
 });
 async function append(buffer, bytes) {
   await new Promise((resolve, reject) => {
@@ -254,7 +263,11 @@ async function loadMse() {
   }));
   source.endOfStream();
 }
-if (mse) loadMse().catch(fail); else video.src = '/media/normal.mp4';
+const fixture = mse ? 'normal' : location.pathname.split('/').pop();
+fetch('/media/' + fixture + '.encoding.json')
+  .then(response => response.json())
+  .then(evidence => { encodingEvidence = evidence; updateState(); }).catch(fail);
+if (mse) loadMse().catch(fail); else video.src = '/media/' + fixture + '.mp4';
 </script>"""
 
 
@@ -281,6 +294,40 @@ def media_segments(data: bytes) -> list[bytes]:
     return segments
 
 
+def video_encoding_evidence(path: Path, expected_profile: str, reordered: bool) -> dict:
+    """Record actual coded/display order; reject duped CFR or B-frame-free inputs."""
+    def probe(kind: str, entries: str) -> dict:
+        output = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0", f"-show_{kind}",
+            "-show_entries", entries, "-of", "json", str(path),
+        ])
+        return json.loads(output)
+
+    stream = probe("streams", "stream=codec_name,profile,width,height,has_b_frames,r_frame_rate")['streams'][0]
+    frames = probe("frames", "frame=best_effort_timestamp_time,pict_type")['frames']
+    packets = probe("packets", "packet=pts_time,dts_time,duration_time")['packets']
+    pts = [float(frame['best_effort_timestamp_time']) for frame in frames]
+    packet_pts = [float(packet['pts_time']) for packet in packets]
+    packet_dts = [float(packet['dts_time']) for packet in packets]
+    expected_pts = [index / 8 for index in range(24)]
+    b_frames = sum(frame['pict_type'] == 'B' for frame in frames)
+    has_reorder = any(right < left for left, right in zip(packet_pts, packet_pts[1:]))
+    if (stream['codec_name'] != 'h264' or stream['profile'] != expected_profile
+            or stream['width'] != 128 or stream['height'] != 96 or stream['r_frame_rate'] != '8/1'
+            or len(frames) != 24 or len(packets) != 24 or pts != expected_pts
+            or sorted(packet_pts) != expected_pts
+            or any(right <= left for left, right in zip(packet_dts, packet_dts[1:]))
+            or bool(b_frames) != reordered or has_reorder != reordered
+            or bool(stream['has_b_frames']) != reordered):
+        raise ValueError(f"unexpected actual H.264 fixture encoding: {path.name}: {stream}, "
+                         f"frames={len(frames)} B={b_frames} PTS={pts} packetPTS={packet_pts}")
+    return {
+        "profile": stream['profile'], "frames": len(frames), "width": stream['width'],
+        "height": stream['height'], "b_frames": b_frames, "reorder_depth": stream['has_b_frames'],
+        "pts": pts, "packet_pts": packet_pts, "packet_dts": packet_dts,
+    }
+
+
 def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
     """Create our own three-second H.264/AAC fixtures; nothing is downloaded."""
     video = directory / "video.mp4"
@@ -293,7 +340,8 @@ def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
         "-f", "lavfi", "-i", "color=lime:s=128x96:r=8:d=1",
         "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0,scale=out_color_matrix=bt709:out_range=tv[v]",
         "-map", "[v]", "-c:v", "libx264", "-profile:v", "baseline", "-level:v", "3.0",
-        "-pix_fmt", "yuv420p", "-g", "8", "-keyint_min", "8", "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p", "-g", "8", "-keyint_min", "8", "-sc_threshold", "0", "-bf", "0",
+        "-fps_mode", "passthrough", "-enc_time_base", "1:8", "-frames:v", "24",
         "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
         "-movflags", "empty_moov+frag_keyframe+default_base_moof", str(video),
     ], check=True)
@@ -305,6 +353,30 @@ def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
     subprocess.run(common + ["-i", str(video), "-i", str(audio), "-map", "0:v", "-map", "1:a",
                              "-c", "copy", "-movflags", "+faststart", str(normal)], check=True)
     resources = {"/media/normal.mp4": ("video/mp4", normal.read_bytes())}
+    evidence = video_encoding_evidence(normal, "Constrained Baseline", False)
+    resources["/media/normal.encoding.json"] = ("application/json", json.dumps(evidence).encode())
+    for profile in ("main", "high"):
+        encoded = directory / f"video-{profile}.mp4"
+        muxed = directory / f"normal-{profile}.mp4"
+        # Passthrough emits each of the 24 source frames exactly once. Fixed
+        # B-adapt=0 forces real B pictures even for these simple solid colours.
+        subprocess.run(common + [
+            "-f", "lavfi", "-i", "color=red:s=128x96:r=8:d=1",
+            "-f", "lavfi", "-i", "color=blue:s=128x96:r=8:d=1",
+            "-f", "lavfi", "-i", "color=lime:s=128x96:r=8:d=1",
+            "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0,scale=out_color_matrix=bt709:out_range=tv[v]",
+            "-map", "[v]", "-c:v", "libx264", "-profile:v", profile, "-level:v", "3.0",
+            "-pix_fmt", "yuv420p", "-g", "8", "-keyint_min", "8", "-sc_threshold", "0",
+            "-bf", "2", "-x264-params", "b-adapt=0", "-threads", "1",
+            "-fps_mode", "passthrough", "-enc_time_base", "1:8", "-frames:v", "24",
+            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+            "-movflags", "+faststart", str(encoded),
+        ], check=True)
+        subprocess.run(common + ["-i", str(encoded), "-i", str(audio), "-map", "0:v", "-map", "1:a",
+                                 "-c", "copy", "-movflags", "+faststart", str(muxed)], check=True)
+        resources[f"/media/normal-{profile}.mp4"] = ("video/mp4", muxed.read_bytes())
+        evidence = video_encoding_evidence(muxed, profile.capitalize(), True)
+        resources[f"/media/normal-{profile}.encoding.json"] = ("application/json", json.dumps(evidence).encode())
     tracks = []
     for name, path, media_type in [
         ("video", video, 'video/mp4; codecs="avc1.42C01E"'),
@@ -419,7 +491,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
                            (("Accept-Ranges", "bytes"), ("Content-Range", f"bytes {start}-{end}/{len(content)}")))
             else:
                 self.reply(200, content_type, content, (("Accept-Ranges", "bytes"),))
-        elif path in ("/media/normal", "/media/mse", "/media/mse-big") and self.server.media:
+        elif path in ("/media/normal", "/media/normal-main", "/media/normal-high", "/media/mse", "/media/mse-big") and self.server.media:
             self.reply(200, "text/html; charset=utf-8", MEDIA_PAGE)
         elif path in ("/", "/main"):
             self.reply(200, "text/html; charset=utf-8", MAIN)
