@@ -8,9 +8,12 @@ network can reach the same listener at ``http://10.0.2.2:<port>``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import json
 import struct
+import subprocess
+import tempfile
 import threading
 import time
 import zlib
@@ -182,13 +185,143 @@ def solid_png() -> bytes:
 PIXEL = solid_png()
 
 
+MEDIA_PAGE = b"""<!doctype html><meta charset="utf-8"><title>media-loading</title>
+<style>body{margin:0}video{position:absolute;left:20px;top:20px;width:128px;height:96px}
+button{position:absolute;left:20px;top:140px;width:128px;height:32px}</style>
+<video id="video" playsinline preload="auto"></video><button id="play">Play</button>
+<span id="media-state" style="display:none"></span>
+<script>
+const video = document.getElementById('video');
+const mse = location.pathname.endsWith('/mse') || location.pathname.endsWith('/mse-big');
+function fail(error) { document.title = 'media-error:' + String(error); }
+video.addEventListener('error', () => fail('video:' + video.error?.code));
+video.addEventListener('canplay', () => { updateState(); if (video.paused) document.title = 'media-ready'; });
+video.addEventListener('timeupdate', () => {
+  if (!video.paused) document.title = 'media-time:' + video.currentTime.toFixed(3);
+});
+video.addEventListener('ended', () => { document.title = 'media-ended:' + video.currentTime.toFixed(3); });
+document.getElementById('play').addEventListener('click', () => video.play().catch(fail));
+function updateState() {
+  document.getElementById('media-state').textContent = JSON.stringify({
+    time:video.currentTime, duration:video.duration, paused:video.paused,
+    ended:video.ended, ready:video.readyState, width:video.videoWidth, height:video.videoHeight,
+    error:video.error?.code || 0
+  });
+}
+updateState();
+setInterval(updateState, 40);
+window.addEventListener('keydown', event => {
+  if (event.key === 'p') {
+    if (video.paused) video.play().catch(fail);
+    else { video.pause(); document.title = 'media-paused'; }
+  } else if (event.key === 's') video.currentTime = 0.25;
+});
+async function append(buffer, bytes) {
+  await new Promise((resolve, reject) => {
+    buffer.addEventListener('updateend', resolve, {once:true});
+    buffer.addEventListener('error', reject, {once:true});
+    buffer.appendBuffer(bytes);
+  });
+}
+async function loadMse() {
+  const source = new MediaSource();
+  video.src = URL.createObjectURL(source);
+  await new Promise(resolve => source.addEventListener('sourceopen', resolve, {once:true}));
+  const manifest = location.pathname.endsWith('/mse-big') ? '/media/manifest-big.json' : '/media/manifest.json';
+  const tracks = await (await fetch(manifest)).json();
+  // Like YouTube, video and audio use separate SourceBuffers, real codec
+  // strings and independent init/media segments. No player DOM substitution.
+  await Promise.all(tracks.map(async track => {
+    if (!MediaSource.isTypeSupported(track.type)) throw Error('unsupported:' + track.type);
+    const buffer = source.addSourceBuffer(track.type);
+    for (const url of track.segments) await append(buffer, await (await fetch(url)).arrayBuffer());
+  }));
+  source.endOfStream();
+}
+if (mse) loadMse().catch(fail); else video.src = '/media/normal.mp4';
+</script>"""
+
+
+def media_segments(data: bytes) -> list[bytes]:
+    """Split FFmpeg's fragmented MP4 into init and complete moof/mdat pairs."""
+    segments: list[bytes] = []
+    start = cursor = 0
+    while cursor < len(data):
+        if len(data) - cursor < 8:
+            raise ValueError("truncated generated MP4 box")
+        size, kind = struct.unpack_from(">I4s", data, cursor)
+        if size == 1:
+            size = struct.unpack_from(">Q", data, cursor + 8)[0]
+        elif size == 0:
+            size = len(data) - cursor
+        if size < 8 or cursor + size > len(data):
+            raise ValueError("invalid generated MP4 box")
+        if kind == b"moof" and cursor > start:
+            segments.append(data[start:cursor])
+            start = cursor
+        cursor += size
+    if start < cursor:
+        segments.append(data[start:cursor])
+    return segments
+
+
+def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
+    """Create our own three-second H.264/AAC fixtures; nothing is downloaded."""
+    video = directory / "video.mp4"
+    audio = directory / "audio.mp4"
+    normal = directory / "normal.mp4"
+    common = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1"]
+    subprocess.run(common + [
+        "-f", "lavfi", "-i", "color=red:s=128x96:r=8:d=1",
+        "-f", "lavfi", "-i", "color=blue:s=128x96:r=8:d=1",
+        "-f", "lavfi", "-i", "color=lime:s=128x96:r=8:d=1",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0,scale=out_color_matrix=bt709:out_range=tv[v]",
+        "-map", "[v]", "-c:v", "libx264", "-profile:v", "baseline", "-level:v", "3.0",
+        "-pix_fmt", "yuv420p", "-g", "8", "-keyint_min", "8", "-sc_threshold", "0",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709", "-color_range", "tv",
+        "-movflags", "empty_moov+frag_keyframe+default_base_moof", str(video),
+    ], check=True)
+    subprocess.run(common + [
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+        "-ac", "2", "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "64k",
+        "-movflags", "empty_moov+frag_keyframe+default_base_moof", "-frag_duration", "1000000", str(audio),
+    ], check=True)
+    subprocess.run(common + ["-i", str(video), "-i", str(audio), "-map", "0:v", "-map", "1:a",
+                             "-c", "copy", "-movflags", "+faststart", str(normal)], check=True)
+    resources = {"/media/normal.mp4": ("video/mp4", normal.read_bytes())}
+    tracks = []
+    for name, path, media_type in [
+        ("video", video, 'video/mp4; codecs="avc1.42C01E"'),
+        ("audio", audio, 'audio/mp4; codecs="mp4a.40.2"'),
+    ]:
+        urls = []
+        for index, segment in enumerate(media_segments(path.read_bytes())):
+            url = f"/media/{name}-{index}.mp4"
+            resources[url] = (f"{name}/mp4", segment)
+            urls.append(url)
+        tracks.append({"type": media_type, "segments": urls})
+    resources["/media/manifest.json"] = ("application/json", json.dumps(tracks).encode())
+    # A legal ignored top-level free box makes the init append cross several
+    # C ABI chunks. This catches truncated append promises and size mismatches
+    # without requiring an expensive high-resolution decode fixture.
+    big_init = "/media/video-0-big.mp4"
+    resources[big_init] = ("video/mp4", resources[tracks[0]["segments"][0]][1]
+                          + struct.pack(">I4s", 2 * 1024 * 1024 + 8, b"free") + bytes(2 * 1024 * 1024))
+    big_tracks = json.loads(json.dumps(tracks))
+    big_tracks[0]["segments"][0] = big_init
+    resources["/media/manifest-big.json"] = ("application/json", json.dumps(big_tracks).encode())
+    return resources
+
+
 class FixtureServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], log_path: Path | None):
+    def __init__(self, address: tuple[str, int], log_path: Path | None,
+                 media: dict[str, tuple[str, bytes]] | None = None):
         super().__init__(address, FixtureHandler)
         self.request_log = log_path.open("a", encoding="utf-8") if log_path else None
         self.log_lock = threading.Lock()
+        self.media = media or {}
 
     def record_request(self, record: dict[str, object]) -> None:
         if self.request_log is None:
@@ -253,6 +386,25 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", response)
         elif self.command not in ("GET", "HEAD"):
             self.reply(405, "text/plain; charset=utf-8", b"Method not allowed\n", (("Allow", "GET, HEAD"),))
+        elif path in self.server.media:
+            content_type, content = self.server.media[path]
+            range_header = self.headers.get("Range")
+            if range_header and range_header.startswith("bytes="):
+                try:
+                    first, last = range_header[6:].split("-", 1)
+                    start = int(first) if first else max(0, len(content) - int(last))
+                    end = min(int(last), len(content) - 1) if last and first else len(content) - 1
+                    if not 0 <= start <= end < len(content):
+                        raise ValueError("invalid range")
+                except ValueError:
+                    self.reply(416, content_type, b"", (("Content-Range", f"bytes */{len(content)}"),))
+                    return
+                self.reply(206, content_type, content[start:end + 1],
+                           (("Accept-Ranges", "bytes"), ("Content-Range", f"bytes {start}-{end}/{len(content)}")))
+            else:
+                self.reply(200, content_type, content, (("Accept-Ranges", "bytes"),))
+        elif path in ("/media/normal", "/media/mse", "/media/mse-big") and self.server.media:
+            self.reply(200, "text/html; charset=utf-8", MEDIA_PAGE)
         elif path in ("/", "/main"):
             self.reply(200, "text/html; charset=utf-8", MAIN)
         elif path == "/second":
@@ -291,10 +443,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=0, help="Listen port (0 chooses a free port)")
     parser.add_argument("--log", type=Path, help="Append actual requests to this JSONL file")
+    parser.add_argument("--media-fixtures", action="store_true", help="Generate H.264/AAC and MSE fixtures using host FFmpeg")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
-    with FixtureServer(("127.0.0.1", args.port), args.log) as server:
+    with contextlib.ExitStack() as stack:
+        media = None
+        if args.media_fixtures:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="myrica-media-fixtures-")))
+            media = generate_media(directory)
+        server = stack.enter_context(FixtureServer(("127.0.0.1", args.port), args.log, media))
         port = server.server_address[1]
         print(json.dumps({
             "host": "127.0.0.1",

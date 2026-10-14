@@ -121,7 +121,14 @@ The Scarlet WebKit profile uses WebKit storage namespaces for localStorage and
 sessionStorage, a shared native CookieJarDB for HTTP and document.cookie, and
 BlobRegistryImpl for object URLs. Local storage and persistent cookies use
 $HOME/.local/share/myrica. Subframes retain WebCore sandbox and origin policies.
-Media, WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
+The Vulkan profile includes Scarlet's H.264/AAC MediaPlayer and MP4 Media Source
+Extensions backend. Bounded CPU workers demux and decode; Skia uploads YUV planes
+and performs colour conversion and page composition on the GPU. SAS supplies
+audio and its consumed PCM position supplies the playback clock. The supported
+profile is progressive 8-bit 4:2:0 AVC and AAC-LC mono/stereo; VP9, AV1, Opus,
+HE-AAC and `avc3` are rejected. Ordinary MP4 input must fit the media core's 8 MiB
+bound; MSE handles separate bounded initialization/media segments.
+WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
 service workers, and IME preedit are unavailable.
 URLs containing embedded usernames or passwords are rejected explicitly.
 Committed Unicode text is delivered to WebCore. Compatibility with general
@@ -143,6 +150,15 @@ The probe checks real HTTP/CSS/image pixels, Retina resizing, native history,
 keyboard editing, POST/reload, scrolling, idle frames, and interruption of an
 actual infinite script. It joins the owner after native Page destruction.
 The host fixture is test input and does not substitute for a live-site GUI check.
+
+For media checks, start the fixture server with `--media-fixtures` (host FFmpeg
+required), build `webkit-smoke` with `backend-webkit-vulkan`, and pass
+`http://10.0.2.2:PORT --media-only` in the guest. The server generates its own
+three-second H.264/AAC clip in a temporary directory and cleans it up on exit.
+The probe exercises both ordinary HTML video and separate audio/video MSE
+SourceBuffers, checks the actual media clock and end event, and reads real GPU
+pixels to verify the decoded red, blue and green frames. Use the normal QEMU
+runner with `SCARLET_QEMU_AUDIO=1` for SAS audio output.
 
 ## Architecture
 

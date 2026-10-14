@@ -30,9 +30,13 @@ def main():
                         help="Build WebKit's native Skia/Vulkan GPU contract probe")
     parser.add_argument("--vulkan-rendering", action="store_true",
                         help="Paint WebCore pages with native Skia/Vulkan")
+    parser.add_argument("--media", action="store_true",
+                        help="Enable Scarlet H.264/AAC playback and Media Source Extensions")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
+    if args.media and not args.vulkan_rendering:
+        parser.error("--media requires --vulkan-rendering for GPU video colour conversion")
     for name in ("cc", "cxx", "ar", "ranlib", "pkg_config", "meson"):
         value = getattr(args, name)
         resolved = shutil.which(value)
@@ -107,6 +111,8 @@ def main():
         "-DPORT=Scarlet", "-DSCARLET_BUILD_EMBEDDING=ON", "-DSCARLET_BUILD_RENDERER=OFF",
         f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
         f"-DSCARLET_USE_SKIA_VULKAN={'ON' if args.vulkan_rendering else 'OFF'}",
+        f"-DSCARLET_USE_NATIVE_MEDIA={'ON' if args.media else 'OFF'}",
+        f"-DENABLE_MEDIA_SOURCE={'ON' if args.media else 'OFF'}",
         "-DUSE_THIN_ARCHIVES=OFF", "-DUSE_PCH_CODEGEN=ON", "-DUSE_HEADER_MAPS=ON",
         f"-DCMAKE_C_FLAGS={cflags}",
         f'-DCMAKE_CXX_FLAGS=-nostdinc++ -isystem "{runtime}/include/c++/v1" {cflags} -fno-exceptions -fno-rtti',

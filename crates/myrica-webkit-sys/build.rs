@@ -62,6 +62,9 @@ fn prepare() -> PathBuf {
     if env::var_os("CARGO_FEATURE_VULKAN_RENDERING").is_some() {
         engine.arg("--vulkan-rendering");
     }
+    if env::var_os("CARGO_FEATURE_MEDIA").is_some() {
+        engine.arg("--media");
+    }
     engine
         .arg("--webkit-source")
         .arg(webkit)

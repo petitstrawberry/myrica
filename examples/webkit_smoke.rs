@@ -194,6 +194,7 @@ fn run() -> Result<(), String> {
         Vec::new()
     };
     let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
+    let media_only = std::env::args().any(|argument| argument == "--media-only");
     if base == "--pages" && pages.is_empty() {
         return Err(String::from("--pages requires URLs"));
     }
@@ -201,7 +202,7 @@ fn run() -> Result<(), String> {
     let worker = thread::Builder::new()
         .name(String::from("myrica-webkit-smoke"))
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || engine_probe(&base, sender, &pages, fixture_only))
+        .spawn(move || engine_probe(&base, sender, &pages, fixture_only, media_only))
         .map_err(|error| error.to_string())?;
     let mut owner = Owner {
         worker: Some(worker),
@@ -247,6 +248,7 @@ fn engine_probe(
     sender: mpsc::Sender<OwnerMessage>,
     pages: &[String],
     fixture_only: bool,
+    media_only: bool,
 ) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
     let mut engine = ProbeEngine::new(wake)?;
@@ -257,6 +259,16 @@ fn engine_probe(
                 .ok_or("missing native interruption hook")?,
         ))
         .map_err(|error| error.to_string())?;
+    if media_only {
+        for path in ["normal", "mse", "mse-big"] {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|error| error.to_string())?;
+            media_probe(&mut engine, base, path)?;
+        }
+        drop(engine);
+        return Ok(());
+    }
     if !pages.is_empty() {
         for url in pages {
             // Each live page has its own bounded wait. Let the control thread
@@ -564,6 +576,130 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+fn media_state(engine: &mut ProbeEngine) -> Result<serde_json::Value, String> {
+    let text = engine
+        .text_content("media-state")
+        .map_err(|error| error.to_string())?
+        .ok_or("missing actual HTMLMediaElement state")?;
+    serde_json::from_str(&text).map_err(|error| format!("media state {text:?}: {error}"))
+}
+
+fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), String> {
+    engine.render(400, 240, 1.0)?;
+    engine
+        .navigate(&format!("{base}/media/{path}"))
+        .map_err(|error| error.to_string())?;
+    wait_title(engine, "media-ready")?;
+    let state = media_state(engine)?;
+    if state["width"] != 128 || state["height"] != 96 || state["ready"].as_u64().unwrap_or(0) < 3 {
+        return Err(format!("metadata or ready state failed ({path}): {state}"));
+    }
+    click(engine, 60.0, 155.0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut colours = [false; 3];
+    let mut previous_time = 0.0;
+    let mut last_revision = 0;
+    let mut changed_frames = 0;
+    let mut sought = false;
+    loop {
+        engine.tick();
+        let state = media_state(engine)?;
+        if state["error"].as_u64().unwrap_or(0) != 0
+            || engine.snapshot().title.starts_with("media-error:")
+        {
+            return Err(format!(
+                "media playback failed ({path}): {state}, {:?}",
+                engine.snapshot()
+            ));
+        }
+        let time = state["time"].as_f64().unwrap_or(0.0);
+        if time + 0.05 < previous_time {
+            return Err(format!(
+                "media clock went backwards: {previous_time} -> {time}"
+            ));
+        }
+        previous_time = time;
+        let frame = engine.render(400, 240, 1.0)?;
+        if frame.revision != last_revision {
+            changed_frames += 1;
+            last_revision = frame.revision;
+        }
+        let offset = (60 * frame.width as usize + 60) * 4;
+        let pixel = &frame.rgba[offset..offset + 4];
+        for (channel, colour) in [(0, 0), (2, 1), (1, 2)] {
+            if pixel[channel] > 200 && (0..3).filter(|c| *c != channel).all(|c| pixel[c] < 30) {
+                colours[colour] = true;
+            }
+        }
+        if !sought && colours[1] && time > 1.1 {
+            key(engine, BrowserKey::Character('p'), true);
+            key(engine, BrowserKey::Character('p'), false);
+            wait_title(engine, "media-paused")?;
+            pump(engine, Duration::from_millis(100));
+            let paused_time = media_state(engine)?["time"]
+                .as_f64()
+                .ok_or("missing paused media clock")?;
+            pump(engine, Duration::from_millis(250));
+            let paused = media_state(engine)?;
+            if paused["paused"] != true
+                || (paused["time"].as_f64().unwrap_or(-1.0) - paused_time).abs() > 0.03
+            {
+                return Err(format!(
+                    "pause did not stop actual media clock ({path}): {paused_time} -> {paused}"
+                ));
+            }
+            key(engine, BrowserKey::Character('s'), true);
+            key(engine, BrowserKey::Character('s'), false);
+            let seek_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                engine.tick();
+                let seek_state = media_state(engine)?;
+                let seek_frame = engine.render(400, 240, 1.0)?;
+                let offset = (60 * seek_frame.width as usize + 60) * 4;
+                let pixel = &seek_frame.rgba[offset..offset + 4];
+                if (seek_state["time"].as_f64().unwrap_or(-1.0) - 0.25).abs() < 0.03
+                    && seek_state["paused"] == true
+                    && pixel[0] > 200
+                    && pixel[1] < 30
+                    && pixel[2] < 30
+                {
+                    break;
+                }
+                if Instant::now() >= seek_deadline {
+                    return Err(format!(
+                        "seek failed to decode/present red frame ({path}): state={seek_state} pixel={pixel:?}"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            key(engine, BrowserKey::Character('p'), true);
+            key(engine, BrowserKey::Character('p'), false);
+            previous_time = 0.25;
+            sought = true;
+            println!("MYRICA_WEBKIT_SMOKE_PASS stage=media-{path}-pause-seek-resume");
+            continue;
+        }
+        if state["ended"] == true {
+            if !sought || !colours.iter().all(|seen| *seen) || changed_frames < 3 || time < 2.9 {
+                return Err(format!(
+                    "media ended without actual decoded GPU frames ({path}): colours={colours:?} frames={changed_frames} state={state}"
+                ));
+            }
+            println!(
+                "MYRICA_WEBKIT_SMOKE_PASS stage=media-{path} colours={colours:?} frames={changed_frames} state={state}"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "media playback stalled ({path}): colours={colours:?}, state={state}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     Ok(())
 }
 

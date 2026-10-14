@@ -3,6 +3,9 @@
 #[cfg(target_os = "scarlet")]
 mod native_memory;
 
+#[cfg(all(target_os = "scarlet", feature = "media"))]
+mod media_bridge;
+
 use std::ffi::c_int;
 
 pub const ABI_VERSION: u32 = 1;
