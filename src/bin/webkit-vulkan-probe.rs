@@ -97,7 +97,7 @@ fn gpu_page_contract() -> Result<(), String> {
             let html = r#"<!doctype html><meta charset="utf-8"><title>GPU page contract</title>
 <style>html,body{margin:0;background:white;width:160px;height:112px}
 #r,#b{position:absolute;width:32px;height:32px}#r{left:16px;top:16px;background:red}
-#b{left:64px;top:32px;background:blue}#tap{position:absolute;left:112px;top:72px;width:40px;height:32px}
+#b{left:64px;top:32px;background:blue;border-radius:8px}#tap{position:absolute;left:112px;top:72px;width:40px;height:32px}
 #marker{position:absolute;left:2px;top:88px;font:12px sans-serif}</style>
 <div id="r"></div><div id="b"></div><div id="tap" onclick="flip()">tap</div><div id="marker">Loading</div>
 <script>let green=false;document.getElementById('marker').textContent='JS executed';
@@ -224,7 +224,12 @@ unsafe fn verify_gpu_pixels(
         return Err(format!("GPU page readback: {status}"));
     }
     let bytes = unsafe { std::slice::from_raw_parts(pixels.data, pixels.length) };
-    for (x, y, expected) in [(0, 0, [255; 4]), (24, 24, [0, 0, 255, 255]), (72, 40, blue)] {
+    for (x, y, expected) in [
+        (0, 0, [255; 4]),
+        (24, 24, [0, 0, 255, 255]),
+        (64, 32, [255; 4]),
+        (72, 40, blue),
+    ] {
         let offset = (y * 2) * pixels.stride as usize + (x * 2) * 4;
         if bytes.get(offset..offset + 4) != Some(expected.as_slice()) {
             return Err(format!(
