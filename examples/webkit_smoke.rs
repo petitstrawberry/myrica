@@ -577,6 +577,30 @@ fn engine_probe(
     assert_pixel(&frame, 300, 100, [0xac, 0x68, 0x24, 255])?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=frameset-child-pixels");
 
+    engine
+        .navigate(&format!("{base}/view-transition"))
+        .map_err(|error| error.to_string())?;
+    wait_title(&mut engine, "view-transition-ready")?;
+    let before = engine.render(800, 600, 1.0)?;
+    assert_pixel(&before, 30, 30, [0x12, 0x34, 0x56, 255])?;
+    click(&mut engine, 60.0, 155.0);
+    wait_title(&mut engine, "view-transition-done")?;
+    let observation = engine
+        .text_content("view-transition-state")
+        .map_err(|error| error.to_string())?
+        .ok_or("view transition observation missing")?;
+    let state: serde_json::Value =
+        serde_json::from_str(&observation).map_err(|error| error.to_string())?;
+    verify_skipped_view_transition(&state)?;
+    let after = engine.render(800, 600, 1.0)?;
+    assert_pixel(&after, 30, 30, [0x65, 0x43, 0x21, 255])?;
+    if after.revision == before.revision {
+        return Err(String::from(
+            "skipped view transition did not repaint its DOM update",
+        ));
+    }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=view-transition-skipped-dom-update state={state}");
+
     if fixture_only {
         drop(engine);
         println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
@@ -594,6 +618,24 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+fn verify_skipped_view_transition(state: &serde_json::Value) -> Result<(), String> {
+    if state["calls"].as_u64() != Some(1)
+        || state["callbackAsync"].as_bool() != Some(true)
+        || state["ready"].as_str() != Some("rejected")
+        || state["readyError"].as_str() != Some("InvalidStateError")
+        || state["updateCallbackDone"].as_str() != Some("fulfilled")
+        || state["finished"].as_str() != Some("fulfilled")
+        || !state
+            .as_object()
+            .is_some_and(|state| state.get("active") == Some(&serde_json::Value::Null))
+    {
+        return Err(format!(
+            "skipped view transition violated its callback or promise contract: {state}"
+        ));
+    }
     Ok(())
 }
 

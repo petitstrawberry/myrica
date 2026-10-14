@@ -102,6 +102,50 @@ SECOND = b"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <title>second-ready</title></head><body><a href="/main">Main page</a></body></html>
 """
 
+VIEW_TRANSITION = b"""<!doctype html><meta charset="utf-8"><title>view-transition-ready</title>
+<style>body{margin:0}#patch{position:absolute;left:20px;top:20px;width:128px;height:96px;background:#123456}
+button{position:absolute;left:20px;top:140px;width:128px;height:32px}</style>
+<div id="patch"></div><button id="transition">Update</button>
+<span id="view-transition-state" style="display:none"></span>
+<script>
+let calls = 0;
+let callbackAsync = false;
+let ready = 'pending';
+let readyError = null;
+let updateCallbackDone = 'pending';
+let finished = 'pending';
+function publishTransitionState() {
+  document.getElementById('view-transition-state').textContent = JSON.stringify({
+    calls, callbackAsync, ready, readyError, updateCallbackDone, finished,
+    active: document.activeViewTransition === null ? null : 'not-null'
+  });
+}
+document.getElementById('transition').addEventListener('click', async () => {
+  try {
+    let insideStart = true;
+    const transition = document.startViewTransition(() => {
+      calls++;
+      callbackAsync = !insideStart;
+      document.getElementById('patch').style.backgroundColor = '#654321';
+      publishTransitionState();
+    });
+    insideStart = false;
+    await Promise.all([
+      transition.ready.then(() => { ready = 'fulfilled'; }, error => {
+        ready = 'rejected'; readyError = error.name;
+      }),
+      transition.updateCallbackDone.then(() => { updateCallbackDone = 'fulfilled'; }),
+      transition.finished.then(() => { finished = 'fulfilled'; })
+    ]);
+    publishTransitionState();
+    document.title = 'view-transition-done';
+  } catch (error) {
+    document.title = 'failed:' + error;
+  }
+});
+publishTransitionState();
+</script>"""
+
 HUNG = b"""<!doctype html><html><head><meta charset="utf-8">
 <title>hung-loading</title></head><body><script>
 document.title = 'hung-entered'; while (true) {}
@@ -536,6 +580,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MAIN)
         elif path == "/second":
             self.reply(200, "text/html; charset=utf-8", SECOND)
+        elif path == "/view-transition":
+            self.reply(200, "text/html; charset=utf-8", VIEW_TRANSITION)
         elif path == "/damage":
             self.reply(200, "text/html", b"<!doctype html><title>damage-ready</title><body style='margin:0'><div style='position:absolute;left:20px;top:20px;width:20px;height:20px;background:#123456' id='patch'></div><script>window.addEventListener('keydown',()=>{document.getElementById('patch').style.backgroundColor='#654321';document.title='damage-changed'})</script></body>")
         elif path == "/storage":
