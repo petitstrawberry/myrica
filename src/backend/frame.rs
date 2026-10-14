@@ -1,5 +1,6 @@
 //! Owned, thread-safe scene data sent from the engine to the UI.
 
+use super::FrameLease;
 use std::sync::Arc;
 
 use scarlet_ui::{
@@ -13,6 +14,7 @@ pub struct BrowserFrame {
     pub width: u32,
     pub height: u32,
     pub draws: Vec<BrowserDraw>,
+    pub(crate) lease: Option<Arc<FrameLease>>,
 }
 
 #[derive(Clone)]
@@ -28,7 +30,60 @@ pub struct BrowserTexture {
     pub revision: u64,
     pub width: u32,
     pub height: u32,
-    pub pixels: Arc<[u8]>,
+    pub source: BrowserTextureSource,
+}
+
+pub enum BrowserTextureSource {
+    Rgba8(Arc<[u8]>),
+    #[cfg(target_os = "scarlet")]
+    SharedGpu(Arc<OwnedGpuImage>),
+}
+
+#[cfg(target_os = "scarlet")]
+pub struct OwnedGpuImage {
+    raw: std::sync::atomic::AtomicI32,
+}
+#[cfg(target_os = "scarlet")]
+impl OwnedGpuImage {
+    /// Takes ownership of one exported native capability.
+    pub(crate) fn new(raw: i32) -> Arc<Self> {
+        Arc::new(Self {
+            raw: std::sync::atomic::AtomicI32::new(raw),
+        })
+    }
+    fn take(&self) -> Result<i32, super::BackendError> {
+        let raw = self.raw.swap(-1, std::sync::atomic::Ordering::AcqRel);
+        if raw < 0 {
+            Err(super::BackendError::new(
+                "GPU page capability was already consumed",
+            ))
+        } else {
+            Ok(raw)
+        }
+    }
+}
+#[cfg(target_os = "scarlet")]
+impl Drop for OwnedGpuImage {
+    fn drop(&mut self) {
+        let raw = *self.raw.get_mut();
+        if raw >= 0 {
+            // SAFETY: this object owns the capability unless take() disarmed it.
+            unsafe {
+                scarlet_sys::syscall1(scarlet_sys::Syscall::HandleClose, raw as usize);
+            }
+        }
+    }
+}
+
+impl BrowserTexture {
+    #[cfg(test)]
+    pub(crate) fn rgba_pixels(&self) -> &Arc<[u8]> {
+        match &self.source {
+            BrowserTextureSource::Rgba8(pixels) => pixels,
+            #[cfg(target_os = "scarlet")]
+            _ => panic!("expected CPU fixture pixels"),
+        }
+    }
 }
 
 impl BrowserFrame {
@@ -38,28 +93,54 @@ impl BrowserFrame {
             width: width.max(1),
             height: height.max(1),
             draws: Vec::new(),
+            lease: None,
         }
     }
 
     /// Wrap the prepared meshes and shared pixels without copying their contents.
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn into_canvas_frame(self) -> Arc<SgfxCanvasFrame> {
+        self.try_into_canvas_frame()
+            .expect("CPU frame has no platform adoption failure")
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn try_into_canvas_frame(self) -> Result<Arc<SgfxCanvasFrame>, super::BackendError> {
         let mut frame = SgfxCanvasFrame::new(self.revision, Color::WHITE)
             .reference_aspect(self.width as f32 / self.height.max(1) as f32);
         for draw in self.draws {
             let mut canvas_draw = SgfxCanvasDraw::new(draw.mesh, draw.transform);
             if let Some(texture) = draw.texture {
-                canvas_draw = canvas_draw.texture(SgfxTexture::rgba8_with_handle(
-                    texture.handle,
-                    texture.revision,
-                    texture.width,
-                    texture.height,
-                    Arc::clone(&texture.pixels),
-                ));
+                let image = match &texture.source {
+                    BrowserTextureSource::Rgba8(pixels) => SgfxTexture::rgba8_with_handle(
+                        texture.handle,
+                        texture.revision,
+                        texture.width,
+                        texture.height,
+                        Arc::clone(pixels),
+                    ),
+                    #[cfg(target_os = "scarlet")]
+                    BrowserTextureSource::SharedGpu(image) => {
+                        let raw = image.take()?;
+                        // SAFETY: take() transfers this exclusively owned capability
+                        // once. ScarletUI consumes it on both success and failure.
+                        unsafe {
+                            scarlet_ui::shared_bgra8_texture_from_raw(
+                                raw,
+                                texture.width,
+                                texture.height,
+                            )
+                        }
+                        .map_err(|error| {
+                            super::BackendError::new(format!("adopt GPU page image: {error}"))
+                        })?
+                    }
+                };
+                canvas_draw = canvas_draw.texture(image);
             }
             frame = frame.draw(canvas_draw);
         }
-        Arc::new(frame)
+        Ok(Arc::new(frame))
     }
 
     #[cfg(test)]

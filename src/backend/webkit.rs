@@ -29,6 +29,10 @@ pub struct WebKitBackend {
     scale: f64,
     modifiers: u32,
     last_frame: u64,
+    #[cfg(feature = "backend-webkit-vulkan")]
+    frame_releaser: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    #[cfg(feature = "backend-webkit-vulkan")]
+    gpu_logged: bool,
     last_click: Option<(BrowserMouseButton, f32, f32, Instant, u32)>,
     pressed_keys: Vec<BrowserKey>,
     suppress_next_text: bool,
@@ -92,6 +96,10 @@ impl WebKitBackend {
             scale: 1.0,
             modifiers: 0,
             last_frame: 0,
+            #[cfg(feature = "backend-webkit-vulkan")]
+            frame_releaser: None,
+            #[cfg(feature = "backend-webkit-vulkan")]
+            gpu_logged: false,
             last_click: None,
             pressed_keys: Vec::new(),
             suppress_next_text: false,
@@ -102,7 +110,10 @@ impl WebKitBackend {
     pub fn paint_statistics(&mut self) -> Result<ffi::PaintStatistics, BackendError> {
         let mut statistics = ffi::PaintStatistics::default();
         // SAFETY: This native view belongs to the current owner thread.
-        check(unsafe { ffi::scarlet_webview_paint_statistics(self.view.as_ptr(), &mut statistics) }, "inspect WebCore paint statistics")?;
+        check(
+            unsafe { ffi::scarlet_webview_paint_statistics(self.view.as_ptr(), &mut statistics) },
+            "inspect WebCore paint statistics",
+        )?;
         Ok(statistics)
     }
 
@@ -110,8 +121,16 @@ impl WebKitBackend {
     pub fn text_content(&mut self, id: &str) -> Result<Option<String>, BackendError> {
         let mut text = ffi::Bytes::empty();
         // SAFETY: The view belongs to this owner; output is cloned before another call.
-        let status = unsafe { ffi::scarlet_webview_text_content(self.view.as_ptr(), ffi::Bytes::from_str(id), &mut text) };
-        if status == ffi::EMPTY { return Ok(None); }
+        let status = unsafe {
+            ffi::scarlet_webview_text_content(
+                self.view.as_ptr(),
+                ffi::Bytes::from_str(id),
+                &mut text,
+            )
+        };
+        if status == ffi::EMPTY {
+            return Ok(None);
+        }
         check(status, "inspect WebCore DOM text")?;
         Ok(Some(read_string(text)?))
     }
@@ -388,7 +407,10 @@ impl BrowserBackend for WebKitBackend {
             self.poll_requests()?;
             let mut needs_paint = 0;
             // SAFETY: Queries pending damage without rasterizing on a network wake.
-            check(unsafe { ffi::scarlet_webview_needs_paint(self.view.as_ptr(), &mut needs_paint) }, "query pending WebCore paint")?;
+            check(
+                unsafe { ffi::scarlet_webview_needs_paint(self.view.as_ptr(), &mut needs_paint) },
+                "query pending WebCore paint",
+            )?;
             Ok::<_, BackendError>(completed | self.refresh_state()? | (needs_paint != 0))
         })();
         match result {
@@ -400,6 +422,104 @@ impl BrowserBackend for WebKitBackend {
         }
     }
 
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn set_frame_releaser(&mut self, release: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.frame_releaser = Some(release);
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn release_frame(&mut self, token: u64) {
+        // SAFETY: returns a lease on this view's owner, across navigation/resize.
+        let status = unsafe { ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), token) };
+        if let Err(error) = check(status, "return WebCore GPU image") {
+            self.fail(error);
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn can_render(&mut self) -> bool {
+        let mut capacity = 0;
+        // SAFETY: queries this live owner-thread view without painting.
+        let status =
+            unsafe { ffi::scarlet_webview_gpu_frame_capacity(self.view.as_ptr(), &mut capacity) };
+        match check(status, "query WebCore GPU capacity") {
+            Ok(()) => capacity > 0,
+            Err(error) => {
+                self.fail(error);
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
+        self.render_if_ready(width, height, scale)
+            .unwrap_or_else(|| BrowserFrame::empty(width, height))
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn render_if_ready(&mut self, width: u32, height: u32, scale: f32) -> Option<BrowserFrame> {
+        let result = (|| {
+            let scale = f64::from(scale);
+            if width != self.width || height != self.height || scale != self.scale {
+                // SAFETY: This view is live and confined to its owner thread.
+                check(
+                    unsafe {
+                        ffi::scarlet_webview_resize(self.view.as_ptr(), width, height, scale)
+                    },
+                    "resize WebCore",
+                )?;
+                self.width = width;
+                self.height = height;
+                self.scale = scale;
+                check(
+                    unsafe { ffi::scarlet_webview_tick(self.view.as_ptr()) },
+                    "paint resized WebCore",
+                )?;
+            }
+            let mut image = ffi::GpuFrame::default();
+            // SAFETY: the returned handle is newly owned; the lease remains in
+            // WebCore until UI replacement/discard queues its owner-thread return.
+            let status = unsafe { ffi::scarlet_webview_gpu_frame(self.view.as_ptr(), &mut image) };
+            if status == ffi::EMPTY {
+                return Ok(None);
+            }
+            check(status, "paint WebCore GPU page")?;
+            let Some(release) = self.frame_releaser.as_ref() else {
+                drop(super::frame::OwnedGpuImage::new(image.handle));
+                // SAFETY: a just-acquired frame has never reached a consumer.
+                unsafe {
+                    ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), image.generation);
+                }
+                return Err(BackendError::new(
+                    "GPU frame return queue was not installed",
+                ));
+            };
+            let frame = self.renderer.gpu_frame(image, Arc::clone(release))?;
+            if frame.width != width || frame.height != height {
+                return Err(BackendError::new(
+                    "WebCore returned a mismatched GPU page extent",
+                ));
+            }
+            self.last_frame = frame.revision;
+            if !self.gpu_logged {
+                eprintln!(
+                    "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none"
+                );
+                self.gpu_logged = true;
+            }
+            Ok::<_, BackendError>(Some(frame))
+        })();
+        match result {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.fail(error);
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "backend-webkit-vulkan"))]
     fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
         let result = (|| {
             let scale = f64::from(scale);

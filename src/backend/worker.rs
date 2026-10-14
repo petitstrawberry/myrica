@@ -39,6 +39,7 @@ struct Update {
 
 struct Mailbox {
     commands: VecDeque<(u64, Command)>,
+    returned_frames: VecDeque<u64>,
     viewport: BrowserViewport,
     generation: u64,
     engine_woken: bool,
@@ -124,6 +125,7 @@ impl BrowserWorker {
         let shared = Arc::new(Shared {
             mailbox: Mutex::new(Mailbox {
                 commands: VecDeque::from([(1, Command::Navigate(location.to_owned()))]),
+                returned_frames: VecDeque::new(),
                 viewport,
                 generation: 1,
                 engine_woken: true,
@@ -148,7 +150,19 @@ impl BrowserWorker {
                     }
                 });
                 match factory(wake_engine) {
-                    Ok(backend) => run_engine(backend, &worker_shared),
+                    Ok(mut backend) => {
+                        let weak = Arc::downgrade(&worker_shared);
+                        backend.set_frame_releaser(Arc::new(move |token| {
+                            if let Some(shared) = weak.upgrade() {
+                                let mut mailbox = shared.mailbox.lock().unwrap();
+                                if !mailbox.shutdown {
+                                    mailbox.returned_frames.push_back(token);
+                                    shared.ready.notify_one();
+                                }
+                            }
+                        }));
+                        run_engine(backend, &worker_shared);
+                    }
                     Err(error) => {
                         let mut snapshot = failure_snapshot;
                         snapshot.load_state = LoadState::Failed(error.to_string());
@@ -382,13 +396,14 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
     let mut rendered_viewport = None;
     let mut published_frame = None;
     loop {
-        let (commands, viewport) = {
+        let (commands, returned_frames, viewport) = {
             let mut mailbox = shared.mailbox.lock().unwrap();
             loop {
                 if mailbox.shutdown {
                     return;
                 }
-                if !mailbox.commands.is_empty()
+                if !mailbox.returned_frames.is_empty()
+                    || !mailbox.commands.is_empty()
                     || mailbox.engine_woken
                     || Instant::now() >= next_poll_at
                     || (dirty && Instant::now() >= next_frame_at)
@@ -407,8 +422,16 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
                     .0;
             }
             mailbox.engine_woken = false;
-            (std::mem::take(&mut mailbox.commands), mailbox.viewport)
+            (
+                std::mem::take(&mut mailbox.commands),
+                std::mem::take(&mut mailbox.returned_frames),
+                mailbox.viewport,
+            )
         };
+
+        for token in returned_frames {
+            backend.release_frame(token);
+        }
 
         // A wake asks us to poll asynchronous work. Only the backend can tell
         // whether that work changed the page (a JS timer may change nothing).
@@ -446,14 +469,19 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
         }
         if dirty && Instant::now() >= next_frame_at {
             next_frame_at = Instant::now() + FRAME_INTERVAL;
-            let frame = backend.render(viewport.width, viewport.height, viewport.scale);
-            let identity = (generation, viewport, frame.revision);
-            if published_frame != Some(identity) {
-                shared.publish(generation, backend.snapshot(), Some((viewport, frame)));
-                published_frame = Some(identity);
+            if backend.can_render() {
+                if let Some(frame) =
+                    backend.render_if_ready(viewport.width, viewport.height, viewport.scale)
+                {
+                    let identity = (generation, viewport, frame.revision);
+                    if published_frame != Some(identity) {
+                        shared.publish(generation, backend.snapshot(), Some((viewport, frame)));
+                        published_frame = Some(identity);
+                    }
+                }
+                rendered_viewport = Some(viewport);
+                dirty = false;
             }
-            rendered_viewport = Some(viewport);
-            dirty = false;
         }
     }
 }

@@ -16,7 +16,7 @@ use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
     BackendKind, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
-    BrowserSnapshot, BrowserViewport, BrowserWorker,
+    BrowserSnapshot, BrowserViewport, BrowserWorker, PresentationLeases,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
@@ -31,6 +31,7 @@ pub struct MyricaApp {
     snapshot: State<BrowserSnapshot>,
     canvas_handle: SgfxCanvasHandle,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    presentation_leases: Rc<RefCell<PresentationLeases>>,
     webview_size: State<Size>,
     webview_focused: State<bool>,
     webview_text_input: State<Option<TextInputElementState>>,
@@ -71,6 +72,7 @@ impl MyricaApp {
             snapshot: State::new(generate_state_id(), initial_snapshot),
             canvas_handle: SgfxCanvasHandle::new(),
             canvas_frame: State::new(generate_state_id(), initial_frame),
+            presentation_leases: Rc::new(RefCell::new(PresentationLeases::default())),
             webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
             webview_text_input: State::new(generate_state_id(), None),
@@ -165,6 +167,7 @@ impl MyricaApp {
 
     /// Stop the owner even if retained window callbacks still hold shell state.
     pub fn shutdown(&self) {
+        self.presentation_leases.borrow_mut().clear();
         self.backend.borrow_mut().shutdown();
     }
 
@@ -179,7 +182,14 @@ impl MyricaApp {
             backend.poll()
         };
         if let Some(frame) = frame {
-            self.canvas_frame.set(frame.into_canvas_frame());
+            let lease = frame.lease.clone();
+            match frame.try_into_canvas_frame() {
+                Ok(canvas) => {
+                    self.presentation_leases.borrow_mut().stage(lease);
+                    self.canvas_frame.set(canvas);
+                }
+                Err(error) => eprintln!("myrica: {error}"),
+            }
         }
         let latest = self.backend.borrow().snapshot();
         if latest.text_input != self.snapshot.get().text_input {
@@ -243,6 +253,12 @@ impl Application for MyricaApp {
 
     fn on_idle(&mut self) {
         self.synchronize_backend_state();
+    }
+
+    fn on_frame_presented(&mut self, _: &scarlet_ui::WindowContext) {
+        // ScarletUI has completed GPU sampling before this callback. Return
+        // the previous page image only after its replacement was presented.
+        self.presentation_leases.borrow_mut().presented();
     }
 
     fn debug_logging(&self) -> bool {

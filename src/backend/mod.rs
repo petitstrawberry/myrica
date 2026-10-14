@@ -4,10 +4,12 @@ use std::fmt;
 use std::sync::Arc;
 
 mod frame;
+mod frame_lease;
 mod worker;
 
 pub use frame::BrowserFrame;
-pub(crate) use frame::{BrowserDraw, BrowserTexture};
+pub(crate) use frame::{BrowserDraw, BrowserTexture, BrowserTextureSource};
+pub(crate) use frame_lease::{FrameLease, PresentationLeases};
 pub use worker::{BrowserViewport, BrowserWorker};
 
 #[cfg(feature = "backend-blitz")]
@@ -239,6 +241,15 @@ pub trait BrowserBackend {
     /// during shutdown. The callback must not enter owner-only engine APIs.
     fn shutdown_callback(&self) -> Option<WakeCallback> {
         None
+    }
+
+    fn set_frame_releaser(&mut self, _release: Arc<dyn Fn(u64) + Send + Sync>) {}
+    fn release_frame(&mut self, _token: u64) {}
+    fn can_render(&mut self) -> bool {
+        true
+    }
+    fn render_if_ready(&mut self, width: u32, height: u32, scale: f32) -> Option<BrowserFrame> {
+        Some(self.render(width, height, scale))
     }
 
     /// Start a new top-level navigation.

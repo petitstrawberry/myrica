@@ -4,12 +4,14 @@ use std::sync::Arc;
 
 use scarlet_ui::{SgfxCanvasVertex, SgfxMesh, SgfxMeshHandle, SgfxTextureHandle};
 
-use super::super::{BackendError, BrowserDraw, BrowserFrame, BrowserTexture};
+use super::super::{BackendError, BrowserDraw, BrowserFrame, BrowserTexture, BrowserTextureSource};
 
 pub(super) struct FrameRenderer {
     mesh: SgfxMeshHandle,
     texture: SgfxTextureHandle,
     texture_size: (u32, u32),
+    #[cfg(all(feature = "backend-webkit-vulkan", target_os = "scarlet"))]
+    gpu_mesh: Option<Arc<SgfxMesh>>,
     cached: Option<((u64, u32, u32, usize), BrowserFrame)>,
 }
 
@@ -27,7 +29,10 @@ mod tests {
             let first_texture = first.draws[0].texture.as_ref().unwrap();
             let cached_texture = cached.draws[0].texture.as_ref().unwrap();
             assert!(Arc::ptr_eq(first_texture, cached_texture));
-            assert!(Arc::ptr_eq(&first_texture.pixels, &cached_texture.pixels));
+            assert!(Arc::ptr_eq(
+                first_texture.rgba_pixels(),
+                cached_texture.rgba_pixels()
+            ));
         }
         assert!(renderer.cached_frame(8, 2, 1, 8).is_none());
         assert!(renderer.cached_frame(7, 1, 1, 8).is_none());
@@ -40,11 +45,11 @@ mod tests {
         let first = renderer.frame(1, 1, 1, 4, &[0, 0, 0, 255]).unwrap();
         let changed = renderer.frame(2, 1, 1, 4, &[0, 0, 255, 255]).unwrap();
         assert!(!Arc::ptr_eq(
-            &first.draws[0].texture.as_ref().unwrap().pixels,
-            &changed.draws[0].texture.as_ref().unwrap().pixels,
+            first.draws[0].texture.as_ref().unwrap().rgba_pixels(),
+            changed.draws[0].texture.as_ref().unwrap().rgba_pixels(),
         ));
         assert_eq!(
-            &*changed.draws[0].texture.as_ref().unwrap().pixels,
+            &**changed.draws[0].texture.as_ref().unwrap().rgba_pixels(),
             &[255, 0, 0, 255]
         );
         assert!(renderer.cached_frame(1, 1, 1, 4).is_none());
@@ -61,7 +66,67 @@ impl FrameRenderer {
             texture: SgfxTextureHandle::new(),
             texture_size: (0, 0),
             cached: None,
+            #[cfg(all(feature = "backend-webkit-vulkan", target_os = "scarlet"))]
+            gpu_mesh: None,
         }
+    }
+
+    #[cfg(all(feature = "backend-webkit-vulkan", target_os = "scarlet"))]
+    pub fn gpu_frame(
+        &mut self,
+        native: myrica_webkit_sys::GpuFrame,
+        release: Arc<dyn Fn(u64) + Send + Sync>,
+    ) -> Result<BrowserFrame, BackendError> {
+        use super::super::FrameLease;
+        use super::super::frame::OwnedGpuImage;
+        let image = OwnedGpuImage::new(native.handle);
+        let lease = FrameLease::new(native.generation, release);
+        if native.handle < 0
+            || !native.width
+            || !native.height
+            || !native.generation
+            || native.format != myrica_webkit_sys::PIXEL_FORMAT_BGRA_PREMULTIPLIED
+        {
+            return Err(BackendError::new(
+                "WebCore returned an invalid shared GPU image",
+            ));
+        }
+        let mesh = self.gpu_mesh.get_or_insert_with(|| {
+            let vertex = |x, y, u, v| {
+                SgfxCanvasVertex::new([x, y, 0.0, 1.0], [1.0; 4]).with_tex_coord([u, v])
+            };
+            SgfxMesh::with_handle(
+                self.mesh,
+                0,
+                vec![
+                    vertex(-1.0, 1.0, 0.0, 0.0),
+                    vertex(1.0, 1.0, 1.0, 0.0),
+                    vertex(-1.0, -1.0, 0.0, 1.0),
+                    vertex(-1.0, -1.0, 0.0, 1.0),
+                    vertex(1.0, 1.0, 1.0, 0.0),
+                    vertex(1.0, -1.0, 1.0, 1.0),
+                ],
+            )
+        });
+        Ok(BrowserFrame {
+            revision: native.generation,
+            width: native.width,
+            height: native.height,
+            lease: Some(lease),
+            draws: vec![BrowserDraw {
+                mesh: Arc::clone(mesh),
+                transform: [
+                    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+                texture: Some(Arc::new(BrowserTexture {
+                    handle: self.texture,
+                    revision: native.generation,
+                    width: native.width,
+                    height: native.height,
+                    source: BrowserTextureSource::SharedGpu(image),
+                })),
+            }],
+        })
     }
 
     pub fn cached_frame(
@@ -132,6 +197,7 @@ impl FrameRenderer {
             revision,
             width,
             height,
+            lease: None,
             draws: vec![BrowserDraw {
                 mesh: SgfxMesh::with_handle(self.mesh, revision, vertices),
                 transform: [
@@ -142,7 +208,7 @@ impl FrameRenderer {
                     revision,
                     width: capacity.0,
                     height: capacity.1,
-                    pixels: Arc::from(padded),
+                    source: BrowserTextureSource::Rgba8(Arc::from(padded)),
                 })),
             }],
         };

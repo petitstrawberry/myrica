@@ -21,7 +21,7 @@ required-features = ["webkit-vulkan-probe"]
 
 [features]
 default = ["backend-blitz", "javascript"]
-backend-webkit-vulkan = ["backend-webkit", "myrica-webkit-sys/vulkan-rendering"]
+backend-webkit-vulkan = ["backend-webkit", "myrica-webkit-sys/vulkan-rendering", "myrica-webkit-sys/vulkan-probe"]
 webkit-vulkan-probe = ["backend-webkit", "myrica-webkit-sys/vulkan-probe"]
 javascript = ["backend-blitz", "dep:blitz-vibey-script", "dep:getrandom-v04"]
 backend-blitz = [
