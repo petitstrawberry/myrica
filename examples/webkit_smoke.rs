@@ -260,7 +260,15 @@ fn engine_probe(
         ))
         .map_err(|error| error.to_string())?;
     if media_only {
-        for path in ["normal", "normal-main", "normal-high", "mse", "mse-big"] {
+        for path in [
+            "normal",
+            "normal-main",
+            "normal-high",
+            "normal-sniff",
+            "normal-sniff-reload",
+            "mse",
+            "mse-big",
+        ] {
             sender
                 .send(OwnerMessage::PageProgress)
                 .map_err(|error| error.to_string())?;
@@ -303,7 +311,7 @@ fn engine_probe(
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            pump(&mut engine, Duration::from_secs(3));
+            sustain_live_page(&mut engine, url)?;
             if url == "https://ichigo.dev/" {
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
@@ -586,6 +594,78 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+fn sustain_live_page(engine: &mut ProbeEngine, url: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ticks = 0;
+    let mut revision_changes = 0;
+    let mut previous_revision = None;
+    // Ready is only a loading milestone. Continue the real owner event loop
+    // and GPU presentation while queued media/loader callbacks can still run.
+    while Instant::now() < deadline {
+        engine.tick();
+        let state = engine.snapshot();
+        if matches!(state.load_state, LoadState::Failed(_)) {
+            return Err(format!(
+                "post-Ready page callback failed ({url}): {state:?}"
+            ));
+        }
+        let frame = engine.render(1280, 720, 1.0)?;
+        if previous_revision.is_some_and(|previous| previous != frame.revision) {
+            revision_changes += 1;
+        }
+        previous_revision = Some(frame.revision);
+        ticks += 1;
+        thread::sleep(Duration::from_millis(17));
+    }
+    if ticks < 2 {
+        return Err(format!(
+            "post-Ready page owner did not sustain progress ({url}): ticks={ticks}"
+        ));
+    }
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=live-page-post-ready url={url} seconds=10 ticks={ticks} revision_changes={revision_changes}"
+    );
+    Ok(())
+}
+
+fn verify_sniff_reload_observation(state: &serde_json::Value) -> Result<(), String> {
+    let requests = state["sniffReload"]["requests"].as_array().ok_or_else(|| {
+        format!(
+            "missing ordinary HTTP sniff/reload observations: {}",
+            state["sniffReload"]
+        )
+    })?;
+    let first = requests
+        .first()
+        .ok_or("sniff/reload resource was not fetched")?;
+    if first["method"] != "GET"
+        || !first["range"].is_null()
+        || first["content_type"] != "video/webm"
+    {
+        return Err(format!(
+            "sniff regression did not begin with a misdeclared full GET: {requests:?}"
+        ));
+    }
+    let sniff = requests
+        .iter()
+        .position(|request| request["method"] == "GET" && request["range"] == "bytes=0-1445")
+        .ok_or_else(|| {
+            format!("WebCore did not fetch its genuine MediaResourceSniffer prefix: {requests:?}")
+        })?;
+    if sniff == 0
+        || !requests.iter().skip(sniff + 1).any(|request| {
+            request["method"] == "GET"
+                && request["range"].is_null()
+                && request["content_type"] == "application/octet-stream"
+        })
+    {
+        return Err(format!(
+            "sniffer prefix was not followed by a genuine engine reload GET: {requests:?}"
+        ));
+    }
     Ok(())
 }
 
@@ -878,6 +958,13 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
                 ));
             }
             verify_media_presentation_history(&state, path)?;
+            if path == "normal-sniff-reload" {
+                verify_sniff_reload_observation(&state)?;
+                println!(
+                    "MYRICA_WEBKIT_SMOKE_PASS stage=media-sniff-engine-reload requests={}",
+                    state["sniffReload"]["requests"]
+                );
+            }
             println!(
                 "MYRICA_WEBKIT_SMOKE_PASS stage=media-{path} colours={colours:?} frames={changed_frames} state={state}"
             );

@@ -199,10 +199,18 @@ let playClicks = 0;
 let presentationEpoch = 0;
 const frameHistory = [];
 let encodingEvidence = null;
+let sniffReloadEvidence = null;
 const mse = location.pathname.endsWith('/mse') || location.pathname.endsWith('/mse-big');
 function fail(error) { document.title = 'media-error:' + String(error); }
 video.addEventListener('error', () => fail('video:' + video.error?.code));
-video.addEventListener('canplay', () => { updateState(); if (video.paused) document.title = 'media-ready'; });
+video.addEventListener('canplay', () => {
+  updateState();
+  if (video.paused) document.title = 'media-ready';
+  if (location.pathname.endsWith('/normal-sniff-reload') && !sniffReloadEvidence) {
+    fetch('/media/sniff-reload-state.json').then(response => response.json())
+      .then(evidence => { sniffReloadEvidence = evidence; updateState(); }).catch(fail);
+  }
+});
 video.addEventListener('timeupdate', () => {
   if (!video.paused) document.title = 'media-time:' + video.currentTime.toFixed(3);
 });
@@ -229,7 +237,7 @@ function updateState() {
     ended:video.ended, ready:video.readyState, width:video.videoWidth, height:video.videoHeight,
     error:video.error?.code || 0, callbacks:frameCallbacks, metadata:lastFrameMetadata,
     quality:video.getVideoPlaybackQuality().totalVideoFrames,
-    frames:frameHistory, encoding:encodingEvidence, playClicks
+    frames:frameHistory, encoding:encodingEvidence, playClicks, sniffReload:sniffReloadEvidence
   });
 }
 updateState();
@@ -266,10 +274,14 @@ async function loadMse() {
   source.endOfStream();
 }
 const fixture = mse ? 'normal' : location.pathname.split('/').pop();
-fetch('/media/' + fixture + '.encoding.json')
+const encodingFixture = fixture.startsWith('normal-sniff') ? 'normal' : fixture;
+fetch('/media/' + encodingFixture + '.encoding.json')
   .then(response => response.json())
   .then(evidence => { encodingEvidence = evidence; updateState(); }).catch(fail);
-if (mse) loadMse().catch(fail); else video.src = '/media/' + fixture + '.mp4';
+if (mse) loadMse().catch(fail);
+else if (fixture === 'normal-sniff') video.src = '/media/normal-sniff-data';
+else if (fixture === 'normal-sniff-reload') video.src = '/media/normal-sniff-reload-data';
+else video.src = '/media/' + fixture + '.mp4';
 </script>"""
 
 
@@ -355,6 +367,11 @@ def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
     subprocess.run(common + ["-i", str(video), "-i", str(audio), "-map", "0:v", "-map", "1:a",
                              "-c", "copy", "-movflags", "+faststart", str(normal)], check=True)
     resources = {"/media/normal.mp4": ("video/mp4", normal.read_bytes())}
+    # No filename extension or <source type> can supply the initial container.
+    # The ordinary opaque-MIME path is separate from the reload regression:
+    # Scarlet accepts opaque MP4 directly, without MediaResourceSniffer.
+    for url in ("/media/normal-sniff-data", "/media/normal-sniff-reload-data"):
+        resources[url] = ("application/octet-stream", resources["/media/normal.mp4"][1])
     evidence = video_encoding_evidence(normal, "Constrained Baseline", False)
     resources["/media/normal.encoding.json"] = ("application/json", json.dumps(evidence).encode())
     for profile in ("main", "high"):
@@ -412,6 +429,8 @@ class FixtureServer(ThreadingHTTPServer):
         self.request_log = log_path.open("a", encoding="utf-8") if log_path else None
         self.log_lock = threading.Lock()
         self.media = media or {}
+        self.sniff_reload_lock = threading.Lock()
+        self.sniff_reload_requests: list[dict[str, object]] = []
 
     def record_request(self, record: dict[str, object]) -> None:
         if self.request_log is None:
@@ -476,9 +495,24 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", response)
         elif self.command not in ("GET", "HEAD"):
             self.reply(405, "text/plain; charset=utf-8", b"Method not allowed\n", (("Allow", "GET, HEAD"),))
+        elif path == "/media/sniff-reload-state.json" and self.server.media:
+            with self.server.sniff_reload_lock:
+                observation = {"requests": list(self.server.sniff_reload_requests)}
+            self.reply(200, "application/json", json.dumps(observation).encode())
         elif path in self.server.media:
             content_type, content = self.server.media[path]
             range_header = self.headers.get("Range")
+            if path == "/media/normal-sniff-reload-data":
+                with self.server.sniff_reload_lock:
+                    # A genuinely misdeclared first load must fail format
+                    # selection. Sniffer and retry receive the same MP4 bytes
+                    # with an opaque MIME, exercising ordinary HTTP reload.
+                    if not self.server.sniff_reload_requests:
+                        content_type = "video/webm"
+                    self.server.sniff_reload_requests.append({
+                        "method": self.command, "range": range_header,
+                        "content_type": content_type,
+                    })
             if range_header and range_header.startswith("bytes="):
                 try:
                     first, last = range_header[6:].split("-", 1)
@@ -493,7 +527,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
                            (("Accept-Ranges", "bytes"), ("Content-Range", f"bytes {start}-{end}/{len(content)}")))
             else:
                 self.reply(200, content_type, content, (("Accept-Ranges", "bytes"),))
-        elif path in ("/media/normal", "/media/normal-main", "/media/normal-high", "/media/mse", "/media/mse-big") and self.server.media:
+        elif path in ("/media/normal", "/media/normal-main", "/media/normal-high", "/media/normal-sniff", "/media/normal-sniff-reload", "/media/mse", "/media/mse-big") and self.server.media:
+            if path == "/media/normal-sniff-reload":
+                with self.server.sniff_reload_lock:
+                    self.server.sniff_reload_requests.clear()
             self.reply(200, "text/html; charset=utf-8", MEDIA_PAGE)
         elif path in ("/", "/main"):
             self.reply(200, "text/html; charset=utf-8", MAIN)
