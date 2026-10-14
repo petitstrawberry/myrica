@@ -341,18 +341,62 @@ fn engine_probe(
     );
 
     let revision = frame.revision;
+    let idle_paints_before = engine
+        .paint_statistics()
+        .map_err(|error| error.to_string())?
+        .paints;
     for _ in 0..20 {
         engine.tick();
         thread::sleep(Duration::from_millis(17));
     }
     let idle = engine.render(800, 600, 1.0)?;
     if idle.revision != revision {
+        // Diagnose a pending first-paint update separately from an idle
+        // repaint loop. Preserve the failure: a stable baseline must not be
+        // assumed just because native loading and the title completed.
+        let changed_bytes = frame
+            .rgba
+            .iter()
+            .zip(idle.rgba.iter())
+            .filter(|(before, after)| before != after)
+            .count();
+        let mut previous = idle.clone();
+        let mut followup_paints = 0;
+        let mut followup_changed_bytes = 0;
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(17));
+            engine.tick();
+            let current = engine.render(800, 600, 1.0)?;
+            followup_paints += usize::from(current.revision != previous.revision);
+            followup_changed_bytes += previous
+                .rgba
+                .iter()
+                .zip(current.rgba.iter())
+                .filter(|(before, after)| before != after)
+                .count();
+            previous = current;
+        }
+        eprintln!(
+            "MYRICA_WEBKIT_IDLE_DIAGNOSTIC first={revision} after={} changed_bytes={changed_bytes} followup_paints={followup_paints} followup_changed_bytes={followup_changed_bytes} last={}",
+            idle.revision, previous.revision
+        );
         return Err(format!(
             "idle frame changed from {revision} to {}",
             idle.revision
         ));
     }
-    println!("MYRICA_WEBKIT_SMOKE_PASS stage=idle-frame revision={revision}");
+    let idle_paints_after = engine
+        .paint_statistics()
+        .map_err(|error| error.to_string())?
+        .paints;
+    if idle_paints_after != idle_paints_before {
+        return Err(format!(
+            "unchanged idle pixels were repainted: paints {idle_paints_before} to {idle_paints_after}"
+        ));
+    }
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=idle-frame revision={revision} paints={idle_paints_after}"
+    );
 
     // Plain pointer movement over an unchanged background must retain pixels.
     engine.handle_input(BrowserInput::PointerMoved { x: 350.0, y: 300.0 });
