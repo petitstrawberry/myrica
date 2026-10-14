@@ -2539,6 +2539,37 @@ mod tests {
     }
 
     #[test]
+    fn native_play_pause_status_is_synchronous_before_decoder_polling() {
+        let session = scarlet_media_session_create();
+        assert!(!session.is_null());
+        // Holding an unrelated pending decode is unnecessary: the API's
+        // immediate getter must reflect controls even before data is ready.
+        // The clock stays at zero until real decoded media becomes available.
+        for _ in 0..100 {
+            let mut status = MediaStatus::default();
+            unsafe {
+                scarlet_media_session_play(session);
+                assert_eq!(scarlet_media_session_status(session, &mut status), OK);
+            }
+            assert_eq!(
+                (status.paused, status.error, status.current_time),
+                (0, 0, 0.0)
+            );
+            unsafe {
+                scarlet_media_session_pause(session);
+                assert_eq!(scarlet_media_session_status(session, &mut status), OK);
+            }
+            assert_eq!(
+                (status.paused, status.error, status.current_time),
+                (1, 0, 0.0)
+            );
+        }
+        unsafe {
+            scarlet_media_session_destroy(session);
+        }
+    }
+
+    #[test]
     fn audio_clock_uses_consumed_timestamp_instead_of_wall_time() {
         let mut clock = PlaybackClock::new();
         clock.audio_master = true;
