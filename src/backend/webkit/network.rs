@@ -234,10 +234,14 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
     let method = reqwest::Method::from_bytes(request.method.as_bytes())
         .map_err(|error| format!("invalid HTTP method: {error}"))?;
     let request_has_entity = method != reqwest::Method::HEAD;
+    let empty_post = method == reqwest::Method::POST && request.body.is_empty();
+    let mut has_request_framing = false;
     let mut builder = client.request(method, url);
     for (name, value) in request.headers {
         let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
             .map_err(|error| format!("invalid request header name: {error}"))?;
+        has_request_framing |=
+            name == reqwest::header::CONTENT_LENGTH || name == reqwest::header::TRANSFER_ENCODING;
         // The C ABI presents HTTP ByteString octets as Unicode Latin-1
         // characters. Encode that mapping back to bytes, never to UTF-8.
         let bytes = value
@@ -250,6 +254,12 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
         let value = reqwest::header::HeaderValue::from_bytes(&bytes)
             .map_err(|error| format!("invalid request header value: {error}"))?;
         builder = builder.header(name, value);
+    }
+    // Hyper treats an empty body as end-of-stream and does not infer an
+    // entity length. Frame a zero-byte POST explicitly for servers requiring
+    // Content-Length; preserve caller framing and leave GET/HEAD unchanged.
+    if empty_post && !has_request_framing {
+        builder = builder.header(reqwest::header::CONTENT_LENGTH, "0");
     }
     // Non-empty bodies retain their original bytes, including form and binary
     // uploads. An empty GET does not acquire an invented payload.
@@ -759,6 +769,121 @@ mod tests {
         assert_eq!(response.status, 404);
         assert_eq!(response.status_text, "Not Found");
         assert_eq!(response.body, b"missing");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn empty_post_has_zero_content_length_and_preserves_origin() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/empty", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (request, headers, body) = read_request(&mut stream);
+            assert!(request.starts_with("POST /empty "));
+            assert!(body.is_empty());
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header == "origin: https://origin.test")
+            );
+            assert!(
+                headers
+                    .iter()
+                    .any(|header| header == "content-type: application/octet-stream")
+            );
+            let lengths: Vec<_> = headers
+                .iter()
+                .filter(|header| header.starts_with("content-length:"))
+                .collect();
+            let framed = lengths.len() == 1 && lengths[0].as_str() == "content-length: 0";
+            let response = if framed {
+                b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://origin.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+            } else {
+                b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice()
+            };
+            stream.write_all(response).unwrap();
+            framed
+        });
+        let (service, wakes) = service();
+        service.submit(
+            1,
+            Request {
+                method: String::from("POST"),
+                url,
+                headers: vec![
+                    (String::from("Origin"), String::from("https://origin.test")),
+                    (
+                        String::from("Content-Type"),
+                        String::from("application/octet-stream"),
+                    ),
+                ],
+                body: Vec::new(),
+            },
+        );
+        let response = complete(&service, &wakes).result.unwrap();
+        let framed = server.join().unwrap();
+        assert_eq!(
+            response.status, 200,
+            "zero-byte POST lacked explicit entity length"
+        );
+        assert!(framed);
+        assert!(response.body.is_empty());
+        assert!(response.headers.contains(&(
+            String::from("access-control-allow-origin"),
+            String::from("https://origin.test")
+        )));
+    }
+
+    #[test]
+    fn explicit_empty_post_length_is_not_duplicated_and_get_head_stay_unframed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/framing", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for method in ["POST", "GET", "HEAD"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (request, headers, body) = read_request(&mut stream);
+                assert!(request.starts_with(&format!("{method} /framing ")));
+                assert!(body.is_empty());
+                let lengths: Vec<_> = headers
+                    .iter()
+                    .filter(|header| header.starts_with("content-length:"))
+                    .collect();
+                if method == "POST" {
+                    assert_eq!(lengths, [&String::from("content-length: 0")]);
+                } else {
+                    assert!(
+                        lengths.is_empty(),
+                        "{method} acquired an invented empty payload"
+                    );
+                }
+                assert!(
+                    !headers
+                        .iter()
+                        .any(|header| header.starts_with("transfer-encoding:"))
+                );
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            }
+        });
+        let (service, wakes) = service();
+        for (id, method) in ["POST", "GET", "HEAD"].into_iter().enumerate() {
+            service.submit(
+                id as u64,
+                Request {
+                    method: method.into(),
+                    url: url.clone(),
+                    headers: if method == "POST" {
+                        vec![(String::from("Content-Length"), String::from("0"))]
+                    } else {
+                        Vec::new()
+                    },
+                    body: Vec::new(),
+                },
+            );
+            assert_eq!(complete(&service, &wakes).result.unwrap().status, 200);
+        }
         server.join().unwrap();
     }
 
