@@ -2439,6 +2439,7 @@ dependencies = [
  "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
  "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
  "scarlet-ui",
+ "serde_json",
  "skrifa",
  "swash",
  "tokio",
