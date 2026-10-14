@@ -55,10 +55,12 @@ fn prepare() -> PathBuf {
     ]));
     let webkit = fs::read_to_string(bootstrap.join("webkit.path")).unwrap();
     let mut engine = Command::new("python3");
+    engine.arg(producer.join("build-webkit.py"));
     if env::var_os("CARGO_FEATURE_VULKAN_PROBE").is_some() {
-        engine.arg(producer.join("build-webkit.py")).arg("--vulkan-probe");
-    } else {
-        engine.arg(producer.join("build-webkit.py"));
+        engine.arg("--vulkan-probe");
+    }
+    if env::var_os("CARGO_FEATURE_VULKAN_RENDERING").is_some() {
+        engine.arg("--vulkan-rendering");
     }
     engine
         .arg("--webkit-source")

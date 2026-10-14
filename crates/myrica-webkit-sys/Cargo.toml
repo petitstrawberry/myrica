@@ -9,6 +9,7 @@ build = "build.rs"
 
 [features]
 vulkan-probe = []
+vulkan-rendering = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

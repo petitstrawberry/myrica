@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--vulkan-probe", action="store_true",
                         help="Build WebKit's native Skia/Vulkan GPU contract probe")
+    parser.add_argument("--vulkan-rendering", action="store_true",
+                        help="Paint WebCore pages with native Skia/Vulkan")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
@@ -104,6 +106,7 @@ def main():
     configure_build_install(webkit, build / "webkit", prefix, [
         "-DPORT=Scarlet", "-DSCARLET_BUILD_EMBEDDING=ON", "-DSCARLET_BUILD_RENDERER=OFF",
         f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
+        f"-DSCARLET_USE_SKIA_VULKAN={'ON' if args.vulkan_rendering else 'OFF'}",
         "-DUSE_THIN_ARCHIVES=OFF", "-DUSE_PCH_CODEGEN=ON", "-DUSE_HEADER_MAPS=ON",
         f"-DCMAKE_C_FLAGS={cflags}",
         f'-DCMAKE_CXX_FLAGS=-nostdinc++ -isystem "{runtime}/include/c++/v1" {cflags} -fno-exceptions -fno-rtti',

@@ -63,7 +63,10 @@ impl Default for Bytes {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct PaintStatistics { pub paints: u64, pub painted_pixels: u64 }
+pub struct PaintStatistics {
+    pub paints: u64,
+    pub painted_pixels: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -80,6 +83,28 @@ pub struct Configuration {
     pub height: u32,
     pub script_enabled: u32,
     pub device_scale_factor: f64,
+}
+
+/// Owned native GPU capability and owner-thread frame lease.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GpuFrame {
+    pub handle: i32,
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub generation: u64,
+}
+impl Default for GpuFrame {
+    fn default() -> Self {
+        Self {
+            handle: -1,
+            width: 0,
+            height: 0,
+            format: 0,
+            generation: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -245,6 +270,9 @@ unsafe extern "C" {
     pub fn scarlet_webview_tick(view: *mut ScarletWebView) -> c_int;
     pub fn scarlet_webview_needs_paint(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_pixels(view: *mut ScarletWebView, out_pixels: *mut Pixels) -> c_int;
+    pub fn scarlet_webview_gpu_frame_capacity(view: *mut ScarletWebView, out: *mut u32) -> c_int;
+    pub fn scarlet_webview_gpu_frame(view: *mut ScarletWebView, out: *mut GpuFrame) -> c_int;
+    pub fn scarlet_webview_release_gpu_frame(view: *mut ScarletWebView, generation: u64) -> c_int;
     pub fn scarlet_webview_state(view: *mut ScarletWebView, out_state: *mut State) -> c_int;
     pub fn scarlet_webview_mouse(
         view: *mut ScarletWebView,
@@ -269,7 +297,10 @@ unsafe extern "C" {
         view: *mut ScarletWebView,
         response: *const Response,
     ) -> c_int;
-    pub fn scarlet_webview_paint_statistics(view: *mut ScarletWebView, out: *mut PaintStatistics) -> c_int;
+    pub fn scarlet_webview_paint_statistics(
+        view: *mut ScarletWebView,
+        out: *mut PaintStatistics,
+    ) -> c_int;
     pub fn scarlet_webview_text_content(
         view: *mut ScarletWebView,
         element_id: Bytes,
