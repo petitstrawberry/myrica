@@ -1,5 +1,5 @@
 //! Persistent native WebCore backend. WebCore owns the document and resource policy;
-//! Myrica supplies HTTP transport and displays its real Cairo pixels through SGFX.
+//! Myrica supplies HTTP transport and presents native page images through SGFX.
 
 use std::collections::HashSet;
 use std::ptr::NonNull;
@@ -115,6 +115,49 @@ impl WebKitBackend {
             "inspect WebCore paint statistics",
         )?;
         Ok(statistics)
+    }
+
+    /// Diagnostic-only GPU readback for native integration probes. Browser
+    /// presentation continues to transfer shared images and never calls this.
+    /// The caller must keep this frame's owner lease alive until this returns.
+    #[cfg(feature = "backend-webkit-vulkan")]
+    pub fn diagnostic_gpu_frame_rgba(
+        &mut self,
+        frame: &BrowserFrame,
+    ) -> Result<Vec<u8>, BackendError> {
+        let lease = frame
+            .lease
+            .as_ref()
+            .ok_or_else(|| BackendError::new("GPU diagnostic frame has no lease"))?;
+        let mut pixels = ffi::Pixels::default();
+        // SAFETY: this is the native owner; frame keeps its lease alive. Copy
+        // the borrowed result before another native readback/return can occur.
+        check(
+            unsafe {
+                ffi::scarlet_webview_gpu_frame_readback(
+                    self.view.as_ptr(),
+                    lease.token,
+                    &mut pixels,
+                )
+            },
+            "diagnostic WebCore GPU readback",
+        )?;
+        if pixels.generation != frame.revision
+            || pixels.width != frame.width
+            || pixels.height != frame.height
+            || pixels.format != ffi::PIXEL_FORMAT_BGRA_PREMULTIPLIED
+            || pixels.data.is_null()
+            || pixels.length > pixels::MAX_FRAME_BYTES
+            || pixels.length > isize::MAX as usize
+        {
+            return Err(BackendError::new(
+                "GPU diagnostic readback has invalid metadata",
+            ));
+        }
+        // SAFETY: validated non-null owner-borrowed C ABI buffer and bounded length.
+        let bytes = unsafe { std::slice::from_raw_parts(pixels.data, pixels.length) };
+        pixels::convert_bgra(pixels.width, pixels.height, pixels.stride as usize, bytes)
+            .map_err(BackendError::new)
     }
 
     /// Read actual DOM text without running host-supplied JavaScript.

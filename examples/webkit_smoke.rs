@@ -18,12 +18,109 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use backend::{
-    BrowserBackend, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
-    LoadState, WakeCallback, WebKitBackend,
+    BrowserBackend, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton, LoadState,
+    WakeCallback, WebKitBackend,
 };
+
+#[derive(Clone)]
+struct ProbeFrame {
+    revision: u64,
+    width: u32,
+    height: u32,
+    rgba: Arc<[u8]>,
+}
+
+/// Diagnostic frame copies belong only to this probe. Real browser rendering
+/// never performs readback; its GPU capabilities go straight to ScarletUI.
+struct ProbeEngine {
+    engine: WebKitBackend,
+    returned: mpsc::Receiver<u64>,
+    cached: Option<ProbeFrame>,
+}
+impl ProbeEngine {
+    fn new(wake: WakeCallback) -> Result<Self, String> {
+        let mut engine = WebKitBackend::new(wake).map_err(|error| error.to_string())?;
+        let (sender, returned) = mpsc::channel();
+        engine.set_frame_releaser(Arc::new(move |token| {
+            let _ = sender.send(token);
+        }));
+        Ok(Self {
+            engine,
+            returned,
+            cached: None,
+        })
+    }
+    fn release_returned(&mut self) {
+        while let Ok(token) = self.returned.try_recv() {
+            self.engine.release_frame(token);
+        }
+    }
+    fn render(&mut self, width: u32, height: u32, scale: f32) -> Result<ProbeFrame, String> {
+        self.release_returned();
+        if let Some(frame) = self.engine.render_if_ready(width, height, scale) {
+            let result = (|| {
+                #[cfg(feature = "backend-webkit-vulkan")]
+                let rgba: Arc<[u8]> = self
+                    .engine
+                    .diagnostic_gpu_frame_rgba(&frame)
+                    .map_err(|error| error.to_string())?
+                    .into();
+                #[cfg(not(feature = "backend-webkit-vulkan"))]
+                let rgba = {
+                    let texture = frame
+                        .draws
+                        .first()
+                        .and_then(|draw| draw.texture.as_ref())
+                        .ok_or("native frame has no real texture")?;
+                    match &texture.source {
+                        backend::BrowserTextureSource::Rgba8(pixels) => Arc::clone(pixels),
+                        #[cfg(target_os = "scarlet")]
+                        _ => return Err(String::from("CPU probe received a GPU capability")),
+                    }
+                };
+                Ok::<_, String>(ProbeFrame {
+                    revision: frame.revision,
+                    width: frame.width,
+                    height: frame.height,
+                    rgba,
+                })
+            })();
+            // Close the exported capability, then return its storage lease on
+            // the genuine WebCore owner even when diagnostic readback failed.
+            drop(frame);
+            self.release_returned();
+            self.cached = Some(result?);
+        }
+        if let LoadState::Failed(error) = self.engine.snapshot().load_state {
+            return Err(format!("native paint failed: {error}"));
+        }
+        self.cached
+            .as_ref()
+            .filter(|frame| frame.width == width && frame.height == height)
+            .cloned()
+            .ok_or_else(|| String::from("native frame has no diagnostic pixels"))
+    }
+}
+impl std::ops::Deref for ProbeEngine {
+    type Target = WebKitBackend;
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+impl std::ops::DerefMut for ProbeEngine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
+}
+impl Drop for ProbeEngine {
+    fn drop(&mut self) {
+        self.release_returned();
+    }
+}
 
 enum OwnerMessage {
     InterruptHook(WakeCallback),
+    PageProgress,
     EnteringInfiniteScript,
 }
 
@@ -88,10 +185,18 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let base = std::env::args().nth(1).ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
-    let pages: Vec<String> = if base == "--pages" { std::env::args().skip(2).collect() } else { Vec::new() };
+    let base = std::env::args()
+        .nth(1)
+        .ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
+    let pages: Vec<String> = if base == "--pages" {
+        std::env::args().skip(2).collect()
+    } else {
+        Vec::new()
+    };
     let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
-    if base == "--pages" && pages.is_empty() { return Err(String::from("--pages requires URLs")); }
+    if base == "--pages" && pages.is_empty() {
+        return Err(String::from("--pages requires URLs"));
+    }
     let (sender, receiver) = mpsc::channel();
     let worker = thread::Builder::new()
         .name(String::from("myrica-webkit-smoke"))
@@ -119,6 +224,7 @@ fn run() -> Result<(), String> {
                 hook();
                 break;
             }
+            Ok(OwnerMessage::PageProgress) => continue,
             Ok(_) => return Err(String::from("unexpected owner message")),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(error) => return Err(format!("native owner stalled: {error}")),
@@ -136,9 +242,14 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String], fixture_only: bool) -> Result<(), String> {
+fn engine_probe(
+    base: &str,
+    sender: mpsc::Sender<OwnerMessage>,
+    pages: &[String],
+    fixture_only: bool,
+) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
-    let mut engine = WebKitBackend::new(wake).map_err(|error| error.to_string())?;
+    let mut engine = ProbeEngine::new(wake)?;
     sender
         .send(OwnerMessage::InterruptHook(
             engine
@@ -148,15 +259,26 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
         .map_err(|error| error.to_string())?;
     if !pages.is_empty() {
         for url in pages {
-            engine.render(1280, 720, 1.0);
+            // Each live page has its own bounded wait. Let the control thread
+            // distinguish several slow pages from a stalled native owner.
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|error| error.to_string())?;
+            engine.render(1280, 720, 1.0)?;
             engine.navigate(url).map_err(|error| error.to_string())?;
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 engine.tick();
                 let state = engine.snapshot();
-                if matches!(state.load_state, LoadState::Failed(_)) { return Err(format!("page failed: {state:?}")); }
-                if state.load_state == LoadState::Ready && !state.title.is_empty() { break; }
-                if Instant::now() >= deadline { return Err(format!("page stalled: {state:?}")); }
+                if matches!(state.load_state, LoadState::Failed(_)) {
+                    return Err(format!("page failed: {state:?}"));
+                }
+                if state.load_state == LoadState::Ready && !state.title.is_empty() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("page stalled: {state:?}"));
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             pump(&mut engine, Duration::from_secs(3));
@@ -164,27 +286,42 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
                 let deadline = Instant::now() + Duration::from_secs(15);
                 loop {
                     engine.tick();
-                    let text = engine.text_content("lastfm-placeholder").map_err(|error| error.to_string())?;
+                    let text = engine
+                        .text_content("lastfm-placeholder")
+                        .map_err(|error| error.to_string())?;
                     if let Some(text) = text.as_ref() {
                         if !text.contains("Loading...") && !text.trim().is_empty() {
-                            println!("MYRICA_WEBKIT_DOM url={url} id=lastfm-placeholder text={text:?}");
+                            println!(
+                                "MYRICA_WEBKIT_DOM url={url} id=lastfm-placeholder text={text:?}"
+                            );
                             break;
                         }
                     }
-                    if Instant::now() >= deadline { return Err(format!("Recent Tracks was not replaced: {text:?}")); }
+                    if Instant::now() >= deadline {
+                        return Err(format!("Recent Tracks was not replaced: {text:?}"));
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
             }
-            let frame = engine.render(1280, 720, 1.0);
-            let texture = frame.draws.first().and_then(|draw| draw.texture.as_ref()).ok_or("page has no pixels")?;
-            let nonwhite = texture.pixels.chunks_exact(4).filter(|pixel| pixel[3] != 0 && pixel[..3] != [255, 255, 255]).count();
-            println!("MYRICA_WEBKIT_PAGE url={url} nonwhite={nonwhite} revision={} state={:?}", frame.revision, engine.snapshot());
-            if nonwhite < 100 { return Err(format!("page remains blank: {url}")); }
+            let frame = engine.render(1280, 720, 1.0)?;
+            let nonwhite = frame
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0 && pixel[..3] != [255, 255, 255])
+                .count();
+            println!(
+                "MYRICA_WEBKIT_PAGE url={url} nonwhite={nonwhite} revision={} state={:?}",
+                frame.revision,
+                engine.snapshot()
+            );
+            if nonwhite < 100 {
+                return Err(format!("page remains blank: {url}"));
+            }
         }
         drop(engine);
         return Ok(());
     }
-    engine.render(800, 600, 1.0);
+    engine.render(800, 600, 1.0)?;
     engine
         .navigate(&format!("{base}/redirect"))
         .map_err(|error| error.to_string())?;
@@ -195,7 +332,7 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
             engine.snapshot()
         ));
     }
-    let frame = engine.render(800, 600, 1.0);
+    let frame = engine.render(800, 600, 1.0)?;
     assert_pixel(&frame, 50, 20, [0x12, 0x34, 0x56, 255])?;
     assert_pixel(&frame, 405, 15, [0xAA, 0xBB, 0xCC, 255])?;
     println!(
@@ -208,7 +345,7 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
         engine.tick();
         thread::sleep(Duration::from_millis(17));
     }
-    let idle = engine.render(800, 600, 1.0);
+    let idle = engine.render(800, 600, 1.0)?;
     if idle.revision != revision {
         return Err(format!(
             "idle frame changed from {revision} to {}",
@@ -220,25 +357,28 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
     // Plain pointer movement over an unchanged background must retain pixels.
     engine.handle_input(BrowserInput::PointerMoved { x: 350.0, y: 300.0 });
     engine.tick();
-    let pointer_revision = engine.render(800, 600, 1.0).revision;
+    let pointer_revision = engine.render(800, 600, 1.0)?.revision;
     for index in 0..100 {
-        engine.handle_input(BrowserInput::PointerMoved { x: 350.0 + (index % 10) as f32, y: 300.0 });
+        engine.handle_input(BrowserInput::PointerMoved {
+            x: 350.0 + (index % 10) as f32,
+            y: 300.0,
+        });
         engine.tick();
     }
-    if engine.render(800, 600, 1.0).revision != pointer_revision {
+    if engine.render(800, 600, 1.0)?.revision != pointer_revision {
         return Err(String::from("plain pointer motion repainted native pixels"));
     }
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=pointer-move-retains-pixels");
 
-    engine.render(500, 400, 2.0);
+    engine.render(500, 400, 2.0)?;
     wait_title(&mut engine, "width:250")?;
     assert_pixel(
-        &engine.render(500, 400, 2.0),
+        &engine.render(500, 400, 2.0)?,
         100,
         40,
         [0x65, 0x43, 0x21, 255],
     )?;
-    engine.render(800, 600, 1.0);
+    engine.render(800, 600, 1.0)?;
     wait_title(&mut engine, "width:800")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=resize-retina-media-query");
 
@@ -312,27 +452,53 @@ fn engine_probe(base: &str, sender: mpsc::Sender<OwnerMessage>, pages: &[String]
     wait_title(&mut engine, "scroll:240")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=native-scroll");
 
-    engine.navigate(&format!("{base}/damage")).map_err(|error| error.to_string())?;
+    engine
+        .navigate(&format!("{base}/damage"))
+        .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "damage-ready")?;
-    engine.render(800, 600, 1.0);
-    let before = engine.paint_statistics().map_err(|error| error.to_string())?;
+    engine.render(800, 600, 1.0)?;
+    let before = engine
+        .paint_statistics()
+        .map_err(|error| error.to_string())?;
     key(&mut engine, BrowserKey::Character('a'), true);
     key(&mut engine, BrowserKey::Character('a'), false);
     wait_title(&mut engine, "damage-changed")?;
-    let frame = engine.render(800, 600, 1.0);
+    let frame = engine.render(800, 600, 1.0)?;
     assert_pixel(&frame, 25, 25, [0x65, 0x43, 0x21, 255])?;
     assert_pixel(&frame, 300, 300, [255, 255, 255, 255])?;
-    let after = engine.paint_statistics().map_err(|error| error.to_string())?;
+    let after = engine
+        .paint_statistics()
+        .map_err(|error| error.to_string())?;
     let painted = after.painted_pixels - before.painted_pixels;
-    if painted >= 800 * 600 { return Err(format!("small DOM change repainted the entire viewport: {painted}")); }
-    println!("MYRICA_WEBKIT_SMOKE_PASS stage=bounded-damage painted_pixels={painted}");
+    #[cfg(not(feature = "backend-webkit-vulkan"))]
+    {
+        if painted >= 800 * 600 {
+            return Err(format!(
+                "small DOM change repainted the entire viewport: {painted}"
+            ));
+        }
+        println!("MYRICA_WEBKIT_SMOKE_PASS stage=bounded-damage painted_pixels={painted}");
+    }
+    #[cfg(feature = "backend-webkit-vulkan")]
+    {
+        // Current two-image GPU renderer repaints a dirty page once into a
+        // free image; it does not copy damaged regions from the leased image.
+        if painted == 0 || painted > 800 * 600 {
+            return Err(format!("GPU DOM mutation painted invalid work: {painted}"));
+        }
+        println!("MYRICA_WEBKIT_SMOKE_PASS stage=gpu-damage-single-paint painted_pixels={painted}");
+    }
 
-    engine.navigate(&format!("{base}/storage")).map_err(|error| error.to_string())?;
+    engine
+        .navigate(&format!("{base}/storage"))
+        .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "storage-blob-iframe-ready")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=storage-cookie-blob-iframe");
-    engine.navigate(&format!("{base}/frames")).map_err(|error| error.to_string())?;
+    engine
+        .navigate(&format!("{base}/frames"))
+        .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "frames-ready")?;
-    let frame = engine.render(800, 600, 1.0);
+    let frame = engine.render(800, 600, 1.0)?;
     assert_pixel(&frame, 20, 100, [0x24, 0x68, 0xac, 255])?;
     assert_pixel(&frame, 300, 100, [0xac, 0x68, 0x24, 255])?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=frameset-child-pixels");
@@ -413,15 +579,13 @@ fn type_character(engine: &mut WebKitBackend, character: char) {
     key(engine, BrowserKey::Character(character), false);
 }
 
-fn assert_pixel(frame: &BrowserFrame, x: u32, y: u32, expected: [u8; 4]) -> Result<(), String> {
-    let texture = frame
-        .draws
-        .first()
-        .and_then(|draw| draw.texture.as_ref())
-        .ok_or("native frame has no real texture")?;
-    let offset = (y as usize * texture.width as usize + x as usize) * 4;
-    let pixel = texture
-        .pixels
+fn assert_pixel(frame: &ProbeFrame, x: u32, y: u32, expected: [u8; 4]) -> Result<(), String> {
+    if x >= frame.width || y >= frame.height {
+        return Err(String::from("pixel outside native frame"));
+    }
+    let offset = (y as usize * frame.width as usize + x as usize) * 4;
+    let pixel = frame
+        .rgba
         .get(offset..offset + 4)
         .ok_or("pixel outside native frame")?;
     if pixel != expected {

@@ -19,7 +19,7 @@ The name comes from *Myrica rubra*, an evergreen tree with scarlet fruit.
 - Backend-neutral navigation, input, lifecycle, and retained scene boundary
 - Optional native WebKit backend for AArch64 Scarlet, using a persistent WebCore Page
 
-Blitz remains the default engine. The `backend-webkit` feature embeds WebKit's
+Blitz remains the default engine. The `backend-webkit` and `backend-webkit-vulkan` features embed WebKit's
 Scarlet port through its C ABI; the same ScarletUI chrome can select either engine.
 
 ## Run on desktop
@@ -78,19 +78,26 @@ Cargo's build directory. The standard Scarlet development shell provides the
 common SDK runtime and raw compilers. `MYRICA_WEBKIT_LINK_MANIFEST` can explicitly
 select a prebuilt installation; otherwise Cargo builds and uses its own link
 manifest. The SGFX userspace Cargo configuration supplies ordinary native
-loader link flags. Building this CPU Cairo profile does not enable GPU rendering.
+loader link flags. `backend-webkit` selects the CPU Cairo profile;
+`backend-webkit-vulkan` selects WebCore Skia painting through the native Vulkan
+loader, SGFX ICD and VirGL backend. Both profiles build in release mode.
 
-The `webkit-vulkan-probe` Cargo feature builds WebKit's Skia Ganesh Vulkan
-contract check. Its `webkit-vulkan-probe` binary is installed as
-`myrica-vulkan-probe` by the current Scarlet desktop recipe. It checks native
-C++ TLS, Rust TLS and errno isolation across four threads, then runs three
-create/draw/readback/destroy cycles through the installed Vulkan loader and
-SGFX ICD. Skia wraps an exported BGRA GPU image; the diagnostic readback is
-used for validation. This feature does not switch browser page rendering to
-Skia.
+The AArch64 Scarlet desktop bundle selects `backend-webkit-vulkan`. WebCore
+paints directly into shared BGRA GPU images. ScarletUI imports those images on
+the UI thread without a CPU page readback, conversion or upload. Two leased
+images provide backpressure: an image becomes reusable only after the UI has
+finished sampling its replacement. Unchanged pages retain their current image.
+The default Cargo features retain Blitz for desktop development and other
+Scarlet architectures.
 
-The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
-retain Blitz for desktop development and other Scarlet architectures.
+The `webkit-vulkan-probe` feature enables diagnostic GPU readback. Its
+`webkit-vulkan-probe` binary is installed as `myrica-vulkan-probe` by the Scarlet
+desktop recipe with the same Vulkan page profile as the browser. It checks
+native C++ TLS, Rust TLS and errno isolation across four threads, then three
+Ganesh create/draw/readback/destroy cycles. Its page contract exercises actual
+WebCore DOM, rounded CSS, text, JavaScript and clicks at Retina scale, checks
+two-image backpressure, and verifies that leased images remain unchanged.
+Diagnostic readback is used only by these checks, not by browser presentation.
 
 Run the installed binary on Scarlet:
 
@@ -104,8 +111,9 @@ keeps Blitz when it is available. WebKit uses JavaScriptCore's native C-loop
 interpreter; Myrica's `javascript` feature controls the Blitz/Boa engine only.
 
 WebCore performs navigation, redirects, resource policy, HTML/CSS layout,
-JavaScript, editing, and history. Myrica provides verified HTTP(S) transport and
-uploads WebCore's Cairo framebuffer into its SGFX canvas. The font configuration
+JavaScript, editing, and history. Myrica provides verified HTTP(S) transport.
+The Vulkan profile presents shared GPU images; the CPU profile uploads
+WebCore's Cairo framebuffer into its SGFX canvas. The font configuration
 defaults to `/etc/fonts/fonts.conf`; `MYRICA_WEBKIT_FONT_CONFIG` can select another
 installed configuration. Install its referenced fonts in the guest.
 
