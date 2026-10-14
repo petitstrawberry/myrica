@@ -13,12 +13,12 @@ vulkan-rendering = []
 media = ["dep:scarlet-codecs", "dep:sas-client", "dep:scarlet-video-client"]
 
 [dependencies]
-scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ee867946936998c92df3841be8d46067a39d67af", optional = true, default-features = false, features = ["media-container-aac"] }
+scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3223658e442cf338c20751fd5fd9b0ff5f0c402d", optional = true, default-features = false, features = ["media-container-aac"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, features = ["std"] }
-sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ee867946936998c92df3841be8d46067a39d67af", optional = true, default-features = false, features = ["std"] }
-scarlet-video-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "ee867946936998c92df3841be8d46067a39d67af", optional = true, default-features = false, features = ["std", "h264-stateful-hw", "h264-stateless-hw"] }
+sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3223658e442cf338c20751fd5fd9b0ff5f0c402d", optional = true, default-features = false, features = ["std"] }
+scarlet-video-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "3223658e442cf338c20751fd5fd9b0ff5f0c402d", optional = true, default-features = false, features = ["std", "h264-stateful-hw", "h264-stateless-hw"] }

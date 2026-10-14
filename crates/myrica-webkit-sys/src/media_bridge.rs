@@ -9,7 +9,7 @@ use scarlet_codecs::media::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -446,8 +446,10 @@ pub unsafe extern "C" fn scarlet_media_supports_type(
 fn native_h264_available() -> bool {
     #[cfg(target_os = "scarlet")]
     {
-        scarlet_video_client::ScarletVideoDecoder::available_capabilities()
-            .ok()
+        static CAPABILITIES: SuccessfulQueryCache<scarlet_video_client::DecoderCapabilities> =
+            SuccessfulQueryCache::new();
+        CAPABILITIES
+            .get_or_query(scarlet_video_client::ScarletVideoDecoder::available_capabilities)
             .is_some_and(|caps| {
                 caps.supports(scarlet_video_client::VideoFormat::H264)
                     && caps.output_pixel_format()
@@ -457,6 +459,36 @@ fn native_h264_available() -> bool {
     #[cfg(not(target_os = "scarlet"))]
     {
         false
+    }
+}
+
+/// The current device open allocates a backend stream even for GET_CAPS.
+/// Reuse successful process capabilities; failed opens remain retryable.
+/// Serializing the cold query prevents concurrent callers from each allocating
+/// a stream before the first successful snapshot has been published.
+struct SuccessfulQueryCache<T> {
+    value: OnceLock<T>,
+    cold_query: Mutex<()>,
+}
+
+impl<T> SuccessfulQueryCache<T> {
+    const fn new() -> Self {
+        Self {
+            value: OnceLock::new(),
+            cold_query: Mutex::new(()),
+        }
+    }
+    fn get_or_query<E>(&self, query: impl FnOnce() -> Result<T, E>) -> Option<&T> {
+        if let Some(value) = self.value.get() {
+            return Some(value);
+        }
+        let _query_guard = lock(&self.cold_query);
+        if let Some(value) = self.value.get() {
+            return Some(value);
+        }
+        let value = query().ok()?;
+        let _ = self.value.set(value);
+        self.value.get()
     }
 }
 
@@ -2330,6 +2362,82 @@ mod tests {
         assert!(!supported("audio/mp4", "avc1.42E01E"));
         assert!(!supported("video/webm", "vp9"));
         assert!(supported("audio/mp4", "mp4a.40.2"));
+    }
+
+    #[test]
+    fn concurrent_capability_queries_publish_one_successful_snapshot() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+        let cache = Arc::new(SuccessfulQueryCache::new());
+        let barrier = Arc::new(Barrier::new(32));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let (cache, barrier, calls) = (cache.clone(), barrier.clone(), calls.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_query(|| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(2));
+                            Ok::<_, ()>(42)
+                        })
+                        .copied()
+                })
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), Some(42));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn capability_open_failures_retry_but_successful_unsupported_result_is_cached() {
+        let cache = SuccessfulQueryCache::new();
+        assert_eq!(
+            cache.get_or_query(|| Err::<bool, _>("device not ready")),
+            None
+        );
+        assert_eq!(cache.get_or_query(|| Ok::<_, ()>(false)), Some(&false));
+        assert_eq!(
+            cache.get_or_query(|| -> Result<bool, ()> { panic!("must not open device again") }),
+            Some(&false)
+        );
+    }
+
+    #[test]
+    fn concurrent_transient_failures_do_not_poison_capability_cache() {
+        use std::sync::{Barrier, atomic::AtomicUsize};
+        let cache = Arc::new(SuccessfulQueryCache::new());
+        let barrier = Arc::new(Barrier::new(32));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let (cache, barrier, calls) = (cache.clone(), barrier.clone(), calls.clone());
+                thread::spawn(move || {
+                    barrier.wait();
+                    cache
+                        .get_or_query(|| {
+                            if calls.fetch_add(1, Ordering::SeqCst) < 7 {
+                                Err(())
+                            } else {
+                                Ok(17)
+                            }
+                        })
+                        .copied()
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_none()).count(), 7);
+        assert_eq!(
+            results.iter().filter(|result| **result == Some(17)).count(),
+            25
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
     }
 
     #[test]
