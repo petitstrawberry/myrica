@@ -33,6 +33,14 @@ fn prepare() -> PathBuf {
             "-DSCARLET_NATIVE_RUNTIME={}",
             Path::new(&runtime).display()
         ));
+    configure.arg(format!(
+        "-DSCARLET_DEPENDENCIES_CAIRO={}",
+        if env::var_os("CARGO_FEATURE_VULKAN_RENDERING").is_some() {
+            "OFF"
+        } else {
+            "ON"
+        }
+    ));
     for (cmake_name, env_name, fallback) in [
         ("SCARLET_NATIVE_CC", "SCARLET_NATIVE_CC", "clang"),
         ("SCARLET_NATIVE_CXX", "SCARLET_NATIVE_CXX", "clang++"),
