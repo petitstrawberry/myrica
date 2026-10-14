@@ -1,4 +1,4 @@
-//! Convert WebCore's premultiplied Cairo BGRA surface into a retained SGFX texture.
+//! Adopt native GPU page images, or convert the optional Cairo framebuffer.
 
 use std::sync::Arc;
 
@@ -82,9 +82,9 @@ impl FrameRenderer {
         let image = OwnedGpuImage::new(native.handle);
         let lease = FrameLease::new(native.generation, release);
         if native.handle < 0
-            || !native.width
-            || !native.height
-            || !native.generation
+            || native.width == 0
+            || native.height == 0
+            || native.generation == 0
             || native.format != myrica_webkit_sys::PIXEL_FORMAT_BGRA_PREMULTIPLIED
         {
             return Err(BackendError::new(
