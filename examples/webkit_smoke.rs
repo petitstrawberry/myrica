@@ -769,6 +769,9 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
     if state["width"] != 128 || state["height"] != 96 || state["ready"].as_u64().unwrap_or(0) < 3 {
         return Err(format!("metadata or ready state failed ({path}): {state}"));
     }
+    // Paint the loaded document before targeting its actual Play button.
+    // Metadata readiness alone does not flush the embedding's pending layout.
+    engine.render(400, 240, 1.0)?;
     click(engine, 60.0, 155.0);
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut colours = [false; 3];
