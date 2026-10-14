@@ -80,6 +80,15 @@ select a prebuilt installation; otherwise Cargo builds and uses its own link
 manifest. The SGFX userspace Cargo configuration supplies ordinary native
 loader link flags. Building this CPU Cairo profile does not enable GPU rendering.
 
+The `webkit-vulkan-probe` Cargo feature builds WebKit's Skia Ganesh Vulkan
+contract check. Its `webkit-vulkan-probe` binary is installed as
+`myrica-vulkan-probe` by the current Scarlet desktop recipe. It checks native
+C++ TLS, Rust TLS and errno isolation across four threads, then runs three
+create/draw/readback/destroy cycles through the installed Vulkan loader and
+SGFX ICD. Skia wraps an exported BGRA GPU image; the diagnostic readback is
+used for validation. This feature does not switch browser page rendering to
+Skia.
+
 The Scarlet desktop bundle selects WebKit on AArch64. The default Cargo features
 retain Blitz for desktop development and other Scarlet architectures.
 
