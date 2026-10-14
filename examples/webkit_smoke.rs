@@ -688,6 +688,20 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
                     "media ended without actual decoded GPU frames ({path}): colours={colours:?} frames={changed_frames} state={state}"
                 ));
             }
+            let metadata = &state["metadata"];
+            if state["callbacks"].as_u64().unwrap_or(0) < 3
+                || state["quality"].as_u64().unwrap_or(0) < 3
+                || metadata["count"].as_u64().unwrap_or(0) < 3
+                || metadata["width"] != 128
+                || metadata["height"] != 96
+                || !metadata["time"]
+                    .as_f64()
+                    .is_some_and(|time| time.is_finite() && time >= 0.0)
+            {
+                return Err(format!(
+                    "media frame callbacks/quality lack actual frame metadata ({path}): {state}"
+                ));
+            }
             println!(
                 "MYRICA_WEBKIT_SMOKE_PASS stage=media-{path} colours={colours:?} frames={changed_frames} state={state}"
             );

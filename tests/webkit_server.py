@@ -192,6 +192,9 @@ button{position:absolute;left:20px;top:140px;width:128px;height:32px}</style>
 <span id="media-state" style="display:none"></span>
 <script>
 const video = document.getElementById('video');
+let frameCallbacks = 0;
+let lastFrameMetadata = null;
+let observingFrames = false;
 const mse = location.pathname.endsWith('/mse') || location.pathname.endsWith('/mse-big');
 function fail(error) { document.title = 'media-error:' + String(error); }
 video.addEventListener('error', () => fail('video:' + video.error?.code));
@@ -200,12 +203,25 @@ video.addEventListener('timeupdate', () => {
   if (!video.paused) document.title = 'media-time:' + video.currentTime.toFixed(3);
 });
 video.addEventListener('ended', () => { document.title = 'media-ended:' + video.currentTime.toFixed(3); });
-document.getElementById('play').addEventListener('click', () => video.play().catch(fail));
+document.getElementById('play').addEventListener('click', () => {
+  if (!observingFrames) {
+    observingFrames = true;
+    function frameReady(now, metadata) {
+      ++frameCallbacks;
+      lastFrameMetadata = { time:metadata.mediaTime, count:metadata.presentedFrames,
+                            width:metadata.width, height:metadata.height };
+      video.requestVideoFrameCallback(frameReady);
+    }
+    video.requestVideoFrameCallback(frameReady);
+  }
+  video.play().catch(fail);
+});
 function updateState() {
   document.getElementById('media-state').textContent = JSON.stringify({
     time:video.currentTime, duration:video.duration, paused:video.paused,
     ended:video.ended, ready:video.readyState, width:video.videoWidth, height:video.videoHeight,
-    error:video.error?.code || 0
+    error:video.error?.code || 0, callbacks:frameCallbacks, metadata:lastFrameMetadata,
+    quality:video.getVideoPlaybackQuality().totalVideoFrames
   });
 }
 updateState();
