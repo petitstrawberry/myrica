@@ -12,6 +12,8 @@ unsafe extern "C" {
     /// Executes real Ganesh Vulkan draws and validates GPU-read pixels.
     /// Must be called on a single native Scarlet thread before starting a GUI.
     pub fn scarlet_webview_vulkan_probe() -> c_int;
+    pub fn scarlet_webview_tls_value() -> u64;
+    pub fn scarlet_webview_tls_increment() -> u64;
 }
 pub const OK: i32 = 0;
 pub const EMPTY: i32 = 1;
