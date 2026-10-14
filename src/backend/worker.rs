@@ -386,7 +386,15 @@ impl Shared {
     }
 }
 
-fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
+fn run_engine(backend: Box<dyn BrowserBackend>, shared: &Shared) {
+    run_engine_polling(backend, shared, ENGINE_POLL_INTERVAL);
+}
+
+fn run_engine_polling(
+    mut backend: Box<dyn BrowserBackend>,
+    shared: &Shared,
+    poll_interval: Duration,
+) {
     shared.mailbox.lock().unwrap().shutdown_hook = backend.shutdown_callback();
     let mut generation = 0;
     let mut dirty = false;
@@ -396,7 +404,7 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
     let mut rendered_viewport = None;
     let mut published_frame = None;
     loop {
-        let (commands, returned_frames, viewport) = {
+        let (commands, returned_frames, viewport, tick_due) = {
             let mut mailbox = shared.mailbox.lock().unwrap();
             loop {
                 if mailbox.shutdown {
@@ -421,11 +429,18 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
                     .unwrap()
                     .0;
             }
+            // A frame deadline or returned GPU lease only makes painting
+            // runnable. Neither is evidence of new engine work, and neither
+            // should postpone the next scheduled timer/network poll.
+            let tick_due = mailbox.engine_woken
+                || !mailbox.commands.is_empty()
+                || Instant::now() >= next_poll_at;
             mailbox.engine_woken = false;
             (
                 std::mem::take(&mut mailbox.commands),
                 std::mem::take(&mut mailbox.returned_frames),
                 mailbox.viewport,
+                tick_due,
             )
         };
 
@@ -460,10 +475,17 @@ fn run_engine(mut backend: Box<dyn BrowserBackend>, shared: &Shared) {
                 }
             }
         }
-        dirty |= backend.tick();
-        next_poll_at = Instant::now() + ENGINE_POLL_INTERVAL;
+        if tick_due {
+            dirty |= backend.tick();
+            next_poll_at = Instant::now() + poll_interval;
+        }
         let snapshot = backend.snapshot();
-        if last_snapshot.as_ref() != Some(&(generation, snapshot.clone())) {
+        if last_snapshot
+            .as_ref()
+            .is_none_or(|(previous_generation, previous)| {
+                *previous_generation != generation || *previous != snapshot
+            })
+        {
             shared.publish(generation, snapshot.clone(), None);
             last_snapshot = Some((generation, snapshot));
         }
@@ -773,6 +795,125 @@ mod tests {
         }
         drop(worker);
         dropped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn blocked_frame_deadlines_and_returned_images_do_not_poll_the_engine() {
+        #[derive(Debug, PartialEq)]
+        enum Signal {
+            Tick,
+            Capacity,
+            Released(u64),
+            Snapshot(u32),
+        }
+        struct BlockedBackend {
+            signals: Sender<Signal>,
+            ticks: u32,
+            released: bool,
+        }
+        impl BrowserBackend for BlockedBackend {
+            fn navigate(&mut self, _: &str) -> Result<(), BackendError> {
+                Ok(())
+            }
+            fn reload(&mut self) {}
+            fn go_back(&mut self) {}
+            fn go_forward(&mut self) {}
+            fn tick(&mut self) -> bool {
+                self.ticks += 1;
+                self.signals.send(Signal::Tick).unwrap();
+                false
+            }
+            fn can_render(&mut self) -> bool {
+                self.signals.send(Signal::Capacity).unwrap();
+                false
+            }
+            fn release_frame(&mut self, token: u64) {
+                self.released = true;
+                self.signals.send(Signal::Released(token)).unwrap();
+            }
+            fn render(&mut self, _: u32, _: u32, _: f32) -> BrowserFrame {
+                panic!("cannot paint while both GPU images are leased")
+            }
+            fn handle_input(&mut self, _: BrowserInput) -> bool {
+                false
+            }
+            fn snapshot(&self) -> BrowserSnapshot {
+                if self.released {
+                    self.signals.send(Signal::Snapshot(self.ticks)).unwrap();
+                }
+                BrowserSnapshot {
+                    backend_name: "test",
+                    url: String::new(),
+                    title: String::new(),
+                    load_state: LoadState::Ready,
+                    can_go_back: false,
+                    can_go_forward: false,
+                    text_input: None,
+                }
+            }
+        }
+        let (signals, received) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            mailbox: Mutex::new(Mailbox {
+                commands: VecDeque::from([(1, Command::Navigate("first".into()))]),
+                returned_frames: VecDeque::new(),
+                viewport: VIEWPORT,
+                generation: 1,
+                engine_woken: true,
+                shutdown: false,
+                shutdown_hook: None,
+                update: None,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            // Keep periodic polling beyond the assertion window, so this
+            // checks actual wake reasons rather than scheduler timing jitter.
+            run_engine_polling(
+                Box::new(BlockedBackend {
+                    signals,
+                    ticks: 0,
+                    released: false,
+                }),
+                &worker_shared,
+                Duration::from_secs(5),
+            );
+        });
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Signal::Tick
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Signal::Capacity
+        );
+        // Let several painting deadlines run while there is no free image.
+        thread::sleep(FRAME_INTERVAL * 3);
+        shared.mailbox.lock().unwrap().returned_frames.push_back(7);
+        shared.ready.notify_one();
+        loop {
+            match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Signal::Capacity | Signal::Released(7) => {}
+                Signal::Snapshot(ticks) => {
+                    assert_eq!(ticks, 1);
+                    break;
+                }
+                other => panic!("a paint-only wake polled the engine: {other:?}"),
+            }
+        }
+        shared.mailbox.lock().unwrap().engine_woken = true;
+        shared.ready.notify_one();
+        loop {
+            match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+                Signal::Tick => break,
+                Signal::Capacity | Signal::Snapshot(1) => {}
+                other => panic!("unexpected wake result: {other:?}"),
+            }
+        }
+        shared.mailbox.lock().unwrap().shutdown = true;
+        shared.ready.notify_one();
+        worker.join().unwrap();
     }
 
     #[test]
