@@ -160,6 +160,12 @@ SourceBuffers, checks the actual media clock and end event, and reads real GPU
 pixels to verify the decoded red, blue and green frames. Use the normal QEMU
 runner with `SCARLET_QEMU_AUDIO=1` for SAS audio output.
 
+`webkit-smoke --video-pages https://www.youtube.com/watch?v=jNQXAC9IVRw` checks
+the site's actual HTML video element, delivers native page input to play it,
+and requires advancing media time, real decoded/painted frames and changing
+GPU pixels within the video rectangle. It keeps the site's player and source
+selection intact and joins the native owner at exit.
+
 ## Architecture
 
 `BrowserBackend` is intentionally a WebView boundary rather than a common DOM

@@ -71,6 +71,28 @@ pub struct PaintStatistics {
     pub painted_pixels: u64,
 }
 
+/// Read-only state from an actual HTMLVideoElement in the main document.
+/// The rectangle uses CSS viewport coordinates; dimensions use video pixels.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MediaStatistics {
+    pub video_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub paused: u32,
+    pub ended: u32,
+    pub ready_state: u32,
+    pub decoded_frames: u64,
+    pub dropped_frames: u64,
+    pub presented_frames: u64,
+    pub current_time: f64,
+    pub duration: f64,
+    pub rect_x: f64,
+    pub rect_y: f64,
+    pub rect_width: f64,
+    pub rect_height: f64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Header {
@@ -310,6 +332,11 @@ unsafe extern "C" {
         view: *mut ScarletWebView,
         out: *mut PaintStatistics,
     ) -> c_int;
+    pub fn scarlet_webview_media_statistics(
+        view: *mut ScarletWebView,
+        index: u32,
+        out: *mut MediaStatistics,
+    ) -> c_int;
     pub fn scarlet_webview_text_content(
         view: *mut ScarletWebView,
         element_id: Bytes,
@@ -331,5 +358,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<KeyEvent>(), 96);
         assert_eq!(std::mem::size_of::<Request>(), 80);
         assert_eq!(std::mem::size_of::<Response>(), 104);
+        assert_eq!(std::mem::size_of::<MediaStatistics>(), 96);
+        assert_eq!(std::mem::offset_of!(MediaStatistics, decoded_frames), 24);
+        assert_eq!(std::mem::offset_of!(MediaStatistics, current_time), 48);
     }
 }

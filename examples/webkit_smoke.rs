@@ -188,15 +188,15 @@ fn run() -> Result<(), String> {
     let base = std::env::args()
         .nth(1)
         .ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
-    let pages: Vec<String> = if base == "--pages" {
+    let pages: Vec<String> = if base == "--pages" || base == "--video-pages" {
         std::env::args().skip(2).collect()
     } else {
         Vec::new()
     };
     let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
     let media_only = std::env::args().any(|argument| argument == "--media-only");
-    if base == "--pages" && pages.is_empty() {
-        return Err(String::from("--pages requires URLs"));
+    if (base == "--pages" || base == "--video-pages") && pages.is_empty() {
+        return Err(String::from("page probes require URLs"));
     }
     let (sender, receiver) = mpsc::channel();
     let worker = thread::Builder::new()
@@ -265,6 +265,16 @@ fn engine_probe(
                 .send(OwnerMessage::PageProgress)
                 .map_err(|error| error.to_string())?;
             media_probe(&mut engine, base, path)?;
+        }
+        drop(engine);
+        return Ok(());
+    }
+    if base == "--video-pages" {
+        for url in pages {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|error| error.to_string())?;
+            video_page_probe(&mut engine, url, &sender)?;
         }
         drop(engine);
         return Ok(());
@@ -585,6 +595,107 @@ fn media_state(engine: &mut ProbeEngine) -> Result<serde_json::Value, String> {
         .map_err(|error| error.to_string())?
         .ok_or("missing actual HTMLMediaElement state")?;
     serde_json::from_str(&text).map_err(|error| format!("media state {text:?}: {error}"))
+}
+
+fn video_page_probe(
+    engine: &mut ProbeEngine,
+    url: &str,
+    sender: &mpsc::Sender<OwnerMessage>,
+) -> Result<(), String> {
+    engine.render(1280, 720, 1.0)?;
+    engine.navigate(url).map_err(|error| error.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut progress = Instant::now();
+    let mut gesture_sent = false;
+    let mut start_time = None;
+    let mut first_frame = None;
+    let mut initial_presented = 0;
+    let mut last_statistics = None;
+    loop {
+        engine.tick();
+        if let LoadState::Failed(error) = engine.snapshot().load_state {
+            return Err(format!("video page navigation failed: {error}"));
+        }
+        // Each real video frame is submitted to WebCore's GPU page paint.
+        // Only this diagnostic probe reads it back; browser presentation does not.
+        let frame = engine.render(1280, 720, 1.0)?;
+        if let Some(statistics) = engine
+            .media_statistics(0)
+            .map_err(|error| error.to_string())?
+        {
+            if statistics.width > 0 && statistics.height > 0 && statistics.ready_state >= 2 {
+                if start_time.is_none() {
+                    println!("MYRICA_WEBKIT_VIDEO_READY url={url} statistics={statistics:?}");
+                    start_time = Some(statistics.current_time);
+                    initial_presented = statistics.presented_frames;
+                    first_frame = Some(frame.clone());
+                }
+                if statistics.paused != 0 && !gesture_sent {
+                    // Deliver genuine native pointer/keyboard input to the page.
+                    // DOM, source URLs and the site's player are never replaced.
+                    if statistics.rect_width > 0.0 && statistics.rect_height > 0.0 {
+                        let x = (statistics.rect_x + statistics.rect_width * 0.5).clamp(1.0, 1278.0)
+                            as f32;
+                        let y = (statistics.rect_y + statistics.rect_height * 0.5).clamp(1.0, 718.0)
+                            as f32;
+                        click(engine, x, y);
+                    } else {
+                        key(engine, BrowserKey::Character('k'), true);
+                        key(engine, BrowserKey::Character('k'), false);
+                    }
+                    gesture_sent = true;
+                }
+                if statistics.current_time >= start_time.unwrap_or(0.0) + 2.0
+                    && statistics.decoded_frames >= 8
+                    && statistics.presented_frames >= initial_presented + 3
+                {
+                    let before = first_frame
+                        .as_ref()
+                        .ok_or("missing initial real video frame")?;
+                    let left = statistics.rect_x.clamp(0.0, 1279.0) as usize;
+                    let top = statistics.rect_y.clamp(0.0, 719.0) as usize;
+                    let right = (statistics.rect_x + statistics.rect_width)
+                        .clamp(left as f64, 1280.0) as usize;
+                    let bottom = (statistics.rect_y + statistics.rect_height)
+                        .clamp(top as f64, 720.0) as usize;
+                    let mut changed = 0;
+                    for y in top..bottom {
+                        for x in left..right {
+                            let offset = (y * 1280 + x) * 4;
+                            if before.rgba[offset..offset + 4] != frame.rgba[offset..offset + 4] {
+                                changed += 1;
+                            }
+                        }
+                    }
+                    if changed < 100 {
+                        return Err(format!(
+                            "video clock advanced without actual changing GPU pixels: {statistics:?}, changed={changed}"
+                        ));
+                    }
+                    println!(
+                        "MYRICA_WEBKIT_SMOKE_PASS stage=actual-video-page url={url} changed_video_pixels={changed} statistics={statistics:?} state={:?}",
+                        engine.snapshot()
+                    );
+                    return Ok(());
+                }
+            }
+            last_statistics = Some(statistics);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "actual page video did not play: {url}, statistics={last_statistics:?}, state={:?}",
+                engine.snapshot()
+            ));
+        }
+        if progress.elapsed() >= Duration::from_secs(5) {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|error| error.to_string())?;
+            println!("MYRICA_WEBKIT_VIDEO_WAIT url={url} statistics={last_statistics:?}");
+            progress = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
 }
 
 fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), String> {

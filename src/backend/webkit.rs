@@ -117,6 +117,23 @@ impl WebKitBackend {
         Ok(statistics)
     }
 
+    /// Inspect an actual page video without executing diagnostic JavaScript.
+    pub fn media_statistics(
+        &mut self,
+        index: u32,
+    ) -> Result<Option<ffi::MediaStatistics>, BackendError> {
+        let mut statistics = ffi::MediaStatistics::default();
+        // SAFETY: The view and output belong to the current native owner.
+        let status = unsafe {
+            ffi::scarlet_webview_media_statistics(self.view.as_ptr(), index, &mut statistics)
+        };
+        if status == ffi::EMPTY {
+            return Ok(None);
+        }
+        check(status, "inspect actual WebCore video state")?;
+        Ok(Some(statistics))
+    }
+
     /// Diagnostic-only GPU readback for native integration probes. Browser
     /// presentation continues to transfer shared images and never calls this.
     /// The caller must keep this frame's owner lease alive until this returns.
