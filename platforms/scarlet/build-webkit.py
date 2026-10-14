@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--ranlib", default="llvm-ranlib")
     parser.add_argument("--pkg-config", default="pkg-config")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--vulkan-probe", action="store_true",
+                        help="Build WebKit's native Skia/Vulkan GPU contract probe")
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
@@ -101,6 +103,7 @@ def main():
         "libc++.a", "libc++abi.a", "libscarlet_cxx_support.a", "libscarlet_c_startup.a", "libscarlet_c.a"))
     configure_build_install(webkit, build / "webkit", prefix, [
         "-DPORT=Scarlet", "-DSCARLET_BUILD_EMBEDDING=ON", "-DSCARLET_BUILD_RENDERER=OFF",
+        f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
         "-DUSE_THIN_ARCHIVES=OFF", "-DUSE_PCH_CODEGEN=ON", "-DUSE_HEADER_MAPS=ON",
         f"-DCMAKE_C_FLAGS={cflags}",
         f'-DCMAKE_CXX_FLAGS=-nostdinc++ -isystem "{runtime}/include/c++/v1" {cflags} -fno-exceptions -fno-rtti',

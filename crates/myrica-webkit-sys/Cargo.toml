@@ -7,6 +7,9 @@ description = "Bindings to WebKit's Scarlet embedding API"
 links = "scarlet_webview"
 build = "build.rs"
 
+[features]
+vulkan-probe = []
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 

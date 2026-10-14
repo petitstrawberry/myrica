@@ -6,6 +6,13 @@ mod native_memory;
 use std::ffi::c_int;
 
 pub const ABI_VERSION: u32 = 1;
+
+#[cfg(feature = "vulkan-probe")]
+unsafe extern "C" {
+    /// Executes real Ganesh Vulkan draws and validates GPU-read pixels.
+    /// Must be called on a single native Scarlet thread before starting a GUI.
+    pub fn scarlet_webview_vulkan_probe() -> c_int;
+}
 pub const OK: i32 = 0;
 pub const EMPTY: i32 = 1;
 pub const STALE_REQUEST: i32 = -6;

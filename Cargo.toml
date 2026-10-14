@@ -14,8 +14,14 @@ name = "webkit-smoke"
 path = "examples/webkit_smoke.rs"
 required-features = ["backend-webkit"]
 
+[[bin]]
+name = "webkit-vulkan-probe"
+path = "examples/webkit_vulkan_probe.rs"
+required-features = ["webkit-vulkan"]
+
 [features]
 default = ["backend-blitz", "javascript"]
+webkit-vulkan = ["backend-webkit", "myrica-webkit-sys/vulkan-probe"]
 javascript = ["backend-blitz", "dep:blitz-vibey-script", "dep:getrandom-v04"]
 backend-blitz = [
     "dep:anyrender",
