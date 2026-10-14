@@ -195,6 +195,7 @@ const video = document.getElementById('video');
 let frameCallbacks = 0;
 let lastFrameMetadata = null;
 let observingFrames = false;
+let playClicks = 0;
 let presentationEpoch = 0;
 const frameHistory = [];
 let encodingEvidence = null;
@@ -207,6 +208,7 @@ video.addEventListener('timeupdate', () => {
 });
 video.addEventListener('ended', () => { document.title = 'media-ended:' + video.currentTime.toFixed(3); });
 document.getElementById('play').addEventListener('click', () => {
+  ++playClicks;
   if (!observingFrames) {
     observingFrames = true;
     function frameReady(now, metadata) {
@@ -227,7 +229,7 @@ function updateState() {
     ended:video.ended, ready:video.readyState, width:video.videoWidth, height:video.videoHeight,
     error:video.error?.code || 0, callbacks:frameCallbacks, metadata:lastFrameMetadata,
     quality:video.getVideoPlaybackQuality().totalVideoFrames,
-    frames:frameHistory, encoding:encodingEvidence
+    frames:frameHistory, encoding:encodingEvidence, playClicks
   });
 }
 updateState();
