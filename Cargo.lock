@@ -2452,6 +2452,7 @@ dependencies = [
  "sas-client",
  "scarlet-codecs",
  "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
+ "scarlet-video-client",
 ]
 
 [[package]]
@@ -3600,11 +3601,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust_h264"
-version = "0.4.0"
-source = "git+https://github.com/petitstrawberry/rust_h264?rev=ed481be3d733382529cc555b5393224adcc6acc0#ed481be3d733382529cc555b5393224adcc6acc0"
-
-[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3716,16 +3712,16 @@ dependencies = [
 [[package]]
 name = "sas-client"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 dependencies = [
  "sas-protocol",
- "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b)",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
 ]
 
 [[package]]
 name = "sas-protocol"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 
 [[package]]
 name = "sbus"
@@ -3754,14 +3750,13 @@ source = "git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f
 [[package]]
 name = "scarlet-abi"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 
 [[package]]
 name = "scarlet-codecs"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 dependencies = [
- "rust_h264",
  "symphonia-codec-aac",
  "symphonia-core",
  "symphonia-format-isomp4",
@@ -3794,19 +3789,19 @@ dependencies = [
 [[package]]
 name = "scarlet-os"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 dependencies = [
- "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b)",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
  "scarlet-rt",
- "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
 ]
 
 [[package]]
 name = "scarlet-rt"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 dependencies = [
- "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
 ]
 
 [[package]]
@@ -3836,9 +3831,9 @@ dependencies = [
 [[package]]
 name = "scarlet-sys"
 version = "1.0.0"
-source = "git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b#ed2c077efe8caa8f62882a613d0941fe1a5db71b"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
 dependencies = [
- "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ed2c077efe8caa8f62882a613d0941fe1a5db71b)",
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
 ]
 
 [[package]]
@@ -3927,6 +3922,16 @@ dependencies = [
  "libm",
  "scarlet-ui-core",
  "sgfx-core",
+]
+
+[[package]]
+name = "scarlet-video-client"
+version = "1.0.0"
+source = "git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af#ee867946936998c92df3841be8d46067a39d67af"
+dependencies = [
+ "scarlet-abi 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
+ "scarlet-codecs",
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=ee867946936998c92df3841be8d46067a39d67af)",
 ]
 
 [[package]]

@@ -4,11 +4,11 @@
 //! Acquired event/frame pointers are pinned by a lease until explicitly
 //! released. Reset and seek invalidate queued work, never an acquired lease.
 use scarlet_codecs::media::{
-    AudioDecoder, AudioFrame, Codec, Mp4Parser, ParserEvent, Sample, Track, VideoDecoder,
-    VideoFrame,
+    AudioDecoder, AudioFrame, Codec, ColorInfo, MediaError, Mp4Parser, ParserEvent, Sample, Track,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -432,7 +432,32 @@ pub unsafe extern "C" fn scarlet_media_supports_type(
     if is_media_source > 1 {
         return ERROR;
     }
-    i32::from(supported(mime, codecs))
+    if !supported(mime, codecs) {
+        return 0;
+    }
+    let codecs = codecs.trim().trim_matches('"');
+    let requires_h264 = codecs
+        .split(',')
+        .any(|codec| codec.trim().to_ascii_lowercase().starts_with("avc1."))
+        || (codecs.is_empty() && !mime.trim().eq_ignore_ascii_case("audio/mp4"));
+    i32::from(!requires_h264 || native_h264_available())
+}
+
+fn native_h264_available() -> bool {
+    #[cfg(target_os = "scarlet")]
+    {
+        scarlet_video_client::ScarletVideoDecoder::available_capabilities()
+            .ok()
+            .is_some_and(|caps| {
+                caps.supports(scarlet_video_client::VideoFormat::H264)
+                    && caps.output_pixel_format()
+                        == scarlet_video_client::NV12_VIDEO_RANGE_PIXEL_FORMAT
+            })
+    }
+    #[cfg(not(target_os = "scarlet"))]
+    {
+        false
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -624,6 +649,7 @@ struct SessionTrack {
     ended: bool,
     drained: bool,
     media_end_seconds: f64,
+    cancellation: Arc<AtomicBool>,
 }
 
 struct QueuedSample {
@@ -663,7 +689,7 @@ pub struct MediaSession {
 }
 
 enum Decoder {
-    Video(VideoDecoder),
+    Video(HardwareVideoDecoder),
     Audio(AudioDecoder),
 }
 
@@ -678,23 +704,269 @@ enum DecodeOutput {
     Audio(AudioFrame),
 }
 
+struct VideoFrame {
+    width: u32,
+    height: u32,
+    pts_us: i64,
+    duration_us: u64,
+    color: ColorInfo,
+    #[cfg(target_os = "scarlet")]
+    pixels: scarlet_video_client::OwnedDecodedFrame,
+}
+
+impl VideoFrame {
+    fn payload(&self) -> &[u8] {
+        #[cfg(target_os = "scarlet")]
+        {
+            self.pixels.payload()
+        }
+        #[cfg(not(target_os = "scarlet"))]
+        {
+            &[]
+        }
+    }
+}
+
+/// The device returns pictures in decode order. Retain at most the SPS
+/// reorder depth and release by the sample's presentation timestamp, including
+/// the final held pictures at EOS. Pixels are never synthesized here.
+struct PresentationReorder<T> {
+    depth: usize,
+    pending: Vec<(i64, T)>,
+}
+
+impl<T> PresentationReorder<T> {
+    fn new(depth: usize) -> Result<Self, MediaError> {
+        if depth > 2 {
+            return Err(MediaError::Unsupported(
+                "native AVC reorder depth exceeds two",
+            ));
+        }
+        Ok(Self {
+            depth,
+            pending: Vec::with_capacity(depth + 1),
+        })
+    }
+    fn push(&mut self, pts: i64, frame: T) -> Option<T> {
+        self.pending.push((pts, frame));
+        if self.pending.len() > self.depth {
+            let index = self
+                .pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (pts, _))| *pts)
+                .unwrap()
+                .0;
+            Some(self.pending.remove(index).1)
+        } else {
+            None
+        }
+    }
+    fn finish(&mut self) -> Vec<T> {
+        self.pending.sort_by_key(|(pts, _)| *pts);
+        self.pending.drain(..).map(|(_, frame)| frame).collect()
+    }
+}
+
+struct HardwareVideoDecoder {
+    #[cfg(target_os = "scarlet")]
+    decoder: scarlet_video_client::ScarletVideoDecoder,
+    #[cfg(target_os = "scarlet")]
+    configuration: scarlet_codecs::media::AvcConfiguration,
+    #[cfg(target_os = "scarlet")]
+    reorder: PresentationReorder<VideoFrame>,
+    #[cfg(target_os = "scarlet")]
+    next_token: u64,
+    #[cfg(target_os = "scarlet")]
+    metadata: BTreeMap<u64, (i64, u64, ColorInfo)>,
+    #[cfg(target_os = "scarlet")]
+    dimensions: (u32, u32),
+    cancellation: Arc<AtomicBool>,
+}
+
+impl HardwareVideoDecoder {
+    #[cfg(target_os = "scarlet")]
+    fn new(track: &Track, cancellation: Arc<AtomicBool>) -> Result<Self, MediaError> {
+        use scarlet_video_client::{
+            DecoderOptions, ScarletVideoDecoder, VideoBufferRequest, VideoFormat,
+        };
+        let configuration = scarlet_codecs::media::AvcConfiguration::new(track)?;
+        let output_len = scarlet_video_client::recommended_nv12_output_buffer_len(
+            configuration.width(),
+            configuration.height(),
+        )
+        .ok_or(MediaError::InvalidData(
+            "native AVC output capacity overflow",
+        ))?;
+        let input_len =
+            scarlet_video_client::recommended_input_buffer_len(4 * 1024 * 1024 + 65536 + 1024)
+                .ok_or(MediaError::InvalidData(
+                    "native AVC input capacity overflow",
+                ))?;
+        let options = DecoderOptions::new()
+            .with_shared_images(false)
+            .with_buffer_request(VideoBufferRequest::new(input_len, output_len))
+            .with_cancellation(cancellation.clone());
+        let mut decoder =
+            ScarletVideoDecoder::open_with_options(options).map_err(MediaError::Decode)?;
+        if !decoder.capabilities().is_some_and(|caps| {
+            caps.supports(VideoFormat::H264)
+                && caps.output_pixel_format() == scarlet_video_client::NV12_VIDEO_RANGE_PIXEL_FORMAT
+        }) {
+            return Err(MediaError::Unsupported(
+                "/dev/video0 does not advertise AVC decode",
+            ));
+        }
+        decoder
+            .configure(VideoFormat::H264)
+            .map_err(MediaError::Decode)?;
+        let reorder = PresentationReorder::new(configuration.max_reorder_frames())?;
+        let dimensions = (configuration.width(), configuration.height());
+        eprintln!(
+            "[myrica:media] video-decoder=scarlet-native device=/dev/video0 output=nv12 cpu-h264-fallback=none"
+        );
+        Ok(Self {
+            decoder,
+            configuration,
+            reorder,
+            next_token: 1,
+            metadata: BTreeMap::new(),
+            dimensions,
+            cancellation,
+        })
+    }
+
+    #[cfg(not(target_os = "scarlet"))]
+    fn new(_: &Track, _: Arc<AtomicBool>) -> Result<Self, MediaError> {
+        Err(MediaError::Unsupported(
+            "native Scarlet video device is unavailable on this host",
+        ))
+    }
+
+    #[cfg(target_os = "scarlet")]
+    fn push(&mut self, sample: &Sample) -> Result<Vec<VideoFrame>, MediaError> {
+        use scarlet_video_client::{DecodedOutput, VideoFormat};
+        if self.cancellation.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        let unit = self.configuration.annex_b(sample)?;
+        if (self.configuration.width(), self.configuration.height()) != self.dimensions {
+            return Err(MediaError::Unsupported(
+                "AVC dimensions changed without a track reconfiguration",
+            ));
+        }
+        if self.configuration.max_reorder_frames() != self.reorder.depth {
+            if !self.reorder.pending.is_empty() {
+                return Err(MediaError::Unsupported(
+                    "AVC reorder depth changed without a track reconfiguration",
+                ));
+            }
+            self.reorder = PresentationReorder::new(self.configuration.max_reorder_frames())?;
+        }
+        if !annex_b_has_picture(&unit) {
+            return Err(MediaError::InvalidData(
+                "AVC access unit has no coded picture",
+            ));
+        }
+        let token = self.next_token;
+        self.next_token = token.checked_add(1).ok_or(MediaError::InvalidData(
+            "native AVC timestamp token overflow",
+        ))?;
+        let mut color = self.configuration.color();
+        // The mapped device ABI explicitly returns NV12 video-range pixels;
+        // the native producer converts full-range sources to that output.
+        color.full_range = false;
+        self.metadata
+            .insert(token, (sample.pts_us, sample.duration_us, color));
+        let output = self
+            .decoder
+            .decode_output(VideoFormat::H264, &unit, token)
+            .map_err(MediaError::Decode)?;
+        let Some(output) = output else {
+            self.metadata.remove(&token);
+            return if self.cancellation.load(Ordering::Acquire) {
+                Ok(Vec::new())
+            } else {
+                Err(MediaError::InvalidData(
+                    "native AVC access unit produced no frame",
+                ))
+            };
+        };
+        let DecodedOutput::Nv12(frame) = output else {
+            return Err(MediaError::Unsupported(
+                "native image decode requires an explicit GPU image ABI",
+            ));
+        };
+        let (pts_us, duration_us, color) =
+            self.metadata
+                .remove(&frame.timestamp())
+                .ok_or(MediaError::InvalidData(
+                    "native AVC frame has an unknown timestamp token",
+                ))?;
+        let pixels = frame.try_into_owned().map_err(MediaError::Decode)?;
+        let frame = VideoFrame {
+            width: pixels.width(),
+            height: pixels.height(),
+            pts_us,
+            duration_us,
+            color,
+            pixels,
+        };
+        if !decoded_video_is_valid(&frame) {
+            return Err(MediaError::InvalidData(
+                "native AVC NV12 dimensions or payload are invalid",
+            ));
+        }
+        if self.metadata.len() > 3 {
+            return Err(MediaError::InvalidData(
+                "native AVC timestamp queue exceeded capacity",
+            ));
+        }
+        Ok(self.reorder.push(pts_us, frame).into_iter().collect())
+    }
+
+    #[cfg(not(target_os = "scarlet"))]
+    fn push(&mut self, _: &Sample) -> Result<Vec<VideoFrame>, MediaError> {
+        Err(MediaError::Unsupported(
+            "native Scarlet video device is unavailable on this host",
+        ))
+    }
+
+    fn flush(&mut self) -> Result<Vec<VideoFrame>, MediaError> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Ok(Vec::new());
+        }
+        #[cfg(target_os = "scarlet")]
+        {
+            Ok(self.reorder.finish())
+        }
+        #[cfg(not(target_os = "scarlet"))]
+        {
+            Err(MediaError::Unsupported(
+                "native Scarlet video device is unavailable on this host",
+            ))
+        }
+    }
+}
+
+fn annex_b_has_picture(unit: &[u8]) -> bool {
+    // The shared AVC facade emits a four-byte prefix for every EBSP NAL. Its
+    // parameter sets/SEI alone do not satisfy the complete access-unit contract.
+    unit.windows(5)
+        .any(|bytes| bytes[..4] == [0, 0, 0, 1] && matches!(bytes[4] & 31, 1 | 5))
+}
+
 fn decoded_video_is_valid(frame: &VideoFrame) -> bool {
     let width = frame.width as usize;
     let height = frame.height as usize;
     if width == 0 || height == 0 || width > 3840 || height > 2160 {
         return false;
     }
-    let heights = [height, height.div_ceil(2), height.div_ceil(2)];
-    let widths = [width, width.div_ceil(2), width.div_ceil(2)];
-    [frame.y.len(), frame.u.len(), frame.v.len()]
-        .iter()
-        .enumerate()
-        .all(|(index, size)| {
-            frame.strides[index] >= widths[index]
-                && frame.strides[index]
-                    .checked_mul(heights[index])
-                    .is_some_and(|needed| *size >= needed && *size <= 32 * 1024 * 1024)
-        })
+    width.is_multiple_of(2)
+        && height.is_multiple_of(2)
+        && width
+            .checked_mul(height + height / 2)
+            .is_some_and(|size| frame.payload().len() == size)
 }
 
 fn update_duration(state: &mut SessionState) {
@@ -734,29 +1006,41 @@ fn session_worker(shared: &SessionShared) {
             );
             continue;
         }
-        decoders.retain(|id, decoder| {
-            state
-                .tracks
-                .get(id)
-                .is_some_and(|track| track.generation == decoder.generation)
-        });
-        if last_generation != state.generation {
-            audio.clear();
+        let reset_all = last_generation != state.generation;
+        let retired_ids: Vec<_> = decoders
+            .iter()
+            .filter_map(|(&id, decoder)| {
+                (reset_all
+                    || state
+                        .tracks
+                        .get(&id)
+                        .is_none_or(|track| track.generation != decoder.generation))
+                .then_some(id)
+            })
+            .collect();
+        let retired: Vec<_> = retired_ids
+            .into_iter()
+            .filter_map(|id| decoders.remove(&id))
+            .collect();
+        let retired_audio = if reset_all || last_audio_generation != state.audio_generation {
+            let previous = std::mem::replace(&mut audio, AudioOutput::new());
             audio.minimum_seconds = state.clock.seconds;
-            decoders.clear();
-            last_generation = state.generation;
-        }
-        if last_audio_generation != state.audio_generation {
-            audio.clear();
-            audio.minimum_seconds = state.clock.seconds;
-            last_audio_generation = state.audio_generation;
-        }
+            Some(previous)
+        } else {
+            None
+        };
+        last_generation = state.generation;
+        last_audio_generation = state.audio_generation;
         // SAS consumed frames, not the number of submitted samples, own the
         // audio clock. Ring writes are nonblocking and never stall WebCore.
         let playing = state.clock.playing;
         let volume = if state.muted { 0.0 } else { state.volume };
         let audio_generation = state.audio_generation;
         drop(state);
+        // Hardware session destruction may wait for the producer. Keep it
+        // outside the state lock so WebCore controls/status remain responsive.
+        drop(retired);
+        drop(retired_audio);
         let audio_result = audio.pump(playing, volume, shared, audio_generation);
         let mut state = lock(&shared.state);
         if state.stopping {
@@ -802,15 +1086,27 @@ fn session_worker(shared: &SessionShared) {
                 return None;
             }
             if let Some(sample) = track.samples.pop_front() {
-                Some((id, track.generation, track.track.clone(), Some(sample)))
+                Some((
+                    id,
+                    track.generation,
+                    track.track.clone(),
+                    track.cancellation.clone(),
+                    Some(sample),
+                ))
             } else if track.ended && !track.drained {
                 track.drained = true;
-                Some((id, track.generation, track.track.clone(), None))
+                Some((
+                    id,
+                    track.generation,
+                    track.track.clone(),
+                    track.cancellation.clone(),
+                    None,
+                ))
             } else {
                 None
             }
         });
-        if let Some((id, generation, track, sample)) = work {
+        if let Some((id, generation, track, cancellation, sample)) = work {
             if let Some(sample) = &sample {
                 state.input_bytes -= sample.sample.data.len();
             }
@@ -820,7 +1116,9 @@ fn session_worker(shared: &SessionShared) {
                 .is_none_or(|current| current.generation != generation)
             {
                 let decoder = match track.codec {
-                    Codec::H264 => VideoDecoder::new(&track).map(Decoder::Video),
+                    Codec::H264 => {
+                        HardwareVideoDecoder::new(&track, cancellation).map(Decoder::Video)
+                    }
                     Codec::Aac => AudioDecoder::new(&track).map(Decoder::Audio),
                 };
                 match decoder {
@@ -834,7 +1132,7 @@ fn session_worker(shared: &SessionShared) {
                             },
                         );
                     }
-                    Err(_) => {
+                    Err(error) => {
                         let mut state = lock(&shared.state);
                         if state
                             .tracks
@@ -842,6 +1140,7 @@ fn session_worker(shared: &SessionShared) {
                             .is_some_and(|track| track.generation == generation)
                         {
                             state.status.error = ERROR;
+                            eprintln!("SCARLET_MEDIA_ERROR stage=decoder-open message={error}");
                         }
                         continue;
                     }
@@ -948,7 +1247,10 @@ fn session_worker(shared: &SessionShared) {
                         }
                     }
                 }
-                Err(_) => state.status.error = ERROR,
+                Err(error) => {
+                    state.status.error = ERROR;
+                    eprintln!("SCARLET_MEDIA_ERROR stage=decode message={error}");
+                }
             }
             shared.wake.notify_all();
             continue;
@@ -1043,7 +1345,13 @@ pub unsafe extern "C" fn scarlet_media_session_destroy(session: *mut MediaSessio
         return;
     }
     let mut session = unsafe { Box::from_raw(session) };
-    lock(&session.shared.state).stopping = true;
+    {
+        let mut state = lock(&session.shared.state);
+        state.stopping = true;
+        for track in state.tracks.values() {
+            track.cancellation.store(true, Ordering::Release);
+        }
+    }
     session.shared.wake.notify_all();
     if let Some(worker) = session.worker.take() {
         let _ = worker.join();
@@ -1115,6 +1423,7 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
     let generation = state.next_track_generation;
     state.next_track_generation = generation.wrapping_add(1);
     if let Some(old) = state.tracks.remove(&track.id) {
+        old.cancellation.store(true, Ordering::Release);
         state.input_bytes -= old
             .samples
             .iter()
@@ -1139,6 +1448,7 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
             ended: false,
             drained: false,
             media_end_seconds: 0.0,
+            cancellation: Arc::new(AtomicBool::new(false)),
         },
     );
     state.media_end_seconds = state
@@ -1246,6 +1556,8 @@ pub unsafe extern "C" fn scarlet_media_session_flush(session: *mut MediaSession,
         track.samples.clear();
         track.ended = false;
         track.drained = false;
+        track.cancellation.store(true, Ordering::Release);
+        track.cancellation = Arc::new(AtomicBool::new(false));
         track.generation = generation;
         let video = track.track.codec == Codec::H264;
         state.input_bytes -= bytes;
@@ -1274,6 +1586,7 @@ pub unsafe extern "C" fn scarlet_media_session_remove_track(
     let Some(removed) = state.tracks.remove(&(track as u32)) else {
         return;
     };
+    removed.cancellation.store(true, Ordering::Release);
     state.input_bytes -= removed
         .samples
         .iter()
@@ -1402,6 +1715,8 @@ pub unsafe extern "C" fn scarlet_media_session_seek(session: *mut MediaSession, 
                 track.samples.clear();
                 track.ended = false;
                 track.drained = false;
+                track.cancellation.store(true, Ordering::Release);
+                track.cancellation = Arc::new(AtomicBool::new(false));
                 track.generation = generation;
                 track.media_end_seconds = seconds;
                 generation = generation.wrapping_add(1);
@@ -1479,15 +1794,28 @@ pub unsafe extern "C" fn scarlet_media_session_acquire_frame(
         lease,
         presentation_us: frame.pts_us,
         duration_us: frame.duration_us.min(i64::MAX as u64) as i64,
-        format: 1,
+        format: 2,
         matrix,
         full_range: u32::from(frame.color.full_range),
         width: frame.width,
         height: frame.height,
         reserved: 0,
-        planes: [frame.y.as_ptr(), frame.u.as_ptr(), frame.v.as_ptr()],
-        strides: frame.strides,
-        plane_sizes: [frame.y.len(), frame.u.len(), frame.v.len()],
+        planes: [
+            frame.payload().as_ptr(),
+            unsafe {
+                frame
+                    .payload()
+                    .as_ptr()
+                    .add(frame.width as usize * frame.height as usize)
+            },
+            std::ptr::null(),
+        ],
+        strides: [frame.width as usize, frame.width as usize, 0],
+        plane_sizes: [
+            frame.width as usize * frame.height as usize,
+            frame.width as usize * (frame.height as usize / 2),
+            0,
+        ],
     };
     state.leases.insert(lease, frame);
     session.shared.wake.notify_all();
@@ -1538,15 +1866,6 @@ impl AudioOutput {
             minimum_seconds: 0.0,
             resampler: None,
         }
-    }
-    fn clear(&mut self) {
-        self.chunks.clear();
-        self.ring = None;
-        self.position = None;
-        self.playing = false;
-        self.draining = false;
-        self.failed = false;
-        self.resampler = None;
     }
     fn push(&mut self, frame: AudioFrame) -> Result<(), ()> {
         if !(1..=2).contains(&frame.channels)
@@ -2014,6 +2333,87 @@ mod tests {
     }
 
     #[test]
+    fn native_decode_order_is_reordered_by_pts_and_drained_at_eof() {
+        let mut reorder = PresentationReorder::new(2).unwrap();
+        let mut presented = Vec::new();
+        for pts in [0, 375_000, 125_000, 250_000, 750_000, 500_000, 625_000] {
+            if let Some(frame) = reorder.push(pts, pts) {
+                presented.push(frame);
+            }
+            assert!(reorder.pending.len() <= 2);
+        }
+        presented.extend(reorder.finish());
+        assert_eq!(
+            presented,
+            [0, 125_000, 250_000, 375_000, 500_000, 625_000, 750_000]
+        );
+        assert!(reorder.finish().is_empty());
+        assert!(PresentationReorder::<i64>::new(3).is_err());
+        let mut no_reorder = PresentationReorder::new(0).unwrap();
+        assert_eq!(no_reorder.push(0, 17), Some(17));
+        assert!(no_reorder.finish().is_empty());
+    }
+
+    #[cfg(not(target_os = "scarlet"))]
+    #[test]
+    fn hardware_absence_is_not_hidden_by_a_software_video_decoder() {
+        let video = b"video/mp4";
+        let audio = b"audio/mp4";
+        let avc = b"avc1.42C01E";
+        let aac = b"mp4a.40.2";
+        unsafe {
+            assert_eq!(
+                scarlet_media_supports_type(
+                    video.as_ptr().cast(),
+                    video.len(),
+                    avc.as_ptr().cast(),
+                    avc.len(),
+                    1
+                ),
+                0
+            );
+            assert_eq!(
+                scarlet_media_supports_type(
+                    audio.as_ptr().cast(),
+                    audio.len(),
+                    aac.as_ptr().cast(),
+                    aac.len(),
+                    1
+                ),
+                1
+            );
+        }
+        assert!(!native_h264_available());
+    }
+
+    #[test]
+    fn flush_and_destroy_cancel_the_native_generation() {
+        let session = scarlet_media_session_create();
+        let mut track = empty_track();
+        track.identifier = 1;
+        track.kind = 1;
+        track.codec = 1;
+        track.width = 64;
+        track.height = 48;
+        unsafe {
+            assert_eq!(scarlet_media_session_configure(session, &track), OK);
+        }
+        let shared = unsafe { session.as_ref().unwrap().shared.clone() };
+        let first = lock(&shared.state).tracks[&1].cancellation.clone();
+        unsafe {
+            scarlet_media_session_flush(session, 1);
+        }
+        assert!(first.load(Ordering::Acquire));
+        let second = lock(&shared.state).tracks[&1].cancellation.clone();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!second.load(Ordering::Acquire));
+        unsafe {
+            scarlet_media_session_destroy(session);
+        }
+        assert!(second.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn playback_clock_waits_for_data_and_pause_seek_are_stable() {
         let mut clock = PlaybackClock::new();
         clock.set_playing(true);
@@ -2294,7 +2694,7 @@ mod tests {
     /// test; it never substitutes fake decoded pictures or a fake device.
     #[test]
     #[ignore = "requires SCARLET_MEDIA_BRIDGE_FIXTURE generated by ffmpeg"]
-    fn real_encoded_video_async_parser_decode_clock_leases_pause_seek_and_eof() {
+    fn real_encoded_video_async_demux_preserves_packets_and_timestamps() {
         let data =
             std::fs::read(std::env::var("SCARLET_MEDIA_BRIDGE_FIXTURE").expect("fixture path"))
                 .unwrap();
@@ -2361,139 +2761,20 @@ mod tests {
         let track = track.unwrap();
         assert_eq!(track.codec, Codec::H264);
         assert_eq!(samples.len(), 16);
-        let session = scarlet_media_session_create();
-        assert!(!session.is_null());
-        unsafe {
-            assert_eq!(
-                scarlet_media_session_configure(session, &track_view(&track)),
-                OK
-            );
-            for sample in &samples {
-                assert_eq!(
-                    scarlet_media_session_enqueue(session, &sample_view(sample)),
-                    OK
-                );
-            }
-            scarlet_media_session_end(session, u64::from(track.id));
-            scarlet_media_session_play(session);
-        }
-        let mut reference = VideoDecoder::new(&track).unwrap();
-        let mut pictures = Vec::new();
-        for sample in &samples {
-            pictures.extend(reference.push(sample).unwrap());
-        }
-        pictures.extend(reference.flush().unwrap());
-        let mut index = 0;
-        let mut first_lease = 0;
-        let mut first_plane = std::ptr::null();
-        let mut first_bytes = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while index != pictures.len() {
-            assert!(
-                Instant::now() < deadline,
-                "decoder/clock stalled at {index}"
-            );
-            let mut frame = unsafe { std::mem::zeroed::<MediaFrame>() };
-            let mut status = MediaStatus::default();
-            unsafe {
-                assert_eq!(scarlet_media_session_status(session, &mut status), OK);
-            }
-            assert_eq!(status.error, 0);
-            if unsafe { scarlet_media_session_acquire_frame(session, &mut frame) } == 1 {
-                assert_eq!(frame.presentation_us, pictures[index].pts_us);
-                assert_eq!((frame.width, frame.height), (64, 48));
-                let plane =
-                    unsafe { std::slice::from_raw_parts(frame.planes[0], frame.plane_sizes[0]) };
-                assert_eq!(plane, pictures[index].y);
-                if index == 0 {
-                    first_lease = frame.lease;
-                    first_plane = frame.planes[0];
-                    first_bytes = plane.to_vec();
-                } else {
-                    unsafe {
-                        scarlet_media_session_release_frame(session, frame.lease);
-                    }
-                }
-                if index == 3 {
-                    unsafe {
-                        scarlet_media_session_pause(session);
-                    }
-                    let mut before = MediaStatus::default();
-                    unsafe {
-                        scarlet_media_session_status(session, &mut before);
-                    }
-                    thread::sleep(Duration::from_millis(30));
-                    let mut after = MediaStatus::default();
-                    unsafe {
-                        scarlet_media_session_status(session, &mut after);
-                    }
-                    assert_eq!(before.current_time, after.current_time);
-                    assert_eq!(after.paused, 1);
-                    unsafe {
-                        scarlet_media_session_play(session);
-                    }
-                }
-                index += 1;
-            } else {
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-        loop {
-            assert!(Instant::now() < deadline, "EOF never completed");
-            let mut status = MediaStatus::default();
-            unsafe {
-                scarlet_media_session_status(session, &mut status);
-            }
-            if status.ended != 0 {
-                assert!(status.current_time >= 1.999);
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        unsafe {
-            scarlet_media_session_seek(session, 0.25);
-        }
-        let mut status = MediaStatus::default();
-        unsafe {
-            scarlet_media_session_status(session, &mut status);
-        }
-        assert_eq!(status.ready_state, 1);
-        assert_eq!(status.current_time, 0.25);
-        assert_eq!(
-            unsafe { std::slice::from_raw_parts(first_plane, first_bytes.len()) },
-            first_bytes
+        assert_eq!((track.width, track.height), (64, 48));
+        assert!(
+            samples
+                .iter()
+                .enumerate()
+                .all(|(index, sample)| sample.pts_us == index as i64 * 125_000
+                    && sample.duration_us == 125_000)
         );
-        unsafe {
-            for sample in &samples {
-                assert_eq!(
-                    scarlet_media_session_enqueue(session, &sample_view(sample)),
-                    OK
-                );
-            }
-            scarlet_media_session_end(session, u64::from(track.id));
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "paused seek did not decode target"
-            );
-            let mut frame = unsafe { std::mem::zeroed::<MediaFrame>() };
-            if unsafe { scarlet_media_session_acquire_frame(session, &mut frame) } == 1 {
-                assert_eq!(frame.presentation_us, 250_000);
-                let plane =
-                    unsafe { std::slice::from_raw_parts(frame.planes[0], frame.plane_sizes[0]) };
-                assert_eq!(plane, pictures[2].y);
-                unsafe {
-                    scarlet_media_session_release_frame(session, frame.lease);
-                }
-                break;
-            }
-            thread::sleep(Duration::from_millis(2));
-        }
-        unsafe {
-            scarlet_media_session_release_frame(session, first_lease);
-            scarlet_media_session_destroy(session);
+        assert!(samples.iter().all(|sample| !sample.data.is_empty()));
+        let mut configuration = scarlet_codecs::media::AvcConfiguration::new(&track).unwrap();
+        for sample in &samples {
+            let annex_b = configuration.annex_b(sample).unwrap();
+            assert!(annex_b.starts_with(&[0, 0, 0, 1]));
+            assert!(annex_b_has_picture(&annex_b));
         }
     }
 }
