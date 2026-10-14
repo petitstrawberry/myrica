@@ -195,6 +195,8 @@ pub enum BrowserInput {
         x: f32,
         y: f32,
     },
+    /// CSS pixel deltas: positive moves content right/down, independent of
+    /// device scale. Adapters translate engine-specific direction conventions.
     Wheel {
         delta_x: f64,
         delta_y: f64,

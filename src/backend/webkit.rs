@@ -679,8 +679,10 @@ impl BrowserBackend for WebKitBackend {
                     modifiers: self.modifiers,
                     x: f64::from(x) * self.scale,
                     y: f64::from(y) * self.scale,
-                    delta_x: delta_x * self.scale,
-                    delta_y: delta_y * self.scale,
+                    // ScarletUI and BrowserInput use positive right/down;
+                    // WebCore's platform wheel event uses positive left/up.
+                    delta_x: -delta_x * self.scale,
+                    delta_y: -delta_y * self.scale,
                     global_x: f64::from(x) * self.scale,
                     global_y: f64::from(y) * self.scale,
                 };

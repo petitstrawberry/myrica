@@ -489,7 +489,7 @@ fn engine_probe(
     wait_title(&mut engine, "main-ready")?;
     engine.handle_input(BrowserInput::Wheel {
         delta_x: 0.0,
-        delta_y: -240.0,
+        delta_y: 240.0,
         x: 350.0,
         y: 300.0,
     });

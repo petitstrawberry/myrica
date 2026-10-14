@@ -77,7 +77,7 @@ peniko = { version = "0.6.0", optional = true }
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "cookies", "rustls-tls-webpki-roots"], optional = true }
 skrifa = { version = "0.44.0", optional = true }
 swash = { version = "0.2.6", optional = true }
-tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"], optional = true }
+tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", default-features = false, features = ["woff"], optional = true }

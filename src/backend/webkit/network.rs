@@ -2,7 +2,7 @@
 //!
 //! WebCore owns redirects, cookies, credentials, CSP, and CORS. This executor
 //! sends exactly the request it receives and never enters WebCore from its
-//! network thread. Completions cross a standard channel to the browser thread.
+//! network workers. Completions cross a standard channel to the browser thread.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -18,6 +18,7 @@ use crate::backend::{BackendError, WakeCallback};
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONTENT_ENCODINGS: usize = 16;
+const NETWORK_STACK_BYTES: usize = 8 * 1024 * 1024;
 const USER_AGENT: &str = "Myrica/0.1 (+https://github.com/petitstrawberry/myrica)";
 
 #[derive(Debug)]
@@ -66,10 +67,7 @@ impl NetworkService {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|error| BackendError::new(format!("create HTTP client: {error}")))?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| BackendError::new(format!("create network runtime: {error}")))?;
+        let runtime = network_runtime()?;
         let (sender, receiver) = unbounded_channel();
         let (completion_sender, completions) = mpsc::channel();
         let worker_sender = sender.clone();
@@ -78,7 +76,7 @@ impl NetworkService {
 
         thread::Builder::new()
             .name(String::from("myrica-webkit-network"))
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(NETWORK_STACK_BYTES)
             .spawn(move || {
                 runtime.block_on(run_worker(
                     client,
@@ -135,6 +133,24 @@ impl Drop for NetworkService {
         // a runtime alive after the backend that created it has gone away.
         let _ = self.sender.send(NetworkJob::Shutdown);
     }
+}
+
+fn network_runtime() -> Result<tokio::runtime::Runtime, BackendError> {
+    // CPU-count discovery may be unavailable on the target. Keep at least two
+    // HTTP workers so TLS work cannot serialize all requests, and bound both
+    // pools rather than spawning one OS thread per resource.
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+        .clamp(2, 4);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(workers)
+        .thread_name("myrica-webkit-http")
+        .thread_stack_size(NETWORK_STACK_BYTES)
+        .enable_all()
+        .build()
+        .map_err(|error| BackendError::new(format!("create network runtime: {error}")))
 }
 
 async fn run_worker(
@@ -273,9 +289,23 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
         append_body(&mut body, &chunk, MAX_BODY_BYTES)?;
     }
-    if response_has_entity {
-        body = decode_entity(&headers, body, MAX_BODY_BYTES)?;
-    }
+    let (headers, body) = if response_has_entity
+        && headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+    {
+        // Brotli/gzip decoding is synchronous CPU work. Keep it off the HTTP
+        // executor so other responses and cancellation can advance meanwhile.
+        // Cancelling the enclosing future discards an already-running decode;
+        // it retains the same encoded and per-layer decoded byte bounds.
+        tokio::task::spawn_blocking(move || {
+            decode_entity(&headers, body, MAX_BODY_BYTES).map(|body| (headers, body))
+        })
+        .await
+        .map_err(|error| format!("decode HTTP entity worker: {error}"))??
+    } else {
+        (headers, body)
+    };
     Ok(FetchResponse {
         final_url,
         status,
@@ -561,6 +591,129 @@ mod tests {
         let mut body = vec![0; length];
         reader.read_exact(&mut body).unwrap();
         (request, headers, body)
+    }
+
+    fn wait_for_release(gate: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+        let (released, ready) = &**gate;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+    }
+
+    fn release_tasks(gate: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+        let (released, ready) = &**gate;
+        *released.lock().unwrap() = true;
+        ready.notify_all();
+    }
+
+    #[test]
+    fn http_executor_runs_tasks_on_multiple_threads() {
+        let runtime = network_runtime().unwrap();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (arrived_sender, arrived) = mpsc::channel();
+        let tasks: Vec<_> = (0..2)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let arrived_sender = arrived_sender.clone();
+                runtime.spawn(async move {
+                    let id = thread::current().id();
+                    arrived_sender.send(id).unwrap();
+                    // Both tasks must enter before either can return. This
+                    // proves parallel execution, not just async IO overlap.
+                    wait_for_release(&gate);
+                    id
+                })
+            })
+            .collect();
+        let first = arrived.recv_timeout(Duration::from_secs(5));
+        let second = arrived.recv_timeout(Duration::from_secs(5));
+        // Release even after a timeout so runtime teardown cannot deadlock.
+        release_tasks(&gate);
+        assert_ne!(first.unwrap(), second.unwrap());
+        runtime.block_on(async {
+            for task in tasks {
+                assert_ne!(task.await.unwrap(), thread::current().id());
+            }
+        });
+    }
+
+    #[test]
+    fn entity_decoders_run_in_parallel_off_the_http_executor() {
+        let runtime = network_runtime().unwrap();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (arrived_sender, arrived) = mpsc::channel();
+        let tasks: Vec<_> = (0..2)
+            .map(|index| {
+                let gate = Arc::clone(&gate);
+                let arrived_sender = arrived_sender.clone();
+                let expected = vec![b'a' + index; 256 * 1024];
+                let encoded = gzip(&expected);
+                runtime.spawn(async move {
+                    let http_thread = thread::current().id();
+                    tokio::task::spawn_blocking(move || {
+                        let decoder_thread = thread::current().id();
+                        arrived_sender.send(decoder_thread).unwrap();
+                        wait_for_release(&gate);
+                        assert_ne!(http_thread, decoder_thread);
+                        assert_eq!(
+                            decode_entity(&encoding_headers("gzip"), encoded, MAX_BODY_BYTES)
+                                .unwrap(),
+                            expected
+                        );
+                    })
+                    .await
+                    .unwrap();
+                })
+            })
+            .collect();
+        let first = arrived.recv_timeout(Duration::from_secs(5));
+        let second = arrived.recv_timeout(Duration::from_secs(5));
+        release_tasks(&gate);
+        assert_ne!(first.unwrap(), second.unwrap());
+        runtime.block_on(async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn pending_http_response_does_not_hold_up_other_resources() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_sender, arrived) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut slow, _) = listener.accept().unwrap();
+            let (request, _, _) = read_request(&mut slow);
+            assert!(request.starts_with("GET /slow "));
+            arrived_sender.send(()).unwrap();
+            let (mut fast, _) = listener.accept().unwrap();
+            let (request, _, _) = read_request(&mut fast);
+            assert!(request.starts_with("GET /fast "));
+            fast.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nfast",
+            )
+            .unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            slow.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow",
+            )
+            .unwrap();
+        });
+        let (service, wakes) = service();
+        service.submit(1, get(format!("{origin}/slow")));
+        arrived.recv_timeout(Duration::from_secs(5)).unwrap();
+        service.submit(2, get(format!("{origin}/fast")));
+        let fast = complete(&service, &wakes);
+        assert_eq!(fast.id, 2);
+        assert_eq!(fast.result.unwrap().body, b"fast");
+        release.send(()).unwrap();
+        let slow = complete(&service, &wakes);
+        assert_eq!(slow.id, 1);
+        assert_eq!(slow.result.unwrap().body, b"slow");
+        server.join().unwrap();
     }
 
     #[test]
