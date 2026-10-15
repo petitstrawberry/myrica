@@ -499,6 +499,59 @@ IMAGE_RESOURCES = {
 }
 
 
+PAINTING_WORKERS_PAGE = """<!doctype html><meta charset="utf-8"><title>painting-workers-loading</title>
+<style>
+html,body{margin:0;width:800px;height:600px;overflow:hidden;background:white}
+#gradient{position:absolute;left:16px;top:16px;width:768px;height:96px;background:linear-gradient(90deg in srgb,black,white)}
+#text{position:absolute;left:24px;top:136px;font:28px/40px sans-serif;color:black}
+img{position:absolute;top:200px;width:64px;height:48px}#png{left:20px}#jpeg{left:100px}#webp{left:180px}
+#clip{position:absolute;left:400px;top:200px;width:96px;height:96px;border-radius:24px;overflow:hidden}
+#clip div{width:160px;height:160px;background:cyan}
+canvas{position:absolute;top:320px;width:160px;height:160px}#copy{left:16px}#pattern{left:210px}
+#source{display:none}#anchor{position:absolute;left:736px;top:520px;width:48px;height:48px;background:#8040c0}
+</style>
+<div id="gradient"></div><div id="text">日本語の描画確認</div>
+<img id="png" src="/images/red.png"><img id="jpeg" src="/images/green.jpg"><img id="webp" src="/images/blue.webp">
+<div id="clip"><div></div></div>
+<canvas id="source" width="256" height="256"></canvas>
+<canvas id="copy" width="256" height="256"></canvas>
+<canvas id="pattern" width="256" height="256"></canvas>
+<div id="anchor"></div><span id="painting-workers-state" style="display:none"></span>
+<script>
+(async () => {
+  try {
+    await Promise.all(Array.from(document.images, image => image.decode()));
+    await document.fonts.ready;
+    const source = document.getElementById('source');
+    // Above WebKit's 128*129 acceleration threshold, without readback hints.
+    // This exercises GPU-capable Canvas images/patterns; the Web API cannot
+    // itself certify the private tile owner-fallback branch was selected.
+    const sourceContext = source.getContext('2d', {willReadFrequently:false});
+    for (const [x,y,colour] of [[0,0,'#d02030'],[128,0,'#20c040'],[0,128,'#3050d0'],[128,128,'#e0c020']]) {
+      sourceContext.fillStyle = colour;
+      sourceContext.fillRect(x,y,128,128);
+    }
+    const copyContext = document.getElementById('copy').getContext('2d', {willReadFrequently:false});
+    copyContext.drawImage(source,0,0);
+    const patternContext = document.getElementById('pattern').getContext('2d', {willReadFrequently:false});
+    const pattern = patternContext.createPattern(source,'repeat');
+    if (!pattern) throw Error('createPattern returned null');
+    patternContext.scale(.25,.25);
+    patternContext.fillStyle = pattern;
+    patternContext.fillRect(0,0,1024,1024);
+    document.getElementById('painting-workers-state').textContent = JSON.stringify({
+      text:document.getElementById('text').textContent,
+      decodedImages:document.images.length,canvases:3,
+      sourceWidth:source.width,sourceHeight:source.height,
+      willReadFrequently:sourceContext.getContextAttributes().willReadFrequently,
+      pattern:true
+    });
+    document.title = 'painting-workers-ready';
+  } catch (error) { document.title = 'painting-workers-error:' + error; }
+})();
+</script>""".encode("utf-8")
+
+
 IMAGE_PAGE = b"""<!doctype html><meta charset="utf-8"><title>images-loading</title>
 <style>
 html,body{margin:0;background:white;width:800px;min-height:1500px}
@@ -995,6 +1048,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MAIN)
         elif path == "/images":
             self.reply(200, "text/html; charset=utf-8", IMAGE_PAGE)
+        elif path == "/painting-workers":
+            self.reply(200, "text/html; charset=utf-8", PAINTING_WORKERS_PAGE)
         elif path in IMAGE_RESOURCES:
             content_type, content = IMAGE_RESOURCES[path]
             self.reply(200, content_type, content, cache_control="public, max-age=3600")

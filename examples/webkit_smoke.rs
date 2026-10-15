@@ -219,6 +219,8 @@ fn run() -> Result<(), String> {
     let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
     let media_only = std::env::args().any(|argument| argument == "--media-only");
     let compositor_only = std::env::args().any(|argument| argument == "--compositor-only");
+    let painting_workers_only =
+        std::env::args().any(|argument| argument == "--painting-workers-only");
     if (base == "--pages" || base == "--video-pages") && pages.is_empty() {
         return Err(String::from("page probes require URLs"));
     }
@@ -234,6 +236,7 @@ fn run() -> Result<(), String> {
                 fixture_only,
                 media_only,
                 compositor_only,
+                painting_workers_only,
             );
             eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=owner-body-returned");
             result
@@ -289,6 +292,7 @@ fn engine_probe(
     fixture_only: bool,
     media_only: bool,
     compositor_only: bool,
+    painting_workers_only: bool,
 ) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
     let mut engine = ProbeEngine::new(wake)?;
@@ -299,6 +303,11 @@ fn engine_probe(
                 .ok_or("missing native interruption hook")?,
         ))
         .map_err(|error| error.to_string())?;
+    if painting_workers_only {
+        painting_workers_probe(&mut engine, base)?;
+        drop(engine);
+        return Ok(());
+    }
     if compositor_only {
         #[cfg(feature = "backend-webkit-vulkan")]
         {
@@ -750,6 +759,154 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+#[cfg(not(feature = "backend-webkit-vulkan"))]
+fn painting_workers_probe(_engine: &mut ProbeEngine, _base: &str) -> Result<(), String> {
+    Err("--painting-workers-only requires backend-webkit-vulkan".into())
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn painting_workers_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    let workers = std::env::var("WEBKIT_SKIA_CPU_PAINTING_THREADS")
+        .map_err(|_| "set WEBKIT_SKIA_CPU_PAINTING_THREADS to 1, 2 or 4")?;
+    if !matches!(workers.as_str(), "1" | "2" | "4") {
+        return Err("painting worker comparison requires 1, 2 or 4 workers".into());
+    }
+    let viewport = (1600, 1200, 2.0);
+    engine.render(viewport.0, viewport.1, viewport.2)?;
+    let before = engine
+        .compositing_statistics()
+        .map_err(|error| error.to_string())?
+        .ok_or("painting worker contract requires the GPU compositor")?;
+    let revision = engine.cached_revision();
+    engine
+        .navigate(&format!("{base}/painting-workers"))
+        .map_err(|error| error.to_string())?;
+    wait_title(engine, "painting-workers-ready")?;
+    let observation = engine
+        .text_content("painting-workers-state")
+        .map_err(|error| error.to_string())?
+        .ok_or("painting worker DOM observation missing")?;
+    let state: serde_json::Value =
+        serde_json::from_str(&observation).map_err(|error| error.to_string())?;
+    if state["text"] != "日本語の描画確認"
+        || state["decodedImages"] != 3
+        || state["canvases"] != 3
+        || state["sourceWidth"] != 256
+        || state["sourceHeight"] != 256
+        || state["willReadFrequently"] != false
+        || state["pattern"] != true
+    {
+        return Err(format!(
+            "painting worker fixture did not initialize: {state}"
+        ));
+    }
+    await_rendered_frame(engine, viewport, revision, inspect_painting_workers)?;
+    // Drain actual pending raster/composition work rather than waiting a fixed
+    // time. Hash only a settled, fully validated GPU readback.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let settled = loop {
+        let changed = engine.tick();
+        let frame = engine.render(viewport.0, viewport.1, viewport.2)?;
+        inspect_painting_workers(&frame)?;
+        if !changed && !engine.has_pending_frame() {
+            break frame;
+        }
+        if Instant::now() >= deadline {
+            return Err("static painting worker fixture never settled".into());
+        }
+        thread::sleep(Duration::from_millis(1));
+    };
+    let statistics = engine
+        .compositing_statistics()
+        .map_err(|error| error.to_string())?
+        .ok_or("painting worker compositor disappeared")?;
+    let tile_paints = statistics.tile_paints.saturating_sub(before.tile_paints);
+    let tile_pixels = statistics.tile_pixels.saturating_sub(before.tile_pixels);
+    if tile_paints < 2 || tile_pixels < 800 * 600 {
+        return Err(format!(
+            "fixture did not rasterize multiple real tiles: {before:?} -> {statistics:?}"
+        ));
+    }
+    for _ in 0..8 {
+        if engine.tick() || engine.has_pending_frame() {
+            return Err("settled painting worker fixture scheduled more work".into());
+        }
+        let frame = engine.render(viewport.0, viewport.1, viewport.2)?;
+        if frame.rgba != settled.rgba {
+            return Err("static painting worker pixels changed after settling".into());
+        }
+    }
+    // FNV-1a over dimensions and every RGBA byte, with a specified byte order.
+    // Parent compares this value across fresh 1/2/4-worker processes. The
+    // expected colour/ink checks above reject matching blank or black frames.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in settled
+        .width
+        .to_le_bytes()
+        .into_iter()
+        .chain(settled.height.to_le_bytes())
+        .chain(settled.rgba.iter().copied())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=painting-workers workers={workers} size={}x{} scale=2 tile_paints={tile_paints} tile_pixels={tile_pixels} rgba_fnv1a64={hash:016x} canvas_gpu_requested=true owner_fallback_observed=false",
+        settled.width, settled.height
+    );
+    Ok(())
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn inspect_painting_workers(frame: &ProbeFrame) -> Result<(), String> {
+    if frame.width != 1600 || frame.height != 1200 || frame.rgba.len() != 1600 * 1200 * 4 {
+        return Err("painting worker frame has the wrong Retina extent".into());
+    }
+    // Coordinates below are CSS pixels; the actual readback is DPR2.
+    for (x, y, expected, tolerance) in [
+        (208, 50, [64, 64, 64, 255], 3),
+        (400, 50, [128, 128, 128, 255], 3),
+        (592, 50, [191, 191, 191, 255], 3),
+        (52, 224, [208, 32, 48, 255], 0),
+        (132, 224, [32, 192, 64, 255], 4),
+        (212, 224, [48, 80, 208, 255], 0),
+        (400, 200, [255; 4], 0),
+        (440, 240, [0, 255, 255, 255], 0),
+        (500, 240, [255; 4], 0),
+        (56, 360, [208, 32, 48, 255], 0),
+        (136, 360, [32, 192, 64, 255], 0),
+        (56, 440, [48, 80, 208, 255], 0),
+        (136, 440, [224, 192, 32, 255], 0),
+        (220, 330, [208, 32, 48, 255], 0),
+        (240, 330, [32, 192, 64, 255], 0),
+        (260, 330, [208, 32, 48, 255], 0),
+        (220, 350, [48, 80, 208, 255], 0),
+        (240, 350, [224, 192, 32, 255], 0),
+        (752, 544, [128, 64, 192, 255], 0),
+        (792, 592, [255; 4], 0),
+    ] {
+        assert_image_pixel(frame, x * 2, y * 2, expected, tolerance)?;
+    }
+    let mut ink = 0;
+    for y in 136 * 2..176 * 2 {
+        for x in 24 * 2..360 * 2 {
+            let offset = (y * frame.width as usize + x) * 4;
+            if frame.rgba[offset..offset + 3]
+                .iter()
+                .all(|channel| *channel < 96)
+            {
+                ink += 1;
+            }
+        }
+    }
+    if ink < 400 {
+        return Err(format!("Japanese text GPU ink missing: {ink}"));
+    }
+    if frame.rgba.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+        return Err("painting worker frame has uninitialized/transparent pixels".into());
+    }
     Ok(())
 }
 
