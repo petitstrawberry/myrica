@@ -8,7 +8,7 @@ mod frame_lease;
 mod worker;
 
 pub use frame::BrowserFrame;
-pub(crate) use frame::{BrowserDraw, BrowserTexture, BrowserTextureSource};
+pub(crate) use frame::{BrowserDraw, BrowserTexture, BrowserTextureSource, GpuImageCache};
 pub(crate) use frame_lease::{FrameLease, PresentationLeases};
 pub use worker::{BrowserViewport, BrowserWorker};
 

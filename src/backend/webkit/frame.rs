@@ -75,12 +75,9 @@ impl FrameRenderer {
     pub fn gpu_frame(
         &mut self,
         native: myrica_webkit_sys::GpuFrame,
-        release: Arc<dyn Fn(u64) + Send + Sync>,
+        image: Arc<super::super::frame::OwnedGpuImage>,
+        lease: Arc<super::super::FrameLease>,
     ) -> Result<BrowserFrame, BackendError> {
-        use super::super::FrameLease;
-        use super::super::frame::OwnedGpuImage;
-        let image = OwnedGpuImage::new(native.handle);
-        let lease = FrameLease::new(native.generation, release);
         if native.handle < 0
             || native.width == 0
             || native.height == 0

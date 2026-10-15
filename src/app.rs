@@ -17,7 +17,7 @@ use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
     BackendKind, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
-    BrowserSnapshot, BrowserViewport, BrowserWorker, PresentationLeases,
+    BrowserSnapshot, BrowserViewport, BrowserWorker, GpuImageCache, PresentationLeases,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
@@ -36,6 +36,7 @@ pub struct MyricaApp {
     // frames notify the inner paint state without rebuilding browser chrome.
     gpu_surface: State<Option<State<Arc<SgfxTexture>>>>,
     presentation_leases: Rc<RefCell<PresentationLeases>>,
+    gpu_image_cache: Rc<RefCell<GpuImageCache<SgfxTexture>>>,
     webview_size: State<Size>,
     webview_focused: State<bool>,
     webview_text_input: State<Option<TextInputElementState>>,
@@ -78,6 +79,7 @@ impl MyricaApp {
             canvas_frame: State::new(generate_state_id(), initial_frame),
             gpu_surface: State::new(generate_state_id(), None),
             presentation_leases: Rc::new(RefCell::new(PresentationLeases::default())),
+            gpu_image_cache: Rc::new(RefCell::new(GpuImageCache::default())),
             webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
             webview_text_input: State::new(generate_state_id(), None),
@@ -181,6 +183,7 @@ impl MyricaApp {
 
     /// Stop the owner even if retained window callbacks still hold shell state.
     pub fn shutdown(&self) {
+        self.gpu_image_cache.borrow_mut().clear();
         self.presentation_leases.borrow_mut().clear();
         self.backend.borrow_mut().shutdown();
     }
@@ -199,9 +202,11 @@ impl MyricaApp {
         frame: BrowserFrame,
     ) -> std::result::Result<(), crate::backend::BackendError> {
         let lease = frame.lease.clone();
-        if let Some(texture) = frame.try_external_gpu_texture()? {
+        let texture = frame.try_external_gpu_texture(&mut self.gpu_image_cache.borrow_mut())?;
+        if let Some(texture) = texture {
             self.set_gpu_surface(texture);
         } else {
+            self.gpu_image_cache.borrow_mut().clear();
             self.canvas_frame.set(frame.try_into_canvas_frame()?);
             if self.gpu_surface.get().is_some() {
                 self.gpu_surface.set(None);

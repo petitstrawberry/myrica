@@ -42,36 +42,110 @@ pub enum BrowserTextureSource {
 #[cfg(target_os = "scarlet")]
 pub struct OwnedGpuImage {
     raw: std::sync::atomic::AtomicI32,
+    allocation_id: u64,
 }
 #[cfg(target_os = "scarlet")]
 impl OwnedGpuImage {
     /// Takes ownership of one exported native capability.
-    pub(crate) fn new(raw: i32) -> Arc<Self> {
+    pub(crate) fn new(raw: i32, allocation_id: u64) -> Arc<Self> {
         Arc::new(Self {
             raw: std::sync::atomic::AtomicI32::new(raw),
+            allocation_id,
         })
     }
-    fn take(&self) -> Result<i32, super::BackendError> {
+    fn take(&self) -> Result<OwnedGpuCapability, super::BackendError> {
         let raw = self.raw.swap(-1, std::sync::atomic::Ordering::AcqRel);
         if raw < 0 {
             Err(super::BackendError::new(
                 "GPU page capability was already consumed",
             ))
         } else {
-            Ok(raw)
+            Ok(OwnedGpuCapability::new(raw))
+        }
+    }
+}
+/// One exported capability, closed unless explicitly transferred to ScarletUI.
+#[cfg(target_os = "scarlet")]
+pub(crate) struct OwnedGpuCapability(i32);
+#[cfg(target_os = "scarlet")]
+impl OwnedGpuCapability {
+    pub(crate) fn new(raw: i32) -> Self {
+        Self(raw)
+    }
+    pub(crate) fn into_raw(mut self) -> i32 {
+        std::mem::replace(&mut self.0, -1)
+    }
+}
+#[cfg(target_os = "scarlet")]
+impl Drop for OwnedGpuCapability {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // SAFETY: this guard exclusively owns the exported capability.
+            unsafe {
+                scarlet_sys::syscall1(scarlet_sys::Syscall::HandleClose, self.0 as usize);
+            }
         }
     }
 }
 #[cfg(target_os = "scarlet")]
 impl Drop for OwnedGpuImage {
     fn drop(&mut self) {
-        let raw = *self.raw.get_mut();
-        if raw >= 0 {
-            // SAFETY: this object owns the capability unless take() disarmed it.
-            unsafe {
-                scarlet_sys::syscall1(scarlet_sys::Syscall::HandleClose, raw as usize);
-            }
+        drop(OwnedGpuCapability::new(*self.raw.get_mut()));
+    }
+}
+
+/// UI-thread image ownership only. Frame leases must never enter this cache.
+pub(crate) struct GpuImageCache<T> {
+    entries: Vec<(u64, u32, u32, Arc<T>)>,
+}
+impl<T> Default for GpuImageCache<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
         }
+    }
+}
+impl<T> GpuImageCache<T> {
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+    // Creation consumes an export only on a miss. A hit still owns the same
+    // allocation, but each newly presented frame retains its independent lease.
+    #[cfg(any(target_os = "scarlet", test))]
+    fn get_or_try_insert(
+        &mut self,
+        allocation_id: u64,
+        width: u32,
+        height: u32,
+        create: impl FnOnce() -> Result<Arc<T>, super::BackendError>,
+    ) -> Result<Arc<T>, super::BackendError> {
+        if allocation_id == 0 || width == 0 || height == 0 {
+            return Err(super::BackendError::new(
+                "invalid GPU image allocation identity or extent",
+            ));
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.0 == allocation_id)
+        {
+            if (self.entries[index].1, self.entries[index].2) != (width, height) {
+                return Err(super::BackendError::new(
+                    "GPU image allocation extent changed",
+                ));
+            }
+            let entry = self.entries.remove(index);
+            let image = Arc::clone(&entry.3);
+            self.entries.push(entry);
+            return Ok(image);
+        }
+        let image = create()?;
+        if self.entries.len() == 2 {
+            self.entries.remove(0);
+        }
+        self.entries
+            .push((allocation_id, width, height, Arc::clone(&image)));
+        Ok(image)
     }
 }
 
@@ -91,6 +165,7 @@ impl BrowserFrame {
     /// retain their mesh/canvas path. The frame's lease stays owned by the UI.
     pub(crate) fn try_external_gpu_texture(
         &self,
+        cache: &mut GpuImageCache<SgfxTexture>,
     ) -> Result<Option<Arc<SgfxTexture>>, super::BackendError> {
         #[cfg(target_os = "scarlet")]
         if let [draw] = self.draws.as_slice()
@@ -109,15 +184,25 @@ impl BrowserFrame {
                     "GPU page is not a full-viewport image",
                 ));
             }
-            let raw = image.take()?;
-            // SAFETY: take() transfers the exclusively owned capability once;
-            // ScarletUI consumes it on both success and failure.
-            return unsafe {
-                scarlet_ui::shared_bgra8_texture_from_raw(raw, self.width, self.height)
-            }
-            .map(Some)
-            .map_err(|error| super::BackendError::new(format!("adopt GPU page image: {error}")));
+            let capability = image.take()?;
+            return cache
+                .get_or_try_insert(image.allocation_id, self.width, self.height, || {
+                    // SAFETY: the guard transfers the exclusively owned export;
+                    // ScarletUI consumes it on both success and failure.
+                    unsafe {
+                        scarlet_ui::shared_bgra8_texture_from_raw(
+                            capability.into_raw(),
+                            self.width,
+                            self.height,
+                        )
+                    }
+                    .map_err(|error| {
+                        super::BackendError::new(format!("adopt GPU page image: {error}"))
+                    })
+                })
+                .map(Some);
         }
+        let _ = cache;
         Ok(None)
     }
 
@@ -155,12 +240,12 @@ impl BrowserFrame {
                     ),
                     #[cfg(target_os = "scarlet")]
                     BrowserTextureSource::SharedGpu(image) => {
-                        let raw = image.take()?;
+                        let capability = image.take()?;
                         // SAFETY: take() transfers this exclusively owned capability
                         // once. ScarletUI consumes it on both success and failure.
                         unsafe {
                             scarlet_ui::shared_bgra8_texture_from_raw(
-                                raw,
+                                capability.into_raw(),
                                 texture.width,
                                 texture.height,
                             )
@@ -180,5 +265,134 @@ impl BrowserFrame {
     #[cfg(test)]
     pub fn draw_count(&self) -> usize {
         self.draws.len()
+    }
+}
+
+#[cfg(test)]
+mod gpu_image_cache_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct Resource(Rc<Cell<usize>>);
+    impl Drop for Resource {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn allocation_identity_reuses_ownership_and_drops_unused_export() {
+        let drops = Rc::new(Cell::new(0));
+        let mut cache = GpuImageCache::default();
+        let first = cache
+            .get_or_try_insert(17, 640, 480, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+            .unwrap();
+        let unused_export = Resource(Rc::clone(&drops));
+        let same = cache
+            .get_or_try_insert(17, 640, 480, move || {
+                drop(unused_export);
+                panic!("same allocation must not be imported twice")
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(drops.get(), 1, "unused export is released even on a hit");
+        drop(same);
+        cache.clear();
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(drops.get(), 1, "current UI image outlives cache clearing");
+        drop(first);
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn two_entry_lru_retires_only_cache_ownership() {
+        let drops = Rc::new(Cell::new(0));
+        let mut cache = GpuImageCache::default();
+        let first = cache
+            .get_or_try_insert(1, 2, 2, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+            .unwrap();
+        let second = cache
+            .get_or_try_insert(2, 2, 2, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+            .unwrap();
+        drop(
+            cache
+                .get_or_try_insert(1, 2, 2, || panic!("cache hit"))
+                .unwrap(),
+        );
+        drop(
+            cache
+                .get_or_try_insert(3, 4, 4, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+                .unwrap(),
+        );
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.0)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(Arc::strong_count(&first), 2);
+        assert_eq!(
+            Arc::strong_count(&second),
+            1,
+            "evicted allocation can still be in flight"
+        );
+        assert_eq!(drops.get(), 0);
+        drop(second);
+        assert_eq!(drops.get(), 1);
+        cache.clear();
+        assert_eq!(drops.get(), 2);
+        drop(first);
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn invalid_extent_and_failed_adoption_preserve_cached_allocations() {
+        let drops = Rc::new(Cell::new(0));
+        let mut cache = GpuImageCache::default();
+        drop(
+            cache
+                .get_or_try_insert(1, 2, 2, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+                .unwrap(),
+        );
+        drop(
+            cache
+                .get_or_try_insert(2, 2, 2, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+                .unwrap(),
+        );
+        let unused_export = Resource(Rc::clone(&drops));
+        assert!(
+            cache
+                .get_or_try_insert(1, 3, 2, move || {
+                    drop(unused_export);
+                    panic!("extent mismatch must not import")
+                })
+                .is_err()
+        );
+        assert_eq!(drops.get(), 1);
+        assert!(
+            cache
+                .get_or_try_insert(3, 4, 4, || Err(super::super::BackendError::new(
+                    "adoption failed"
+                )))
+                .is_err()
+        );
+        assert!(
+            cache
+                .get_or_try_insert(0, 4, 4, || panic!("zero identity"))
+                .is_err()
+        );
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        cache.clear();
+        assert_eq!(drops.get(), 3);
     }
 }

@@ -297,6 +297,12 @@ unsafe extern "C" {
     pub fn scarlet_webview_pixels(view: *mut ScarletWebView, out_pixels: *mut Pixels) -> c_int;
     pub fn scarlet_webview_gpu_frame_capacity(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_gpu_frame(view: *mut ScarletWebView, out: *mut GpuFrame) -> c_int;
+    /// Stable allocation identity, queried only while this frame lease is live.
+    pub fn scarlet_webview_gpu_frame_image_id(
+        view: *mut ScarletWebView,
+        generation: u64,
+        out: *mut u64,
+    ) -> c_int;
     pub fn scarlet_webview_release_gpu_frame(view: *mut ScarletWebView, generation: u64) -> c_int;
     /// Renderer diagnostic only; browser presentation never reads page pixels.
     pub fn scarlet_webview_gpu_frame_readback(

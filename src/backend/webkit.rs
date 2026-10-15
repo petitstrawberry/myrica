@@ -545,8 +545,8 @@ impl BrowserBackend for WebKitBackend {
                 return Ok(None);
             }
             check(status, "paint WebCore GPU page")?;
+            let capability = super::frame::OwnedGpuCapability::new(image.handle);
             let Some(release) = self.frame_releaser.as_ref() else {
-                drop(super::frame::OwnedGpuImage::new(image.handle));
                 // SAFETY: a just-acquired frame has never reached a consumer.
                 unsafe {
                     ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), image.generation);
@@ -555,7 +555,26 @@ impl BrowserBackend for WebKitBackend {
                     "GPU frame return queue was not installed",
                 ));
             };
-            let frame = self.renderer.gpu_frame(image, Arc::clone(release))?;
+            let lease = super::FrameLease::new(image.generation, Arc::clone(release));
+            let mut allocation_id = 0;
+            // SAFETY: the acquired frame's lease is live on its owning view.
+            check(
+                unsafe {
+                    ffi::scarlet_webview_gpu_frame_image_id(
+                        self.view.as_ptr(),
+                        image.generation,
+                        &mut allocation_id,
+                    )
+                },
+                "query WebCore GPU image identity",
+            )?;
+            if allocation_id == 0 {
+                return Err(BackendError::new(
+                    "WebCore returned a zero GPU allocation identity",
+                ));
+            }
+            let owned = super::frame::OwnedGpuImage::new(capability.into_raw(), allocation_id);
+            let frame = self.renderer.gpu_frame(image, owned, lease)?;
             if frame.width != width || frame.height != height {
                 return Err(BackendError::new(
                     "WebCore returned a mismatched GPU page extent",
