@@ -357,6 +357,13 @@ fn engine_probe(
         return Ok(());
     }
     engine.render(800, 600, 1.0)?;
+    sender
+        .send(OwnerMessage::PageProgress)
+        .map_err(|error| error.to_string())?;
+    image_pipeline_probe(&mut engine, base)?;
+    sender
+        .send(OwnerMessage::PageProgress)
+        .map_err(|error| error.to_string())?;
     engine
         .navigate(&format!("{base}/redirect"))
         .map_err(|error| error.to_string())?;
@@ -647,6 +654,231 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    engine
+        .navigate(&format!("{base}/images"))
+        .map_err(|error| error.to_string())?;
+    let first = await_image_frame(engine, "images-ready", |frame| {
+        inspect_image_board(frame, false, false)
+    })?;
+    verify_image_state(engine, 0, false, 0)?;
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=image-formats-flat-layer-scaled revision={}",
+        first.revision
+    );
+
+    click(engine, 540.0, 38.0);
+    let asynchronous = await_image_frame(engine, "images-async", |frame| {
+        inspect_image_board(frame, true, false)
+    })?;
+    verify_image_state(engine, 1, false, 0)?;
+    if asynchronous.revision == first.revision {
+        return Err("asynchronous image load retained the old GPU frame".into());
+    }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=image-async-http-load-decode-pixels");
+
+    click(engine, 540.0, 98.0);
+    let transformed = await_image_frame(engine, "images-transformed", |frame| {
+        inspect_image_board(frame, true, true)?;
+        assert_image_pixel(frame, 24, 116, [255, 255, 255, 255], 0)
+    })?;
+    verify_image_state(engine, 1, true, 0)?;
+    if transformed.revision == asynchronous.revision {
+        return Err("translated image layers did not update actual GPU pixels".into());
+    }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=image-transformed-textures-retained");
+
+    engine.handle_input(BrowserInput::Wheel {
+        delta_x: 0.0,
+        delta_y: -760.0,
+        x: 400.0,
+        y: 440.0,
+    });
+    await_image_frame(engine, "images-scroll:760", |frame| {
+        for (x, colour, tolerance) in image_samples() {
+            assert_image_pixel(frame, x, 64, colour, tolerance)?;
+        }
+        Ok(())
+    })?;
+    verify_image_state(engine, 1, true, 760)?;
+    engine.handle_input(BrowserInput::Wheel {
+        delta_x: 0.0,
+        delta_y: 760.0,
+        x: 400.0,
+        y: 440.0,
+    });
+    await_image_frame(engine, "images-scroll:0", |frame| {
+        inspect_image_board(frame, true, true)
+    })?;
+    verify_image_state(engine, 1, true, 0)?;
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=image-cached-scroll-return-pixels");
+    Ok(())
+}
+
+fn image_samples() -> [(u32, [u8; 4], u8); 3] {
+    [
+        (52, [208, 32, 48, 255], 0),
+        (132, [32, 192, 64, 255], 4),
+        (212, [48, 80, 208, 255], 0),
+    ]
+}
+
+fn inspect_image_board(frame: &ProbeFrame, asynchronous: bool, moved: bool) -> Result<(), String> {
+    for (x, colour, tolerance) in image_samples() {
+        assert_image_pixel(frame, x, 44, colour, tolerance)?;
+        assert_image_pixel(
+            frame,
+            x + if moved { 24 } else { 0 },
+            116,
+            colour,
+            tolerance,
+        )?;
+    }
+    for (x, y, colour) in [
+        (100, 225, [208, 32, 48, 255]),
+        (260, 225, [32, 192, 64, 255]),
+        (100, 315, [48, 80, 208, 255]),
+        (260, 315, [224, 192, 32, 255]),
+    ] {
+        assert_image_pixel(frame, x, y, colour, 4)?;
+    }
+    let colour = if asynchronous {
+        [48, 80, 208, 255]
+    } else {
+        [208, 32, 48, 255]
+    };
+    assert_image_pixel(frame, 312, 44, colour, 0)
+}
+
+fn assert_image_pixel(
+    frame: &ProbeFrame,
+    x: u32,
+    y: u32,
+    expected: [u8; 4],
+    tolerance: u8,
+) -> Result<(), String> {
+    if x >= frame.width || y >= frame.height {
+        return Err("image sample outside actual native frame".into());
+    }
+    let offset = (y as usize * frame.width as usize + x as usize) * 4;
+    let actual = frame
+        .rgba
+        .get(offset..offset + 4)
+        .ok_or("image sample outside native diagnostic pixels")?;
+    if actual[..3]
+        .iter()
+        .zip(expected[..3].iter())
+        .any(|(a, b)| a.abs_diff(*b) > tolerance)
+        || actual[3] != expected[3]
+    {
+        return Err(format!(
+            "decoded image pixel ({x},{y}) expected {expected:?} tolerance={tolerance}, got {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn await_image_frame(
+    engine: &mut ProbeEngine,
+    title: &str,
+    inspect: impl Fn(&ProbeFrame) -> Result<(), String>,
+) -> Result<ProbeFrame, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::from("no decoded image frame");
+    loop {
+        engine.tick();
+        let state = engine.snapshot();
+        if matches!(state.load_state, LoadState::Failed(_))
+            || state.title.starts_with("images-error:")
+        {
+            return Err(format!("native image fixture failed: {state:?}"));
+        }
+        let frame = engine.render(800, 600, 1.0)?;
+        if state.title == title && state.load_state == LoadState::Ready {
+            match inspect(&frame) {
+                Ok(()) => return Ok(frame),
+                Err(error) => last = error,
+            }
+        }
+        if Instant::now() >= deadline {
+            let observation = engine
+                .text_content("images-state")
+                .map_err(|e| e.to_string())?;
+            return Err(format!(
+                "image stage {title:?} did not reach decoded GPU output: {last}; state={state:?} DOM={observation:?}"
+            ));
+        }
+        // Poll a concrete DOM/GPU predicate; this is not a fixed settling delay.
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn verify_image_state(
+    engine: &mut WebKitBackend,
+    async_events: u64,
+    moved: bool,
+    scroll: i64,
+) -> Result<(), String> {
+    let observation = engine
+        .text_content("images-state")
+        .map_err(|error| error.to_string())?
+        .ok_or("image decode observation missing")?;
+    let state: serde_json::Value = serde_json::from_str(&observation).map_err(|e| e.to_string())?;
+    let images = state["images"]
+        .as_array()
+        .ok_or("image observation is not an array")?;
+    if images.len() != 11
+        || state["asyncLoadEvents"].as_u64() != Some(async_events)
+        || state["moved"].as_bool() != Some(moved)
+        || state["scrollY"].as_i64() != Some(scroll)
+    {
+        return Err(format!("image DOM lifecycle state mismatch: {state}"));
+    }
+    for id in [
+        "flat-png",
+        "flat-jpeg",
+        "flat-webp",
+        "layer-png",
+        "layer-jpeg",
+        "layer-webp",
+        "large-image",
+        "async-image",
+        "cached-png",
+        "cached-jpeg",
+        "cached-webp",
+    ] {
+        let image = images
+            .iter()
+            .find(|image| image["id"] == id)
+            .ok_or_else(|| format!("missing decoded image {id}: {state}"))?;
+        let (width, height) = if id == "large-image" {
+            (1280, 720)
+        } else {
+            (64, 48)
+        };
+        let path = if id == "large-image" {
+            "/images/quadrants.jpg"
+        } else if id.ends_with("jpeg") {
+            "/images/green.jpg"
+        } else if id.ends_with("webp") || (id == "async-image" && async_events == 1) {
+            "/images/blue.webp"
+        } else {
+            "/images/red.png"
+        };
+        if image["complete"] != true
+            || image["decoded"] != true
+            || image["width"] != width
+            || image["height"] != height
+            || image["path"] != path
+        {
+            return Err(format!(
+                "native image {id} did not actually decode: {image}"
+            ));
+        }
+    }
     Ok(())
 }
 
