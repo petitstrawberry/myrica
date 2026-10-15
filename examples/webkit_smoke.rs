@@ -767,9 +767,9 @@ fn video_page_probe(
                     }
                     gesture_sent = true;
                 }
-                if statistics.current_time >= start_time.unwrap_or(0.0) + 2.0
-                    && statistics.decoded_frames >= 8
-                    && statistics.presented_frames >= initial_presented + 3
+                if statistics.current_time >= start_time.unwrap_or(0.0) + 10.0
+                    && statistics.decoded_frames >= 24
+                    && statistics.presented_frames >= initial_presented + 8
                 {
                     let before = first_frame
                         .as_ref()
