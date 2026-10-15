@@ -1551,7 +1551,7 @@ fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), St
                     page_paints - initial_page_paints,
                     callbacks - initial_callbacks
                 );
-                return Ok(());
+                return compositor_video_reparent_probe(engine);
             }
         }
         if state["ended"] == true || Instant::now() >= deadline {
@@ -1562,6 +1562,306 @@ fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), St
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+#[derive(Clone, Copy)]
+struct VideoProgress {
+    callbacks: u64,
+    pts: f64,
+    presented: u64,
+    revision: u64,
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn video_progress(engine: &mut ProbeEngine) -> Result<VideoProgress, String> {
+    let state = media_state(engine)?;
+    let native = engine
+        .media_statistics(0)
+        .map_err(|error| error.to_string())?
+        .ok_or("missing native video presentation statistics")?;
+    Ok(VideoProgress {
+        callbacks: state["callbacks"]
+            .as_u64()
+            .ok_or("missing frame callbacks")?,
+        pts: state["metadata"]["time"]
+            .as_f64()
+            .ok_or("missing actual rVFC mediaTime")?,
+        presented: native.presented_frames,
+        revision: engine.cached_revision(),
+    })
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn video_colour(frame: &ProbeFrame, x: u32, y: u32) -> Option<usize> {
+    if x >= frame.width || y >= frame.height {
+        return None;
+    }
+    let offset = (y as usize * frame.width as usize + x as usize) * 4;
+    let pixel = frame.rgba.get(offset..offset + 4)?;
+    [[255u8, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]]
+        .iter()
+        .position(|colour| pixel.iter().zip(colour).all(|(a, b)| a.abs_diff(*b) <= 30))
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn inspect_video_layout(
+    frame: &ProbeFrame,
+    state: &serde_json::Value,
+    theater: bool,
+    scroll: f64,
+    viewport: (u32, u32, f32),
+) -> Result<usize, String> {
+    let layout = &state["compositor"];
+    let phase = if theater { "theater" } else { "inline" };
+    let parent = if theater {
+        "theater-player"
+    } else {
+        "inline-player"
+    };
+    let scale = f64::from(viewport.2);
+    let css_width = f64::from(viewport.0) / scale;
+    let width = if theater { css_width - 32.0 } else { 128.0 };
+    let height = width * 0.75;
+    let top = if theater {
+        56.0 - scroll
+    } else {
+        20.0 - scroll
+    };
+    if layout["phase"] != phase
+        || layout["parent"] != parent
+        || layout["sameVideo"] != true
+        || layout["scrollY"]
+            .as_f64()
+            .is_none_or(|y| (y - scroll).abs() > 0.5)
+        || layout["rect"]["width"]
+            .as_f64()
+            .is_none_or(|w| (w - width).abs() > 0.5)
+        || layout["rect"]["height"]
+            .as_f64()
+            .is_none_or(|h| (h - height).abs() > 0.5)
+        || layout["rect"]["y"]
+            .as_f64()
+            .is_none_or(|y| (y - top).abs() > 0.5)
+    {
+        return Err(format!(
+            "video reparent/resize/scroll has not reached {phase}: {layout}"
+        ));
+    }
+    let physical = |value: f64| (value * scale).round() as u32;
+    if theater {
+        let marker = if scroll == 0.0 {
+            [0xb0, 0x40, 0x80, 255]
+        } else {
+            [0x20, 0x20, 0x20, 255]
+        };
+        assert_pixel(frame, physical(8.0), physical(8.0), marker)?;
+    } else {
+        assert_pixel(
+            frame,
+            physical(280.0),
+            physical(60.0),
+            [0x12, 0x34, 0x56, 255],
+        )?;
+        assert_pixel(
+            frame,
+            physical(180.0),
+            physical(100.0),
+            [0x24, 0x68, 0xac, 255],
+        )?;
+    }
+    let first = if theater { (60.0, 100.0) } else { (60.0, 60.0) };
+    let second = if theater {
+        (css_width - 60.0, f64::from(viewport.1) / scale - 60.0)
+    } else {
+        (130.0, 100.0)
+    };
+    let colour = video_colour(frame, physical(first.0), physical(first.1))
+        .ok_or("first actual GPU video sample is not a decoded fixture colour")?;
+    if video_colour(frame, physical(second.0), physical(second.1)) != Some(colour) {
+        return Err("expanded/restored video has stale, clipped or missing GPU pixels".into());
+    }
+    Ok(colour)
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn await_video_layout_progress(
+    engine: &mut ProbeEngine,
+    start: VideoProgress,
+    stage: &str,
+    theater: bool,
+    scroll: f64,
+    viewport: (u32, u32, f32),
+) -> Result<VideoProgress, String> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut first_colour = None;
+    let mut last = String::from("no new GPU frame after layout change");
+    loop {
+        engine.tick();
+        let frame = engine.render(viewport.0, viewport.1, viewport.2)?;
+        let state = media_state(engine)?;
+        if state["error"].as_u64().unwrap_or(0) != 0
+            || state["ended"] == true
+            || engine.snapshot().title.starts_with("media-error:")
+        {
+            return Err(format!(
+                "{stage}: video failed/stopped during layout changes: {state}"
+            ));
+        }
+        if frame.revision > start.revision {
+            match inspect_video_layout(&frame, &state, theater, scroll, viewport) {
+                Ok(colour) => {
+                    let (initial_colour, initial_revision) =
+                        *first_colour.get_or_insert((colour, frame.revision));
+                    let now = video_progress(engine)?;
+                    if colour != initial_colour
+                        && frame.revision > initial_revision
+                        && now.callbacks >= start.callbacks + 2
+                        && now.pts > start.pts
+                        && now.presented >= start.presented + 2
+                        && state["paused"] == false
+                    {
+                        println!(
+                            "MYRICA_WEBKIT_SMOKE_PASS stage={stage} size={}x{} scale={} callback_delta={} presented_delta={} pts={}..{} revision={}..{}",
+                            viewport.0,
+                            viewport.1,
+                            viewport.2,
+                            now.callbacks - start.callbacks,
+                            now.presented - start.presented,
+                            start.pts,
+                            now.pts,
+                            start.revision,
+                            frame.revision
+                        );
+                        return Ok(now);
+                    }
+                    last =
+                        format!("decoded pixels/callbacks have not both advanced: state={state}");
+                }
+                Err(error) => last = error,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{stage}: native video layout progression stalled: {last}"
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn compositor_video_reparent_probe(engine: &mut ProbeEngine) -> Result<(), String> {
+    let small = (400, 240, 1.0);
+    let wide = (2560, 1440, 2.0);
+    let before_hide = engine.cached_revision();
+    type_character(engine, 'h');
+    await_rendered_frame(engine, small, before_hide, |frame| {
+        assert_pixel(frame, 60, 60, [0x24, 0x68, 0xac, 255])?;
+        assert_pixel(frame, 280, 60, [0x12, 0x34, 0x56, 255])
+    })?;
+    let hidden = media_state(engine)?;
+    if hidden["compositor"]["phase"] != "hidden" || hidden["compositor"]["sameVideo"] != true {
+        return Err(format!(
+            "video was replaced instead of genuinely hidden: {hidden}"
+        ));
+    }
+    let mut progress = video_progress(engine)?;
+    type_character(engine, 't');
+    progress = await_video_layout_progress(
+        engine,
+        progress,
+        "video-reparent-wide-dpr2",
+        true,
+        0.0,
+        wide,
+    )?;
+    engine.handle_input(BrowserInput::Wheel {
+        delta_x: 0.0,
+        delta_y: -80.0,
+        x: 1260.0,
+        y: 680.0,
+    });
+    progress =
+        await_video_layout_progress(engine, progress, "video-theater-scroll", true, 80.0, wide)?;
+    engine.handle_input(BrowserInput::Wheel {
+        delta_x: 0.0,
+        delta_y: 80.0,
+        x: 1260.0,
+        y: 680.0,
+    });
+    progress = await_video_layout_progress(
+        engine,
+        progress,
+        "video-theater-scroll-return",
+        true,
+        0.0,
+        wide,
+    )?;
+    type_character(engine, 't');
+    await_video_layout_progress(engine, progress, "video-inline-restore", false, 0.0, small)?;
+
+    type_character(engine, 'p');
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        engine.tick();
+        engine.render(small.0, small.1, small.2)?;
+        if media_state(engine)?["paused"] == true {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("video did not really pause before reparent".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let paused_time = media_state(engine)?["time"]
+        .as_f64()
+        .ok_or("missing paused time")?;
+    let paused_revision = engine.cached_revision();
+    type_character(engine, 't');
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        engine.tick();
+        let frame = engine.render(small.0, small.1, small.2)?;
+        let state = media_state(engine)?;
+        if state["paused"] != true
+            || state["time"]
+                .as_f64()
+                .is_none_or(|t| (t - paused_time).abs() > 0.05)
+        {
+            return Err(format!(
+                "reparent unexpectedly resumed the paused video: {state}"
+            ));
+        }
+        if frame.revision > paused_revision
+            && inspect_video_layout(&frame, &state, true, 0.0, small).is_ok()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("paused video did not survive reparent: {state}"));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=video-paused-reparent pixels=decoded same-element=true"
+    );
+    // Re-read native callback counts after reparent; future playback must advance
+    // beyond this point, not reuse feedback from before the layout switch.
+    progress = video_progress(engine)?;
+    type_character(engine, 'p');
+    progress =
+        await_video_layout_progress(engine, progress, "video-reparent-resume", true, 0.0, small)?;
+    type_character(engine, 't');
+    await_video_layout_progress(
+        engine,
+        progress,
+        "video-final-inline-restore",
+        false,
+        0.0,
+        small,
+    )?;
+    Ok(())
 }
 
 fn await_rendered_frame(

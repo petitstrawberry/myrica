@@ -671,15 +671,59 @@ else video.src = '/media/' + fixture + '.mp4';
 # The video has its own accelerated layer; the board remains genuine static DOM
 # content. Frame callbacks/state update only a hidden span and cannot dirty it.
 COMPOSITOR_MEDIA_PAGE = MEDIA_PAGE.replace(
-    b"<video id=", b'<div id="static-board"></div><video id=', 1,
+    b"<video id=", b'<div id="static-board"></div><div id="inline-player"><video id=', 1,
+).replace(
+    b'</video><button',
+    b'</video></div><div id="theater-player"><div id="theater-marker"></div></div><button', 1,
 ).replace(
     b"</style>",
-    b"body{background:#2468ac}#static-board{position:absolute;left:200px;top:20px;"
-    b"width:160px;height:180px;background:#123456}video{transform:translateZ(0);"
+    b"body{background:#2468ac;min-height:1200px}#static-board{position:absolute;left:200px;top:20px;"
+    b"width:160px;height:180px;background:#123456}#inline-player{position:absolute;left:0;top:0}"
+    b"#theater-player{display:none;position:absolute;left:0;top:0;width:100vw;height:1100px;"
+    b"background:#202020;transform:translateZ(0);filter:drop-shadow(0 0 1px #000)}#theater-marker{position:absolute;left:0;top:0;"
+    b"width:100vw;height:32px;background:#b04080}video{transform:translateZ(0);"
     b"will-change:transform}</style>", 1,
 ).replace(
+    b"const video = document.getElementById('video');",
+    b"""const video = document.getElementById('video');
+const originalVideo = video;
+let compositorPhase = 'inline';
+function compositorState() {
+  const rect = video.getBoundingClientRect();
+  return {phase:compositorPhase, sameVideo:document.getElementById('video') === originalVideo,
+          parent:video.parentElement.id, scrollY,
+          rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}};
+}
+window.addEventListener('keydown', event => {
+  if (event.key === 'h') {
+    document.getElementById('inline-player').style.display = 'none';
+    compositorPhase = 'hidden';
+  } else if (event.key === 't') {
+    const theater = document.getElementById('theater-player');
+    const inline = document.getElementById('inline-player');
+    if (compositorPhase !== 'theater') {
+      inline.style.display = 'none';
+      theater.style.display = 'block';
+      theater.appendChild(video);
+      video.style.cssText = 'left:16px;top:56px;width:calc(100vw - 32px);height:calc((100vw - 32px)*0.75)';
+      compositorPhase = 'theater';
+    } else {
+      theater.style.display = 'none';
+      inline.style.display = 'block';
+      inline.appendChild(video);
+      video.style.cssText = '';
+      compositorPhase = 'inline';
+    }
+  }
+  updateState();
+});
+window.addEventListener('scroll', updateState);""", 1,
+).replace(
+    b"quality:video.getVideoPlaybackQuality().totalVideoFrames,",
+    b"quality:video.getVideoPlaybackQuality().totalVideoFrames, compositor:compositorState(),", 1,
+).replace(
     b"const fixture = mse ? 'normal' : location.pathname.split('/').pop();",
-    b"const fixture = 'normal';", 1,
+    b"const fixture = 'compositor';", 1,
 )
 
 
@@ -706,7 +750,8 @@ def media_segments(data: bytes) -> list[bytes]:
     return segments
 
 
-def video_encoding_evidence(path: Path, expected_profile: str, reordered: bool) -> dict:
+def video_encoding_evidence(path: Path, expected_profile: str, reordered: bool,
+                            expected_frames: int = 24) -> dict:
     """Record actual coded/display order; reject duped CFR or B-frame-free inputs."""
     def probe(kind: str, entries: str) -> dict:
         output = subprocess.check_output([
@@ -721,12 +766,12 @@ def video_encoding_evidence(path: Path, expected_profile: str, reordered: bool) 
     pts = [float(frame['best_effort_timestamp_time']) for frame in frames]
     packet_pts = [float(packet['pts_time']) for packet in packets]
     packet_dts = [float(packet['dts_time']) for packet in packets]
-    expected_pts = [index / 8 for index in range(24)]
+    expected_pts = [index / 8 for index in range(expected_frames)]
     b_frames = sum(frame['pict_type'] == 'B' for frame in frames)
     has_reorder = any(right < left for left, right in zip(packet_pts, packet_pts[1:]))
     if (stream['codec_name'] != 'h264' or stream['profile'] != expected_profile
             or stream['width'] != 128 or stream['height'] != 96 or stream['r_frame_rate'] != '8/1'
-            or len(frames) != 24 or len(packets) != 24 or pts != expected_pts
+            or len(frames) != expected_frames or len(packets) != expected_frames or pts != expected_pts
             or sorted(packet_pts) != expected_pts
             or any(right <= left for left, right in zip(packet_dts, packet_dts[1:]))
             or bool(b_frames) != reordered or has_reorder != reordered
@@ -772,6 +817,19 @@ def generate_media(directory: Path) -> dict[str, tuple[str, bytes]]:
         resources[url] = ("application/octet-stream", resources["/media/normal.mp4"][1])
     evidence = video_encoding_evidence(normal, "Constrained Baseline", False)
     resources["/media/normal.encoding.json"] = ("application/json", json.dumps(evidence).encode())
+    # One continuous playback, without seeking or replacing the video/source,
+    # leaves time for actual reparent/resize/scroll and paused-proxy regressions.
+    compositor = directory / "compositor.mp4"
+    subprocess.run(common + [
+        "-stream_loop", "7", "-i", str(video),
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=24",
+        "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-ac", "2",
+        "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "64k", "-t", "24",
+        "-movflags", "+faststart", str(compositor),
+    ], check=True)
+    evidence = video_encoding_evidence(compositor, "Constrained Baseline", False, 192)
+    resources["/media/compositor.mp4"] = ("video/mp4", compositor.read_bytes())
+    resources["/media/compositor.encoding.json"] = ("application/json", json.dumps(evidence).encode())
     for profile in ("main", "high"):
         encoded = directory / f"video-{profile}.mp4"
         muxed = directory / f"normal-{profile}.mp4"
