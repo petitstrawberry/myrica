@@ -426,6 +426,8 @@ fn engine_probe(
         return Ok(());
     }
     engine.render(800, 600, 1.0)?;
+    #[cfg(feature = "backend-webkit-vulkan")]
+    css_animation_probe(&mut engine, base)?;
     sender
         .send(OwnerMessage::PageProgress)
         .map_err(|error| error.to_string())?;
@@ -907,6 +909,66 @@ fn inspect_painting_workers(frame: &ProbeFrame) -> Result<(), String> {
     if frame.rgba.chunks_exact(4).any(|pixel| pixel[3] != 255) {
         return Err("painting worker frame has uninitialized/transparent pixels".into());
     }
+    Ok(())
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn css_animation_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    fn red_box(frame: &ProbeFrame) -> Result<(u32, u8), String> {
+        let mut left = frame.width;
+        let mut green = 0;
+        let mut pixels = 0;
+        for y in 40..104 {
+            for x in 0..320 {
+                let i = ((y * frame.width + x) * 4) as usize;
+                let p = &frame.rgba[i..i + 4];
+                if p[0] > 240 && p[1] < 200 && p[2] < 200 && p[3] == 255 {
+                    left = left.min(x);
+                    green = green.max(p[1]);
+                    pixels += 1;
+                }
+            }
+        }
+        if pixels < 3900 {
+            return Err(format!("CSS animated box missing: {pixels} pixels"));
+        }
+        Ok((left, green))
+    }
+    let revision = engine.cached_revision();
+    engine
+        .navigate(&format!("{base}/css-animations"))
+        .map_err(|e| e.to_string())?;
+    let first = await_image_frame(engine, "css-animations", revision, |f| {
+        red_box(f).map(|_| ())
+    })?;
+    let before = engine
+        .compositing_statistics()
+        .map_err(|e| e.to_string())?
+        .unwrap();
+    let initial = red_box(&first)?;
+    let mut moved = false;
+    let mut faded = false;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        engine.tick();
+        let frame = engine.render(800, 600, 1.0)?;
+        let observed = red_box(&frame)?;
+        moved |= observed.0.abs_diff(initial.0) > 30;
+        faded |= observed.1.abs_diff(initial.1) > 20;
+        thread::sleep(Duration::from_millis(10));
+    }
+    let after = engine
+        .compositing_statistics()
+        .map_err(|e| e.to_string())?
+        .unwrap();
+    if !moved || !faded || before.tile_paints != after.tile_paints {
+        return Err(format!(
+            "CSS transform/opacity failed: moved={moved} faded={faded} tiles={before:?}->{after:?}"
+        ));
+    }
+    println!(
+        "MYRICA_WEBKIT_SMOKE_PASS stage=css-transform-opacity-animation pixels=changed tile_delta=0"
+    );
     Ok(())
 }
 

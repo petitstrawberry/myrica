@@ -552,6 +552,16 @@ canvas{position:absolute;top:320px;width:160px;height:160px}#copy{left:16px}#pat
 </script>""".encode("utf-8")
 
 
+CSS_ANIMATION_PAGE = b"""<!doctype html><meta charset="utf-8"><title>css-animations</title>
+<style>
+html,body{margin:0;background:white}
+#box{position:absolute;left:16px;top:40px;width:64px;height:64px;background:red;
+will-change:transform,opacity;animation:move 2s linear infinite alternate,fade 2s linear infinite alternate}
+@keyframes move{from{transform:translateX(0)}to{transform:translateX(160px)}}
+@keyframes fade{from{opacity:1}to{opacity:.4}}
+</style><div id="box"></div>"""
+
+
 IMAGE_PAGE = b"""<!doctype html><meta charset="utf-8"><title>images-loading</title>
 <style>
 html,body{margin:0;background:white;width:800px;min-height:1500px}
@@ -1049,6 +1059,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MEDIA_PAGE)
         elif path in ("/", "/main"):
             self.reply(200, "text/html; charset=utf-8", MAIN)
+        elif path == "/css-animations":
+            self.reply(200, "text/html; charset=utf-8", CSS_ANIMATION_PAGE)
         elif path in ("/images", "/images-firstpaint"):
             self.reply(200, "text/html; charset=utf-8", IMAGE_PAGE)
         elif path == "/painting-workers":
