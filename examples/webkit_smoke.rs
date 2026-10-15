@@ -171,7 +171,10 @@ impl Drop for Owner {
 fn main() -> std::process::ExitCode {
     // Configure diagnostics before creating either native owner or HTTP worker.
     // SAFETY: The probe is still single-threaded during process initialization.
-    unsafe { std::env::set_var("MYRICA_WEBKIT_TRACE_SHUTDOWN", "1") };
+    unsafe {
+        std::env::set_var("MYRICA_WEBKIT_TRACE_SHUTDOWN", "1");
+        std::env::set_var("SCARLET_GC_DIAGNOSTICS", "1");
+    }
     match run() {
         Ok(()) => {
             println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-joined");

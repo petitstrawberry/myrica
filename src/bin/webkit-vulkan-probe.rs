@@ -97,12 +97,13 @@ fn gpu_page_contract() -> Result<(), String> {
             let html = r#"<!doctype html><meta charset="utf-8"><title>GPU page contract</title>
 <style>html,body{margin:0;background:white;width:160px;height:112px}
 #r,#b{position:absolute;width:32px;height:32px}#r{left:16px;top:16px;background:red}
-#b{left:64px;top:32px;background:blue;border-radius:8px}#tap{position:absolute;left:112px;top:72px;width:40px;height:32px}
+#b{left:64px;top:32px;background:blue;border-radius:8px}#tap,#red-tap{position:absolute;left:112px;width:40px;height:32px}
+#tap{top:72px}#red-tap{top:8px}
 #marker{position:absolute;left:2px;top:88px;font:12px sans-serif}</style>
-<div id="r"></div><div id="b"></div><div id="tap" onclick="flip()">tap</div><div id="marker">Loading</div>
+<div id="r"></div><div id="b"></div><div id="tap" onclick="flip()">tap</div><div id="red-tap" onclick="yellow()">red</div><div id="marker">Loading</div>
 <script>let green=false;document.getElementById('marker').textContent='JS executed';
-function flip(){green=!green;document.getElementById('b').style.background=green?'lime':'blue';
-document.getElementById('marker').textContent=green?'clicked':'JS executed';}</script>"#;
+function flip(){green=!green;document.getElementById('b').style.background=green?'lime':'blue';}
+function yellow(){document.getElementById('r').style.background='yellow';}</script>"#;
             let header = ffi::Header {
                 name: ffi::Bytes::from_str("Content-Type"),
                 value: ffi::Bytes::from_str("text/html; charset=utf-8"),
@@ -140,7 +141,8 @@ document.getElementById('marker').textContent=green?'clicked':'JS executed';}</s
             }
             check(ffi::scarlet_webview_focus(view, 1), "focus")?;
             let first = acquire_gpu(view)?;
-            verify_gpu_pixels(view, first.generation, [255, 0, 0, 255])?;
+            let first_id = gpu_image_id(view, first.generation)?;
+            verify_gpu_pixels(view, first.generation, [0, 0, 255, 255], [255, 0, 0, 255])?;
             let mut marker = ffi::Bytes::default();
             check(
                 ffi::scarlet_webview_text_content(
@@ -153,14 +155,18 @@ document.getElementById('marker').textContent=green?'clicked':'JS executed';}</s
             if std::slice::from_raw_parts(marker.data, marker.length) != b"JS executed" {
                 return Err("JavaScript marker did not execute".into());
             }
-            click_fixture(view)?;
+            click_fixture(view, 240.0, 160.0)?;
             let second = acquire_gpu(view)?;
+            let second_id = gpu_image_id(view, second.generation)?;
+            if first_id == second_id {
+                return Err("concurrently leased GPU pages share an allocation identity".into());
+            }
             if second.generation <= first.generation {
                 return Err("page generation did not advance".into());
             }
-            verify_gpu_pixels(view, second.generation, [0, 255, 0, 255])?;
+            verify_gpu_pixels(view, second.generation, [0, 0, 255, 255], [0, 255, 0, 255])?;
             // Changing DOM/painting a second image must not mutate a leased first image.
-            verify_gpu_pixels(view, first.generation, [255, 0, 0, 255])?;
+            verify_gpu_pixels(view, first.generation, [0, 0, 255, 255], [255, 0, 0, 255])?;
             let mut capacity = 99;
             check(
                 ffi::scarlet_webview_gpu_frame_capacity(view, &mut capacity),
@@ -169,25 +175,95 @@ document.getElementById('marker').textContent=green?'clicked':'JS executed';}</s
             if capacity != 0 {
                 return Err("two live frames did not apply backpressure".into());
             }
+            // A second, distant damage rect arrives while both images remain
+            // leased. Reusing A must accumulate B's green update as well.
+            click_fixture(view, 240.0, 40.0)?;
+            let mut blocked = ffi::GpuFrame::default();
+            if ffi::scarlet_webview_gpu_frame(view, &mut blocked) != ffi::EMPTY
+                || blocked.handle != -1
+                || blocked.generation != 0
+            {
+                return Err("dirty page bypassed two-image lease backpressure".into());
+            }
+            verify_gpu_pixels(view, first.generation, [0, 0, 255, 255], [255, 0, 0, 255])?;
+            verify_gpu_pixels(view, second.generation, [0, 0, 255, 255], [0, 255, 0, 255])?;
             close_frame(first.handle);
             check(
                 ffi::scarlet_webview_release_gpu_frame(view, first.generation),
                 "release first",
             )?;
-            click_fixture(view)?;
-            let third = acquire_gpu(view)?;
-            verify_gpu_pixels(view, third.generation, [255, 0, 0, 255])?;
-            verify_gpu_pixels(view, second.generation, [0, 255, 0, 255])?;
-            close_frame(second.handle);
-            close_frame(third.handle);
+            verify_stale_image_id(view, first.generation)?;
+            let mut before = ffi::PaintStatistics::default();
             check(
-                ffi::scarlet_webview_release_gpu_frame(view, second.generation),
-                "release second",
+                ffi::scarlet_webview_paint_statistics(view, &mut before),
+                "paint statistics before reuse",
             )?;
+            let third = acquire_gpu(view)?;
+            if gpu_image_id(view, third.generation)? != first_id
+                || third.generation <= second.generation
+            {
+                return Err("third page did not reuse A with a fresh generation".into());
+            }
+            verify_stale_image_id(view, first.generation)?;
+            verify_gpu_pixels(view, third.generation, [0, 255, 255, 255], [0, 255, 0, 255])?;
+            verify_gpu_pixels(view, second.generation, [0, 0, 255, 255], [0, 255, 0, 255])?;
+            let mut after = ffi::PaintStatistics::default();
+            check(
+                ffi::scarlet_webview_paint_statistics(view, &mut after),
+                "paint statistics after reuse",
+            )?;
+            let painted = after
+                .painted_pixels
+                .checked_sub(before.painted_pixels)
+                .ok_or("paint statistics regressed")?;
+            if after.paints != before.paints + 1 || painted == 0 || painted >= 320 * 224 {
+                return Err(format!(
+                    "GPU reuse failed bounded DPR2 damage: paints {} -> {}, painted_pixels={painted}",
+                    before.paints, after.paints
+                ));
+            }
+            println!(
+                "PASS: GPU allocation IDs A={first_id} B={second_id}, A reuse accumulates distant damage, painted_pixels={painted}"
+            );
+            close_frame(third.handle);
             check(
                 ffi::scarlet_webview_release_gpu_frame(view, third.generation),
                 "release third",
             )?;
+            verify_stale_image_id(view, third.generation)?;
+            check(ffi::scarlet_webview_resize(view, 384, 256, 2.0), "resize")?;
+            check(ffi::scarlet_webview_tick(view), "resize tick")?;
+            let resized = acquire_gpu(view)?;
+            let resized_id = gpu_image_id(view, resized.generation)?;
+            if resized.width != 384
+                || resized.height != 256
+                || resized_id == first_id
+                || resized_id == second_id
+            {
+                return Err("resized GPU page reused an old allocation identity or extent".into());
+            }
+            verify_gpu_pixels(
+                view,
+                resized.generation,
+                [0, 255, 255, 255],
+                [0, 255, 0, 255],
+            )?;
+            verify_gpu_pixels(view, second.generation, [0, 0, 255, 255], [0, 255, 0, 255])?;
+            if gpu_image_id(view, second.generation)? != second_id {
+                return Err("resize changed the identity of a still-leased page".into());
+            }
+            close_frame(resized.handle);
+            check(
+                ffi::scarlet_webview_release_gpu_frame(view, resized.generation),
+                "release resized",
+            )?;
+            verify_stale_image_id(view, resized.generation)?;
+            close_frame(second.handle);
+            check(
+                ffi::scarlet_webview_release_gpu_frame(view, second.generation),
+                "release second",
+            )?;
+            verify_stale_image_id(view, second.generation)?;
             println!(
                 "PASS: WebCore DOM/CSS/JS/input Retina GPU pages, two-image backpressure and immutable leased readback"
             );
@@ -211,9 +287,44 @@ unsafe fn acquire_gpu(
     }
 }
 #[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn gpu_image_id(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    generation: u64,
+) -> Result<u64, String> {
+    let mut image_id = 0;
+    let status = unsafe {
+        myrica_webkit_sys::scarlet_webview_gpu_frame_image_id(view, generation, &mut image_id)
+    };
+    if status != myrica_webkit_sys::OK || image_id == 0 {
+        Err(format!(
+            "leased GPU image identity: status={status} id={image_id}"
+        ))
+    } else {
+        Ok(image_id)
+    }
+}
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn verify_stale_image_id(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    generation: u64,
+) -> Result<(), String> {
+    let mut image_id = u64::MAX;
+    let status = unsafe {
+        myrica_webkit_sys::scarlet_webview_gpu_frame_image_id(view, generation, &mut image_id)
+    };
+    if status != myrica_webkit_sys::STALE_REQUEST || image_id != 0 {
+        Err(format!(
+            "released GPU image identity was not cleared: status={status} id={image_id}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+#[cfg(feature = "backend-webkit-vulkan")]
 unsafe fn verify_gpu_pixels(
     view: *mut myrica_webkit_sys::ScarletWebView,
     generation: u64,
+    red: [u8; 4],
     blue: [u8; 4],
 ) -> Result<(), String> {
     let mut pixels = myrica_webkit_sys::Pixels::default();
@@ -223,10 +334,22 @@ unsafe fn verify_gpu_pixels(
     if status != 0 {
         return Err(format!("GPU page readback: {status}"));
     }
+    if pixels.data.is_null()
+        || pixels.width < 320
+        || pixels.height < 224
+        || pixels.stride < pixels.width * 4
+        || (pixels.stride as usize)
+            .checked_mul(pixels.height as usize)
+            .is_none_or(|length| length > pixels.length)
+        || pixels.format != myrica_webkit_sys::PIXEL_FORMAT_BGRA_PREMULTIPLIED
+        || pixels.generation != generation
+    {
+        return Err("GPU page readback returned invalid metadata".into());
+    }
     let bytes = unsafe { std::slice::from_raw_parts(pixels.data, pixels.length) };
     for (x, y, expected) in [
         (0, 0, [255; 4]),
-        (24, 24, [0, 0, 255, 255]),
+        (24, 24, red),
         (64, 32, [255; 4]),
         (72, 40, blue),
     ] {
@@ -253,16 +376,20 @@ unsafe fn verify_gpu_pixels(
     Ok(())
 }
 #[cfg(feature = "backend-webkit-vulkan")]
-unsafe fn click_fixture(view: *mut myrica_webkit_sys::ScarletWebView) -> Result<(), String> {
+unsafe fn click_fixture(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
     for kind in [1, 2] {
         let event = myrica_webkit_sys::MouseEvent {
             kind,
             button: 1,
             click_count: 1,
-            x: 240.0,
-            y: 160.0,
-            global_x: 240.0,
-            global_y: 160.0,
+            x,
+            y,
+            global_x: x,
+            global_y: y,
             ..Default::default()
         };
         let mut handled = 0;
