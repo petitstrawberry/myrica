@@ -490,24 +490,10 @@ fn run_engine_polling(
                 }
             }
         }
-        if tick_due {
-            dirty |= backend.tick();
-            next_poll_at = Instant::now() + poll_interval;
-        }
-        if snapshot_due {
-            let snapshot = backend.snapshot();
-            if last_snapshot
-                .as_ref()
-                .is_none_or(|(previous_generation, previous)| {
-                    *previous_generation != generation || *previous != snapshot
-                })
-            {
-                shared.publish(generation, snapshot.clone(), None);
-                last_snapshot = Some((generation, snapshot));
-            }
-        }
+        // A finished image can reach the UI while the following JS/timer tick
+        // runs. Navigation has already canceled any obsolete native submission.
         if let Some((submitted_generation, submitted_viewport)) = pending_frame
-            && Instant::now() >= next_completion_at
+            && (tick_due || Instant::now() >= next_completion_at)
         {
             if let Some(frame) = backend.poll_pending_frame() {
                 let identity = (submitted_generation, submitted_viewport, frame.revision);
@@ -524,6 +510,22 @@ fn run_engine_polling(
                 pending_frame = None;
             }
             next_completion_at = Instant::now() + GPU_COMPLETION_POLL_INTERVAL;
+        }
+        if tick_due {
+            dirty |= backend.tick();
+            next_poll_at = Instant::now() + poll_interval;
+        }
+        if snapshot_due {
+            let snapshot = backend.snapshot();
+            if last_snapshot
+                .as_ref()
+                .is_none_or(|(previous_generation, previous)| {
+                    *previous_generation != generation || *previous != snapshot
+                })
+            {
+                shared.publish(generation, snapshot.clone(), None);
+                last_snapshot = Some((generation, snapshot));
+            }
         }
         if dirty && pending_frame.is_none() && !waiting_for_lease && Instant::now() >= next_frame_at
         {
@@ -981,6 +983,9 @@ mod tests {
         completed: Receiver<()>,
         pending: Option<(u64, u32, u32)>,
         revision: u64,
+        ticks: u32,
+        render_gate: Option<Receiver<()>>,
+        tick_gate: Option<Receiver<()>>,
     }
     impl BrowserBackend for AsyncBackend {
         fn navigate(&mut self, _: &str) -> Result<(), BackendError> {
@@ -990,7 +995,13 @@ mod tests {
         fn go_back(&mut self) {}
         fn go_forward(&mut self) {}
         fn tick(&mut self) -> bool {
+            self.ticks += 1;
             self.signals.send(AsyncSignal::Tick).unwrap();
+            if self.ticks == 2
+                && let Some(gate) = self.tick_gate.take()
+            {
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             false
         }
         fn render(&mut self, _: u32, _: u32, _: f32) -> BrowserFrame {
@@ -1006,6 +1017,9 @@ mod tests {
             self.signals
                 .send(AsyncSignal::Submit(self.revision))
                 .unwrap();
+            if let Some(gate) = self.render_gate.take() {
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             None
         }
         fn has_pending_frame(&mut self) -> bool {
@@ -1044,6 +1058,17 @@ mod tests {
         Receiver<AsyncSignal>,
         Sender<()>,
     ) {
+        async_worker_with_gates(None, None)
+    }
+    fn async_worker_with_gates(
+        render_gate: Option<Receiver<()>>,
+        tick_gate: Option<Receiver<()>>,
+    ) -> (
+        Arc<Shared>,
+        thread::JoinHandle<()>,
+        Receiver<AsyncSignal>,
+        Sender<()>,
+    ) {
         let (signals, received) = mpsc::channel();
         let (complete, completed) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -1067,6 +1092,9 @@ mod tests {
                     completed,
                     pending: None,
                     revision: 0,
+                    ticks: 0,
+                    render_gate,
+                    tick_gate,
                 }),
                 &worker_shared,
                 Duration::from_secs(5),
@@ -1085,6 +1113,34 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn completed_frame_is_published_before_a_blocked_engine_tick() {
+        let (resume_submit, submit_gate) = mpsc::channel();
+        let (resume_tick, tick_gate) = mpsc::channel();
+        let (shared, worker, received, complete) =
+            async_worker_with_gates(Some(submit_gate), Some(tick_gate));
+        await_async(&received, AsyncSignal::Submit(1));
+        // The owner is still inside the first submit. Queue completion and a
+        // timer/network wake together before allowing its next iteration.
+        shared.mailbox.lock().unwrap().engine_woken = true;
+        complete.send(()).unwrap();
+        resume_submit.send(()).unwrap();
+        await_async(&received, AsyncSignal::Tick);
+        // Tick is blocked, just as a long native JS callback would block it.
+        // This observes actual worker publication, not an elapsed-time target.
+        let published = {
+            let mailbox = shared.mailbox.lock().unwrap();
+            mailbox
+                .update
+                .as_ref()
+                .and_then(|update| update.frame.as_ref())
+                .map(|(viewport, frame)| (*viewport, frame.revision))
+        };
+        resume_tick.send(()).unwrap();
+        stop_test_worker(&shared, worker);
+        assert_eq!(published, Some((VIEWPORT, 1)));
     }
 
     #[test]
