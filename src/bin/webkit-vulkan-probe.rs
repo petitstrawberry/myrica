@@ -272,6 +272,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 "PASS: WebCore DOM/CSS/JS/input Retina GPU pages, two-image backpressure and immutable leased readback"
             );
             compositor_page_contract(view)?;
+            filter_bounds_contract(view)?;
             pending_cover_boundary_contract(view)?;
             let mut compositor = ffi::CompositingStatistics::default();
             if ffi::scarlet_webview_compositing_statistics(view, &mut compositor) == ffi::OK {
@@ -578,6 +579,22 @@ const COMPOSITOR_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>com
 <div id="large" onclick="document.getElementById('scroll').scrollTop=10316"></div>
 <script>const colours=['red','blue','lime','yellow','magenta','cyan'];for(let i=0;i<100;i++){const stripe=document.createElement('div');stripe.style.background=colours[i%6];document.getElementById('stripes').appendChild(stripe)}</script>"#;
 
+// At DPR2 the first filter is wider than the old 2048px clamp but smaller
+// than the device's 4096px limit. The last filter needs the offscreen source at
+// x=5200 CSS px to cast its shadow back into the viewport. Reverse mapping the
+// visible output therefore cannot reduce its input to a small visible texture:
+// source plus reverse-shadow bounds exceed 10000 physical pixels.
+#[cfg(feature = "backend-webkit-vulkan")]
+const FILTER_BOUNDS_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>filter-bounds-ready</title>
+<style>html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:white}
+#wide{position:absolute;left:16px;top:24px;width:1248px;height:96px;background:linear-gradient(to right,red 0%,red 40%,blue 40%,blue 90%,lime 90%,lime 100%);filter:drop-shadow(0 24px 2px black);transform:translateZ(0)}
+#clip{position:absolute;left:32px;top:164px;width:520px;height:220px;overflow:hidden;transform:translateZ(0)}
+#multiple{position:absolute;left:16px;top:16px;width:160px;height:96px;background:red;filter:drop-shadow(240px 0 0 lime) drop-shadow(0 120px 0 blue) blur(2px);transform:translateZ(0)}
+#far{position:absolute;left:0;top:400px;width:5400px;height:160px;filter:drop-shadow(-5000px 0 0 lime);transform:translateZ(0)}
+#far div{position:absolute;top:16px}#near-source{left:16px;width:64px;height:64px;background:red}#far-source{left:5200px;width:96px;height:96px;background:blue}
+</style><div id="wide"></div><div id="clip"><div id="multiple"></div></div>
+<div id="far"><div id="near-source"></div><div id="far-source"></div></div>"#;
+
 #[cfg(feature = "backend-webkit-vulkan")]
 const PENDING_COVER_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>cover-ready</title>
 <style>html,body{margin:0;width:640px;height:480px;overflow:hidden;background:white}
@@ -821,6 +838,88 @@ unsafe fn settle_contract_composition(
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn filter_bounds_contract(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    check(
+        unsafe { ffi::scarlet_webview_resize(view, 2560, 1440, 2.0) },
+        "resize DPR2 filter bounds fixture",
+    )?;
+    unsafe {
+        contract_navigation(
+            view,
+            "https://myrica.test/filter-bounds",
+            FILTER_BOUNDS_HTML,
+        )
+    }?;
+    let (frame, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            if width != 2560 || pixels.len() != 2560 * 1440 * 4 {
+                return Err(format!(
+                    "DPR2 filter frame extent mismatch: width={width} length={}",
+                    pixels.len()
+                ));
+            }
+            // All positions are physical pixels. The blue samples on both
+            // sides of x=2048 must survive the old per-surface clamp boundary.
+            for (x, y, rgba) in [
+                (80, 120, [255, 0, 0, 255]),
+                (1400, 120, [0, 0, 255, 255]),
+                (2032, 120, [0, 0, 255, 255]),
+                (2040, 120, [0, 0, 255, 255]),
+                (2048, 120, [0, 0, 255, 255]),
+                (2056, 120, [0, 0, 255, 255]),
+                (2440, 120, [0, 255, 0, 255]),
+                (1400, 264, [0, 0, 0, 255]), // Shadow below the source.
+                (16, 120, [255; 4]),
+                (256, 456, [255, 0, 0, 255]),
+                (736, 456, [0, 255, 0, 255]),
+                (256, 688, [0, 0, 255, 255]),
+                (736, 688, [0, 0, 255, 255]), // Shadow of the first shadow.
+                (256, 752, [0, 0, 255, 255]), // Inside the ancestor clip.
+                (256, 784, [255; 4]),         // Outside the ancestor clip.
+                (1000, 456, [255; 4]),
+                (96, 896, [255, 0, 0, 255]),  // Visible near source.
+                (496, 928, [0, 255, 0, 255]), // Shadow from x=5200 CSS source.
+                (720, 896, [255; 4]),
+            ] {
+                contract_pixel(pixels, width, x, y, rgba)?;
+            }
+            // Blur must extend beyond the source and first shadow. These
+            // one-sigma fringe pixels reject both white (missing outset) and
+            // an opaque/unblurred rectangle; supported Skia kernels may differ.
+            for (x, y, rgba) in [
+                (92, 456, [255u8, 214, 214, 255]),
+                (572, 456, [214, 255, 214, 255]),
+            ] {
+                let offset = (y * width as usize + x) * 4;
+                let expected = [rgba[2], rgba[1], rgba[0], rgba[3]];
+                if !pixels.get(offset..offset + 4).is_some_and(|actual| {
+                    actual[3] == 255
+                        && actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(&a, b)| a.abs_diff(b) <= 32)
+                }) {
+                    return Err(format!(
+                        "multiple-filter fringe ({x},{y}) expected RGBA {rgba:?} (+/-32), got BGRA {:?}",
+                        pixels.get(offset..offset + 4)
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }?;
+    drop(frame);
+    unsafe { settle_contract_composition(view) }?;
+    println!(
+        "PASS: DPR2 filter 2496px source across 2048px boundary, multiple-shadow/blur outsets and ancestor clip, >10000px reverse-input downsample preserves far-source shadow"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
