@@ -595,6 +595,10 @@ fn engine_probe(
     wait_title(&mut engine, "view-transition-ready")?;
     let before = engine.render(800, 600, 1.0)?;
     assert_pixel(&before, 30, 30, [0x12, 0x34, 0x56, 255])?;
+    let composited = engine
+        .compositing_statistics()
+        .map_err(|error| error.to_string())?
+        .is_some();
     click(&mut engine, 60.0, 155.0);
     wait_title(&mut engine, "view-transition-done")?;
     let observation = engine
@@ -603,15 +607,20 @@ fn engine_probe(
         .ok_or("view transition observation missing")?;
     let state: serde_json::Value =
         serde_json::from_str(&observation).map_err(|error| error.to_string())?;
-    verify_skipped_view_transition(&state)?;
+    verify_view_transition(&state, composited)?;
     let after = engine.render(800, 600, 1.0)?;
     assert_pixel(&after, 30, 30, [0x65, 0x43, 0x21, 255])?;
     if after.revision == before.revision {
         return Err(String::from(
-            "skipped view transition did not repaint its DOM update",
+            "view transition did not repaint its DOM update",
         ));
     }
-    println!("MYRICA_WEBKIT_SMOKE_PASS stage=view-transition-skipped-dom-update state={state}");
+    let stage = if composited {
+        "view-transition-composited-dom-update"
+    } else {
+        "view-transition-skipped-dom-update"
+    };
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage={stage} state={state}");
 
     engine
         .navigate(&format!("{base}/js-execution"))
@@ -906,11 +915,21 @@ fn verify_js_execution(state: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_skipped_view_transition(state: &serde_json::Value) -> Result<(), String> {
+fn verify_view_transition(state: &serde_json::Value, composited: bool) -> Result<(), String> {
+    // The actual engine capability determines one strict expected outcome:
+    // retained compositing runs the transition; the legacy port skips it.
+    let ready_matches = if composited {
+        state["ready"].as_str() == Some("fulfilled")
+            && state
+                .as_object()
+                .is_some_and(|state| state.get("readyError") == Some(&serde_json::Value::Null))
+    } else {
+        state["ready"].as_str() == Some("rejected")
+            && state["readyError"].as_str() == Some("InvalidStateError")
+    };
     if state["calls"].as_u64() != Some(1)
         || state["callbackAsync"].as_bool() != Some(true)
-        || state["ready"].as_str() != Some("rejected")
-        || state["readyError"].as_str() != Some("InvalidStateError")
+        || !ready_matches
         || state["updateCallbackDone"].as_str() != Some("fulfilled")
         || state["finished"].as_str() != Some("fulfilled")
         || !state
@@ -918,7 +937,7 @@ fn verify_skipped_view_transition(state: &serde_json::Value) -> Result<(), Strin
             .is_some_and(|state| state.get("active") == Some(&serde_json::Value::Null))
     {
         return Err(format!(
-            "skipped view transition violated its callback or promise contract: {state}"
+            "view transition violated its callback or promise contract (composited={composited}): {state}"
         ));
     }
     Ok(())
