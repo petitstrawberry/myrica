@@ -1646,18 +1646,24 @@ fn youtube_hover_probe(
     engine: &mut ProbeEngine,
     sender: &mpsc::Sender<OwnerMessage>,
 ) -> Result<(), String> {
-    let before = engine
+    let mut before = engine
         .media_statistics(0)
         .map_err(|e| e.to_string())?
         .ok_or("YouTube video is absent before hover probe")?;
     let started = Instant::now();
+    let mut epoch_started = started;
+    let mut previous_time = before.current_time;
+    let mut epoch_resets = 0;
     let mut heartbeat = started;
     let mut last_presentation = started;
     let mut frames = before.presented_frames;
     let mut max_gap = Duration::ZERO;
     let mut max_turn = Duration::ZERO;
     let mut turns = 0;
-    while started.elapsed() < Duration::from_secs(12) {
+    while epoch_started.elapsed() < Duration::from_secs(12) {
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("YouTube media kept changing during hover probe".into());
+        }
         let turn = Instant::now();
         // Genuine pointer events alternately expose the player's hover controls
         // and move onto the recommendations. Do not inject page scripts.
@@ -1679,10 +1685,20 @@ fn youtube_hover_probe(
         // an exclusive GPU duration. Report freezes instead of hiding them in
         // an average frame rate or asserting an arbitrary timing threshold.
         max_gap = max_gap.max(observed.duration_since(last_presentation));
-        if now.presented_frames > frames {
+        if now.presented_frames < frames || now.current_time + 0.25 < previous_time {
+            // YouTube replaces an ad's media session with the main video;
+            // quality changes may also reset native decoder counters. Require
+            // a fresh continuous epoch instead of comparing unrelated clocks.
+            epoch_resets += 1;
+            before = now;
+            epoch_started = observed;
+            frames = before.presented_frames;
+            last_presentation = observed;
+        } else if now.presented_frames > frames {
             frames = now.presented_frames;
             last_presentation = observed;
         }
+        previous_time = now.current_time;
         turns += 1;
         if heartbeat.elapsed() >= Duration::from_secs(5) {
             sender
@@ -1697,8 +1713,9 @@ fn youtube_hover_probe(
         .map_err(|e| e.to_string())?
         .ok_or("YouTube video is absent after hover probe")?;
     println!(
-        "MYRICA_WEBKIT_INTERACTION_METRIC stage=youtube-hover elapsed_ms={} turns={} max_owner_turn_us={} max_observed_presentation_gap_ms={} before={before:?} after={after:?}",
+        "MYRICA_WEBKIT_INTERACTION_METRIC stage=youtube-hover elapsed_ms={} epoch_resets={} turns={} max_owner_turn_us={} max_observed_presentation_gap_ms={} before={before:?} after={after:?}",
         started.elapsed().as_millis(),
+        epoch_resets,
         turns,
         max_turn.as_micros(),
         max_gap.as_millis(),
