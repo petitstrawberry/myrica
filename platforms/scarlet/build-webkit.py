@@ -112,6 +112,7 @@ def main():
         "-DENABLE_C_LOOP=OFF",
         f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
         f"-DSCARLET_USE_SKIA_VULKAN={'ON' if args.vulkan_rendering else 'OFF'}",
+        f"-DSCARLET_USE_COORDINATED_COMPOSITOR={'ON' if args.vulkan_rendering else 'OFF'}",
         f"-DSCARLET_USE_NATIVE_MEDIA={'ON' if args.media else 'OFF'}",
         f"-DENABLE_MEDIA_SOURCE={'ON' if args.media else 'OFF'}",
         "-DUSE_THIN_ARCHIVES=OFF", "-DUSE_PCH_CODEGEN=ON", "-DUSE_HEADER_MAPS=ON",
