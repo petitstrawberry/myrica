@@ -343,6 +343,11 @@ impl WebKitBackend {
     }
 
     fn drain_completions(&mut self) -> Result<bool, BackendError> {
+        // Completing a response can synchronously execute page JavaScript.
+        // Yield between responses so a burst of images/scripts cannot consume
+        // the owner turn before queued input, media polling and painting run.
+        // A single WebCore callback must still run to completion on its owner.
+        let deadline = Instant::now() + Duration::from_millis(4);
         let mut changed = false;
         for _ in 0..128 {
             let Some(completion) = self.network.try_recv() else {
@@ -382,6 +387,13 @@ impl WebKitBackend {
                         check(result, "complete WebCore resource")?;
                     }
                 }
+            }
+            if Instant::now() >= deadline {
+                // The network notification may already have been consumed by
+                // this turn. Keep remaining completions runnable without
+                // waiting for another response or the periodic engine poll.
+                (self.wake)();
+                break;
             }
         }
         Ok(changed)

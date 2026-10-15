@@ -212,7 +212,10 @@ fn run() -> Result<(), String> {
         .nth(1)
         .ok_or("usage: webkit-smoke http://HOST:PORT | --pages URL...")?;
     let pages: Vec<String> = if base == "--pages" || base == "--video-pages" {
-        std::env::args().skip(2).collect()
+        std::env::args()
+            .skip(2)
+            .filter(|argument| argument != "--youtube-comments")
+            .collect()
     } else {
         Vec::new()
     };
@@ -1473,6 +1476,9 @@ fn video_page_probe_inner(
                     );
                     if is_youtube_url(url) {
                         youtube_theater_probe(engine, sender, statistics, frame)?;
+                        if std::env::args().any(|argument| argument == "--youtube-comments") {
+                            youtube_comments_probe(engine, sender)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -1623,6 +1629,90 @@ fn youtube_theater_probe(
         }
     }
     Ok(())
+}
+
+fn youtube_comments_probe(
+    engine: &mut ProbeEngine,
+    sender: &mpsc::Sender<OwnerMessage>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    engine.handle_input(BrowserInput::Wheel {
+        delta_x: 0.0,
+        delta_y: -1100.0,
+        x: 640.0,
+        y: 540.0,
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut heartbeat = Instant::now();
+    loop {
+        engine.tick();
+        engine.render(1280, 720, 1.0)?;
+        if let Some(comment) = engine
+            .text_content("content-text")
+            .map_err(|e| e.to_string())?
+        {
+            if !comment.trim().is_empty() {
+                println!(
+                    "MYRICA_WEBKIT_SMOKE_PASS stage=youtube-comments elapsed_ms={} actual_comment_bytes={}",
+                    started.elapsed().as_millis(),
+                    comment.len()
+                );
+                let before = engine
+                    .media_statistics(0)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("YouTube video disappeared during comment loading")?;
+                engine.handle_input(BrowserInput::Wheel {
+                    delta_x: 0.0,
+                    delta_y: 1100.0,
+                    x: 640.0,
+                    y: 240.0,
+                });
+                let resume_deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    engine.tick();
+                    engine.render(1280, 720, 1.0)?;
+                    let now = engine
+                        .media_statistics(0)
+                        .map_err(|e| e.to_string())?
+                        .ok_or("YouTube video disappeared on comment scroll return")?;
+                    if now.current_time > before.current_time + 0.5
+                        && now.presented_frames >= before.presented_frames + 4
+                        && now.paused == 0
+                    {
+                        println!(
+                            "MYRICA_WEBKIT_SMOKE_PASS stage=youtube-comments-player-return before={before:?} after={now:?}"
+                        );
+                        return Ok(());
+                    }
+                    if Instant::now() >= resume_deadline {
+                        return Err(format!(
+                            "YouTube player stalled after comments: before={before:?} after={now:?}"
+                        ));
+                    }
+                    if heartbeat.elapsed() >= Duration::from_secs(5) {
+                        sender
+                            .send(OwnerMessage::PageProgress)
+                            .map_err(|e| e.to_string())?;
+                        heartbeat = Instant::now();
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "YouTube comments did not load after scrolling: {:?}",
+                engine.snapshot()
+            ));
+        }
+        if heartbeat.elapsed() >= Duration::from_secs(5) {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|e| e.to_string())?;
+            heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn verify_media_presentation_history(state: &serde_json::Value, path: &str) -> Result<(), String> {
