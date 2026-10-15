@@ -166,6 +166,18 @@ and requires advancing media time, real decoded/painted frames and changing
 GPU pixels within the video rectangle. It keeps the site's player and source
 selection intact and joins the native owner at exit.
 
+Add `--youtube-comments --youtube-search` to exercise comment scrolling,
+continuing playback on return, and the site's native search suggestions. The
+probe reports input and owner-turn times; diagnostic GPU readback makes its
+frame counts unsuitable for measuring ordinary GUI playback throughput.
+
+On a Scarlet kernel with `sync-debug`, the `scarlet_cpu_sample` example accepts
+`PID [SECONDS]` and samples that process's threads through `GetTaskDebugInfo`.
+It prints timer-observed instruction addresses weighted by CPU-time deltas,
+alongside syscall/validity flags. Resolve addresses against the matching ELF;
+shared-library addresses also require their load biases. Samples indicate
+execution regions rather than precise call stacks or individual callback cost.
+
 ## Architecture
 
 `BrowserBackend` is intentionally a WebView boundary rather than a common DOM
