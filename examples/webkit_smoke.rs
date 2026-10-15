@@ -50,6 +50,9 @@ impl ProbeEngine {
             cached: None,
         })
     }
+    fn cached_revision(&self) -> u64 {
+        self.cached.as_ref().map_or(0, |frame| frame.revision)
+    }
     fn release_returned(&mut self) {
         while let Ok(token) = self.returned.try_recv() {
             self.engine.release_frame(token);
@@ -317,6 +320,7 @@ fn engine_probe(
                 .send(OwnerMessage::PageProgress)
                 .map_err(|error| error.to_string())?;
             engine.render(1280, 720, 1.0)?;
+            let previous_revision = engine.cached_revision();
             engine.navigate(url).map_err(|error| error.to_string())?;
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
@@ -355,7 +359,19 @@ fn engine_probe(
                     thread::sleep(Duration::from_millis(10));
                 }
             }
-            let frame = engine.render(1280, 720, 1.0)?;
+            let frame =
+                await_rendered_frame(&mut engine, (1280, 720, 1.0), previous_revision, |frame| {
+                    let nonwhite = frame
+                        .rgba
+                        .chunks_exact(4)
+                        .filter(|pixel| pixel[3] != 0 && pixel[..3] != [255, 255, 255])
+                        .count();
+                    if nonwhite >= 100 {
+                        Ok(())
+                    } else {
+                        Err(format!("page remains blank: {url}"))
+                    }
+                })?;
             let nonwhite = frame
                 .rgba
                 .chunks_exact(4)
@@ -381,6 +397,7 @@ fn engine_probe(
     sender
         .send(OwnerMessage::PageProgress)
         .map_err(|error| error.to_string())?;
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/redirect"))
         .map_err(|error| error.to_string())?;
@@ -391,9 +408,10 @@ fn engine_probe(
             engine.snapshot()
         ));
     }
-    let frame = engine.render(800, 600, 1.0)?;
-    assert_pixel(&frame, 50, 20, [0x12, 0x34, 0x56, 255])?;
-    assert_pixel(&frame, 405, 15, [0xAA, 0xBB, 0xCC, 255])?;
+    let frame = await_rendered_frame(&mut engine, (800, 600, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 50, 20, [0x12, 0x34, 0x56, 255])?;
+        assert_pixel(frame, 405, 15, [0xAA, 0xBB, 0xCC, 255])
+    })?;
     println!(
         "MYRICA_WEBKIT_SMOKE_PASS stage=live-navigation-css-image frame={}",
         frame.revision
@@ -448,6 +466,11 @@ fn engine_probe(
         .paint_statistics()
         .map_err(|error| error.to_string())?
         .paints;
+    if engine.tick() {
+        return Err(String::from(
+            "idle owner still has pending native work after the unchanged-frame check",
+        ));
+    }
     if idle_paints_after != idle_paints_before {
         return Err(format!(
             "unchanged idle pixels were repainted: paints {idle_paints_before} to {idle_paints_after}"
@@ -468,21 +491,22 @@ fn engine_probe(
         });
         engine.tick();
     }
-    if engine.render(800, 600, 1.0)?.revision != pointer_revision {
+    if engine.render(800, 600, 1.0)?.revision != pointer_revision || engine.tick() {
         return Err(String::from("plain pointer motion repainted native pixels"));
     }
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=pointer-move-retains-pixels");
 
+    let previous_revision = engine.cached_revision();
     engine.render(500, 400, 2.0)?;
     wait_title(&mut engine, "width:250")?;
-    assert_pixel(
-        &engine.render(500, 400, 2.0)?,
-        100,
-        40,
-        [0x65, 0x43, 0x21, 255],
-    )?;
+    let resized = await_rendered_frame(&mut engine, (500, 400, 2.0), previous_revision, |frame| {
+        assert_pixel(frame, 100, 40, [0x65, 0x43, 0x21, 255])
+    })?;
     engine.render(800, 600, 1.0)?;
     wait_title(&mut engine, "width:800")?;
+    await_rendered_frame(&mut engine, (800, 600, 1.0), resized.revision, |frame| {
+        assert_pixel(frame, 50, 20, [0x12, 0x34, 0x56, 255])
+    })?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=resize-retina-media-query");
 
     click(&mut engine, 40.0, 235.0);
@@ -555,20 +579,31 @@ fn engine_probe(
     wait_title(&mut engine, "scroll:240")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=native-scroll");
 
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/damage"))
         .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "damage-ready")?;
-    engine.render(800, 600, 1.0)?;
+    let initial_damage =
+        await_rendered_frame(&mut engine, (800, 600, 1.0), previous_revision, |frame| {
+            assert_pixel(frame, 25, 25, [0x12, 0x34, 0x56, 255])?;
+            assert_pixel(frame, 300, 300, [255, 255, 255, 255])
+        })?;
     let before = engine
         .paint_statistics()
         .map_err(|error| error.to_string())?;
     key(&mut engine, BrowserKey::Character('a'), true);
     key(&mut engine, BrowserKey::Character('a'), false);
     wait_title(&mut engine, "damage-changed")?;
-    let frame = engine.render(800, 600, 1.0)?;
-    assert_pixel(&frame, 25, 25, [0x65, 0x43, 0x21, 255])?;
-    assert_pixel(&frame, 300, 300, [255, 255, 255, 255])?;
+    await_rendered_frame(
+        &mut engine,
+        (800, 600, 1.0),
+        initial_damage.revision,
+        |frame| {
+            assert_pixel(frame, 25, 25, [0x65, 0x43, 0x21, 255])?;
+            assert_pixel(frame, 300, 300, [255, 255, 255, 255])
+        },
+    )?;
     let after = engine
         .paint_statistics()
         .map_err(|error| error.to_string())?;
@@ -597,21 +632,25 @@ fn engine_probe(
         .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "storage-blob-iframe-ready")?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=storage-cookie-blob-iframe");
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/frames"))
         .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "frames-ready")?;
-    let frame = engine.render(800, 600, 1.0)?;
-    assert_pixel(&frame, 20, 100, [0x24, 0x68, 0xac, 255])?;
-    assert_pixel(&frame, 300, 100, [0xac, 0x68, 0x24, 255])?;
+    await_rendered_frame(&mut engine, (800, 600, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 20, 100, [0x24, 0x68, 0xac, 255])?;
+        assert_pixel(frame, 300, 100, [0xac, 0x68, 0x24, 255])
+    })?;
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=frameset-child-pixels");
 
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/view-transition"))
         .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "view-transition-ready")?;
-    let before = engine.render(800, 600, 1.0)?;
-    assert_pixel(&before, 30, 30, [0x12, 0x34, 0x56, 255])?;
+    let before = await_rendered_frame(&mut engine, (800, 600, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 30, 30, [0x12, 0x34, 0x56, 255])
+    })?;
     let composited = engine
         .compositing_statistics()
         .map_err(|error| error.to_string())?
@@ -625,8 +664,9 @@ fn engine_probe(
     let state: serde_json::Value =
         serde_json::from_str(&observation).map_err(|error| error.to_string())?;
     verify_view_transition(&state, composited)?;
-    let after = engine.render(800, 600, 1.0)?;
-    assert_pixel(&after, 30, 30, [0x65, 0x43, 0x21, 255])?;
+    let after = await_rendered_frame(&mut engine, (800, 600, 1.0), before.revision, |frame| {
+        assert_pixel(frame, 30, 30, [0x65, 0x43, 0x21, 255])
+    })?;
     if after.revision == before.revision {
         return Err(String::from(
             "view transition did not repaint its DOM update",
@@ -639,12 +679,14 @@ fn engine_probe(
     };
     println!("MYRICA_WEBKIT_SMOKE_PASS stage={stage} state={state}");
 
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/js-execution"))
         .map_err(|error| error.to_string())?;
     wait_title(&mut engine, "js-execution-ready")?;
-    let before = engine.render(800, 600, 1.0)?;
-    assert_pixel(&before, 30, 30, [0x12, 0x34, 0x56, 255])?;
+    let before = await_rendered_frame(&mut engine, (800, 600, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 30, 30, [0x12, 0x34, 0x56, 255])
+    })?;
     click(&mut engine, 60.0, 155.0);
     wait_title(&mut engine, "js-execution-done")?;
     let observation = engine
@@ -654,8 +696,9 @@ fn engine_probe(
     let state: serde_json::Value =
         serde_json::from_str(&observation).map_err(|error| error.to_string())?;
     verify_js_execution(&state)?;
-    let after = engine.render(800, 600, 1.0)?;
-    assert_pixel(&after, 30, 30, [0x65, 0x43, 0x21, 255])?;
+    let after = await_rendered_frame(&mut engine, (800, 600, 1.0), before.revision, |frame| {
+        assert_pixel(frame, 30, 30, [0x65, 0x43, 0x21, 255])
+    })?;
     if after.revision == before.revision {
         return Err(String::from(
             "JavaScript DOM callback did not update GPU pixels",
@@ -684,10 +727,11 @@ fn engine_probe(
 }
 
 fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/images"))
         .map_err(|error| error.to_string())?;
-    let first = await_image_frame(engine, "images-ready", |frame| {
+    let first = await_image_frame(engine, "images-ready", previous_revision, |frame| {
         inspect_image_board(frame, false, false)
     })?;
     verify_image_state(engine, 0, false, 0)?;
@@ -697,7 +741,7 @@ fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), Stri
     );
 
     click(engine, 540.0, 38.0);
-    let asynchronous = await_image_frame(engine, "images-async", |frame| {
+    let asynchronous = await_image_frame(engine, "images-async", first.revision, |frame| {
         inspect_image_board(frame, true, false)
     })?;
     verify_image_state(engine, 1, false, 0)?;
@@ -707,10 +751,15 @@ fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), Stri
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=image-async-http-load-decode-pixels");
 
     click(engine, 540.0, 98.0);
-    let transformed = await_image_frame(engine, "images-transformed", |frame| {
-        inspect_image_board(frame, true, true)?;
-        assert_image_pixel(frame, 24, 116, [255, 255, 255, 255], 0)
-    })?;
+    let transformed = await_image_frame(
+        engine,
+        "images-transformed",
+        asynchronous.revision,
+        |frame| {
+            inspect_image_board(frame, true, true)?;
+            assert_image_pixel(frame, 24, 116, [255, 255, 255, 255], 0)
+        },
+    )?;
     verify_image_state(engine, 1, true, 0)?;
     if transformed.revision == asynchronous.revision {
         return Err("translated image layers did not update actual GPU pixels".into());
@@ -723,7 +772,7 @@ fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), Stri
         x: 400.0,
         y: 440.0,
     });
-    await_image_frame(engine, "images-scroll:760", |frame| {
+    let scrolled = await_image_frame(engine, "images-scroll:760", transformed.revision, |frame| {
         for (x, colour, tolerance) in image_samples() {
             assert_image_pixel(frame, x, 64, colour, tolerance)?;
         }
@@ -736,7 +785,7 @@ fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), Stri
         x: 400.0,
         y: 440.0,
     });
-    await_image_frame(engine, "images-scroll:0", |frame| {
+    await_image_frame(engine, "images-scroll:0", scrolled.revision, |frame| {
         inspect_image_board(frame, true, true)
     })?;
     verify_image_state(engine, 1, true, 0)?;
@@ -810,6 +859,7 @@ fn assert_image_pixel(
 fn await_image_frame(
     engine: &mut ProbeEngine,
     title: &str,
+    after_revision: u64,
     inspect: impl Fn(&ProbeFrame) -> Result<(), String>,
 ) -> Result<ProbeFrame, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -823,7 +873,10 @@ fn await_image_frame(
             return Err(format!("native image fixture failed: {state:?}"));
         }
         let frame = engine.render(800, 600, 1.0)?;
-        if state.title == title && state.load_state == LoadState::Ready {
+        if state.title == title
+            && state.load_state == LoadState::Ready
+            && frame.revision > after_revision
+        {
             match inspect(&frame) {
                 Ok(()) => return Ok(frame),
                 Err(error) => last = error,
@@ -1250,6 +1303,7 @@ fn verify_media_presentation_history(state: &serde_json::Value, path: &str) -> R
 
 fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), String> {
     engine.render(400, 240, 1.0)?;
+    let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/media/{path}"))
         .map_err(|error| error.to_string())?;
@@ -1258,9 +1312,11 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
     if state["width"] != 128 || state["height"] != 96 || state["ready"].as_u64().unwrap_or(0) < 3 {
         return Err(format!("metadata or ready state failed ({path}): {state}"));
     }
-    // Paint the loaded document before targeting its actual Play button.
-    // Metadata readiness alone does not flush the embedding's pending layout.
-    engine.render(400, 240, 1.0)?;
+    // Metadata readiness precedes asynchronous GPU publication. Require this
+    // document's completed frame before targeting its real Play button.
+    await_rendered_frame(engine, (400, 240, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 280, 60, [255, 255, 255, 255])
+    })?;
     click(engine, 60.0, 155.0);
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut colours = [false; 3];
@@ -1393,6 +1449,7 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
 #[cfg(feature = "backend-webkit-vulkan")]
 fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
     engine.render(400, 240, 1.0)?;
+    let previous_revision = engine.cached_revision();
     let before_fixture = engine
         .compositing_statistics()
         .map_err(|error| error.to_string())?
@@ -1401,7 +1458,9 @@ fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), St
         .navigate(&format!("{base}/media/compositor"))
         .map_err(|error| error.to_string())?;
     wait_title(engine, "media-ready")?;
-    engine.render(400, 240, 1.0)?;
+    await_rendered_frame(engine, (400, 240, 1.0), previous_revision, |frame| {
+        assert_pixel(frame, 280, 60, [0x12, 0x34, 0x56, 255])
+    })?;
     click(engine, 60.0, 155.0);
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut baseline: Option<(
@@ -1502,6 +1561,37 @@ fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), St
             ));
         }
         thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn await_rendered_frame(
+    engine: &mut ProbeEngine,
+    viewport: (u32, u32, f32),
+    after_revision: u64,
+    inspect: impl Fn(&ProbeFrame) -> Result<(), String>,
+) -> Result<ProbeFrame, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = String::from("no newer completed native frame");
+    loop {
+        engine.tick();
+        let state = engine.snapshot();
+        if matches!(state.load_state, LoadState::Failed(_)) {
+            return Err(format!("native rendering failed: {state:?}"));
+        }
+        let frame = engine.render(viewport.0, viewport.1, viewport.2)?;
+        if frame.revision > after_revision {
+            match inspect(&frame) {
+                Ok(()) => return Ok(frame),
+                Err(error) => last = error,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "GPU output did not advance beyond revision {after_revision} with expected pixels: {last}; latest={} state={state:?}",
+                frame.revision
+            ));
+        }
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
