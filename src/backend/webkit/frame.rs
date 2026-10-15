@@ -109,6 +109,7 @@ impl FrameRenderer {
             revision: native.generation,
             width: native.width,
             height: native.height,
+            damage: None,
             lease: Some(lease),
             draws: vec![BrowserDraw {
                 mesh: Arc::clone(mesh),
@@ -194,6 +195,7 @@ impl FrameRenderer {
             revision,
             width,
             height,
+            damage: None,
             lease: None,
             draws: vec![BrowserDraw {
                 mesh: SgfxMesh::with_handle(self.mesh, revision, vertices),

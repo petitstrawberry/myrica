@@ -25,6 +25,38 @@ pub struct BrowserViewport {
     pub scale: f32,
 }
 
+impl BrowserViewport {
+    /// Fit backing storage to the producer's limit while keeping CSS dimensions
+    /// and input coordinates stable. Normal-sized windows keep their native DPR.
+    fn fit_surface(self, maximum: u32) -> Self {
+        if maximum == 0
+            || self.width.max(self.height) <= maximum
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+        {
+            return self;
+        }
+        let css_width = (f64::from(self.width) / f64::from(self.scale)).ceil();
+        let css_height = (f64::from(self.height) / f64::from(self.scale)).ceil();
+        let limit_scale = f64::from(maximum) / css_width.max(css_height);
+        let scale = limit_scale as f32;
+        if scale < 0.25 {
+            return self;
+        }
+        Self {
+            width: (css_width * f64::from(scale))
+                .floor()
+                .max(1.0)
+                .min(f64::from(maximum)) as u32,
+            height: (css_height * f64::from(scale))
+                .floor()
+                .max(1.0)
+                .min(f64::from(maximum)) as u32,
+            scale,
+        }
+    }
+}
+
 enum Command {
     Navigate(String),
     Reload,
@@ -237,6 +269,11 @@ impl BrowserWorker {
     }
 
     pub fn resize(&self, viewport: BrowserViewport) {
+        let viewport = self
+            .frame_source
+            .as_ref()
+            .and_then(|source| source.maximum_surface_dimension())
+            .map_or(viewport, |maximum| viewport.fit_surface(maximum));
         let mut mailbox = self.shared.mailbox.lock().unwrap();
         if mailbox.viewport != viewport {
             mailbox.viewport = viewport;
@@ -588,6 +625,34 @@ mod tests {
     use super::*;
     use std::rc::Rc;
     use std::sync::mpsc::{self, Receiver, Sender};
+
+    #[test]
+    fn large_retina_viewports_fit_the_gpu_limit_and_keep_css_dimensions() {
+        let native = BrowserViewport {
+            width: 5120,
+            height: 2880,
+            scale: 2.0,
+        };
+        let fitted = native.fit_surface(4096);
+        assert_eq!((fitted.width, fitted.height), (4096, 2304));
+        assert_eq!((fitted.width as f64 / fitted.scale as f64).ceil(), 2560.0);
+        assert_eq!((fitted.height as f64 / fitted.scale as f64).ceil(), 1440.0);
+        for scale in [1.0, 1.25, 1.5, 2.0, 2.5] {
+            for (width, height) in [(2200, 1400), (5120, 2880), (3000, 6000)] {
+                let viewport = BrowserViewport {
+                    width,
+                    height,
+                    scale,
+                };
+                let fit = viewport.fit_surface(4096);
+                assert!(fit.width <= 4096 && fit.height <= 4096);
+                assert!(fit.scale > 0.0 && fit.scale <= scale);
+                if width.max(height) <= 4096 {
+                    assert_eq!(fit, viewport);
+                }
+            }
+        }
+    }
 
     const VIEWPORT: BrowserViewport = BrowserViewport {
         width: 320,

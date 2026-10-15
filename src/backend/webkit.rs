@@ -725,7 +725,7 @@ impl BrowserBackend for WebKitBackend {
                     unsafe {
                         ffi::scarlet_webview_resize(self.view.as_ptr(), width, height, scale)
                     },
-                    "resize WebCore",
+                    &format!("resize WebCore width={width} height={height} scale={scale}"),
                 )?;
                 self.width = width;
                 self.height = height;
@@ -766,7 +766,7 @@ impl BrowserBackend for WebKitBackend {
                     unsafe {
                         ffi::scarlet_webview_resize(self.view.as_ptr(), width, height, scale)
                     },
-                    "resize WebCore",
+                    &format!("resize WebCore width={width} height={height} scale={scale}"),
                 )?;
                 self.width = width;
                 self.height = height;

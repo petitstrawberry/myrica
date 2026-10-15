@@ -43,6 +43,8 @@ pub struct MyricaApp {
     last_webview_focused: Rc<Cell<bool>>,
     last_backend_url: Rc<RefCell<String>>,
     browser_shortcut_keys: Rc<RefCell<Vec<KeyCode>>>,
+    surface_damage: State<Option<scarlet_ui::Rect>>,
+    staged_damage: Rc<RefCell<Option<Option<scarlet_ui::Rect>>>>,
 }
 
 impl MyricaApp {
@@ -86,6 +88,8 @@ impl MyricaApp {
             last_webview_focused: Rc::new(Cell::new(false)),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
             browser_shortcut_keys: Rc::new(RefCell::new(Vec::new())),
+            surface_damage: State::new(generate_state_id(), None),
+            staged_damage: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -130,11 +134,10 @@ impl MyricaApp {
         let webview_size = self.webview_size.get();
         let observed_webview_size = self.webview_size.clone();
         let page = if let Some(texture) = self.gpu_surface.get() {
-            Either::A(ExternalGpuSurface::from_state(
-                webview_size.width,
-                webview_size.height,
-                texture,
-            ))
+            Either::A(
+                ExternalGpuSurface::from_state(webview_size.width, webview_size.height, texture)
+                    .damage(self.surface_damage.clone()),
+            )
         } else {
             Either::B(SgfxCanvas::from_state(
                 self.canvas_handle,
@@ -202,6 +205,17 @@ impl MyricaApp {
         frame: BrowserFrame,
     ) -> std::result::Result<(), crate::backend::BackendError> {
         let lease = frame.lease.clone();
+        let size = self.webview_size.get();
+        let damage = frame.damage.map(|[x, y, width, height]| {
+            scarlet_ui::Rect::from_xywh(
+                x as f32 * size.width / frame.width.max(1) as f32,
+                y as f32 * size.height / frame.height.max(1) as f32,
+                width as f32 * size.width / frame.width.max(1) as f32,
+                height as f32 * size.height / frame.height.max(1) as f32,
+            )
+        });
+        let damage = accumulate_damage(&mut self.staged_damage.borrow_mut(), damage);
+        self.surface_damage.set(damage);
         let texture = frame.try_external_gpu_texture(&mut self.gpu_image_cache.borrow_mut())?;
         if let Some(texture) = texture {
             self.set_gpu_surface(texture);
@@ -300,11 +314,34 @@ impl Application for MyricaApp {
         // ScarletUI has completed GPU sampling before this callback. Return
         // the previous page image only after its replacement was presented.
         self.presentation_leases.borrow_mut().presented();
+        self.staged_damage.borrow_mut().take();
     }
 
     fn debug_logging(&self) -> bool {
         false
     }
+}
+
+fn accumulate_damage(
+    pending: &mut Option<Option<scarlet_ui::Rect>>,
+    next: Option<scarlet_ui::Rect>,
+) -> Option<scarlet_ui::Rect> {
+    let merged = match (*pending, next) {
+        (None, next) => next,
+        (Some(Some(a)), Some(b)) => {
+            let x = a.origin.x.min(b.origin.x);
+            let y = a.origin.y.min(b.origin.y);
+            Some(scarlet_ui::Rect::from_xywh(
+                x,
+                y,
+                (a.origin.x + a.size.width).max(b.origin.x + b.size.width) - x,
+                (a.origin.y + a.size.height).max(b.origin.y + b.size.height) - y,
+            ))
+        }
+        _ => None,
+    };
+    *pending = Some(merged);
+    merged
 }
 
 fn viewport_for_size(size: Size) -> BrowserViewport {

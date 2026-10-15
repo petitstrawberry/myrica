@@ -28,10 +28,25 @@ pub(super) struct FrameSource {
     output: Arc<Output>,
     renderer: FrameRenderer,
     logged: bool,
+    maximum_dimension: u32,
 }
 
 impl FrameSource {
     pub(super) fn new(view: NonNull<ffi::ScarletWebView>) -> Result<Self, BackendError> {
+        let mut maximum_dimension = 0;
+        // SAFETY: The immutable embedding/GPU limit is read on the Page owner.
+        check(
+            unsafe {
+                ffi::scarlet_webview_maximum_surface_dimension(
+                    view.as_ptr(),
+                    &mut maximum_dimension,
+                )
+            },
+            "query WebCore surface limit",
+        )?;
+        if maximum_dimension == 0 {
+            return Err(BackendError::new("WebCore returned an empty surface limit"));
+        }
         let mut output = std::ptr::null_mut();
         // SAFETY: Called once while constructing the endpoint on the Page owner.
         check(
@@ -44,11 +59,15 @@ impl FrameSource {
             output: Arc::new(Output(output)),
             renderer: FrameRenderer::new(),
             logged: false,
+            maximum_dimension,
         })
     }
 }
 
 impl BrowserFrameSource for FrameSource {
+    fn maximum_surface_dimension(&self) -> Option<u32> {
+        Some(self.maximum_dimension)
+    }
     fn poll(&mut self) -> Result<Option<PresentedFrame>, BackendError> {
         let mut frame = ffi::GpuFrame::default();
         let (mut allocation_id, mut epoch, mut scale) = (0, 0, 1.0);
@@ -85,7 +104,21 @@ impl BrowserFrameSource for FrameSource {
             height: frame.height,
             scale: scale as f32,
         };
-        let frame = self.renderer.gpu_frame(frame, image, lease)?;
+        let mut damage = [0; 4];
+        // SAFETY: The leased generation's immutable damage belongs to this
+        // independently owned endpoint, including after Page destruction.
+        check(
+            unsafe {
+                ffi::scarlet_webview_output_damage(
+                    self.output.0.as_ptr(),
+                    frame.generation,
+                    damage.as_mut_ptr(),
+                )
+            },
+            "query compositor damage",
+        )?;
+        let mut frame = self.renderer.gpu_frame(frame, image, lease)?;
+        frame.damage = Some(damage);
         if !self.logged {
             eprintln!(
                 "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none compositor=threaded"

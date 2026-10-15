@@ -305,6 +305,10 @@ unsafe extern "C" {
     pub fn scarlet_webview_reload(view: *mut ScarletWebView) -> c_int;
     pub fn scarlet_webview_back(view: *mut ScarletWebView) -> c_int;
     pub fn scarlet_webview_forward(view: *mut ScarletWebView) -> c_int;
+    pub fn scarlet_webview_maximum_surface_dimension(
+        view: *mut ScarletWebView,
+        out: *mut u32,
+    ) -> c_int;
     pub fn scarlet_webview_resize(
         view: *mut ScarletWebView,
         width: u32,
@@ -323,6 +327,11 @@ unsafe extern "C" {
         out: *mut *mut CompositorOutput,
     ) -> c_int;
     pub fn scarlet_webview_output_destroy(output: *mut CompositorOutput);
+    pub fn scarlet_webview_output_damage(
+        output: *mut CompositorOutput,
+        generation: u64,
+        rect: *mut u32,
+    ) -> c_int;
     pub fn scarlet_webview_output_acquire(
         output: *mut CompositorOutput,
         out: *mut GpuFrame,

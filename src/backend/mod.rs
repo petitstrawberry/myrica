@@ -245,6 +245,10 @@ pub struct PresentedFrame {
 /// This endpoint may exchange completed images and leases only. It must never
 /// enter the document, execute script, or wait for the engine/GPU.
 pub trait BrowserFrameSource: Send {
+    /// Immutable producer limit, queried on construction rather than per frame.
+    fn maximum_surface_dimension(&self) -> Option<u32> {
+        None
+    }
     fn poll(&mut self) -> Result<Option<PresentedFrame>, BackendError>;
 }
 

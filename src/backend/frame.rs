@@ -13,6 +13,9 @@ pub struct BrowserFrame {
     pub revision: u64,
     pub width: u32,
     pub height: u32,
+    /// Changed physical pixels since the last acquired producer frame. None
+    /// means the complete image; consumers union updates skipped before paint.
+    pub damage: Option<[u32; 4]>,
     pub draws: Vec<BrowserDraw>,
     pub(crate) lease: Option<Arc<FrameLease>>,
 }
@@ -211,6 +214,7 @@ impl BrowserFrame {
             revision: 0,
             width: width.max(1),
             height: height.max(1),
+            damage: None,
             draws: Vec::new(),
             lease: None,
         }
