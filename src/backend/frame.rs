@@ -87,6 +87,40 @@ impl BrowserTexture {
 }
 
 impl BrowserFrame {
+    /// Adopt a completed GPU page for direct window composition. CPU scenes
+    /// retain their mesh/canvas path. The frame's lease stays owned by the UI.
+    pub(crate) fn try_external_gpu_texture(
+        &self,
+    ) -> Result<Option<Arc<SgfxTexture>>, super::BackendError> {
+        #[cfg(target_os = "scarlet")]
+        if let [draw] = self.draws.as_slice()
+            && let Some(texture) = &draw.texture
+            && let BrowserTextureSource::SharedGpu(image) = &texture.source
+        {
+            if texture.width != self.width
+                || texture.height != self.height
+                || draw.transform
+                    != [
+                        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ]
+            {
+                return Err(super::BackendError::new(
+                    "GPU page is not a full-viewport image",
+                ));
+            }
+            let raw = image.take()?;
+            // SAFETY: take() transfers the exclusively owned capability once;
+            // ScarletUI consumes it on both success and failure.
+            return unsafe {
+                scarlet_ui::shared_bgra8_texture_from_raw(raw, self.width, self.height)
+            }
+            .map(Some)
+            .map_err(|error| super::BackendError::new(format!("adopt GPU page image: {error}")));
+        }
+        Ok(None)
+    }
+
     pub fn empty(width: u32, height: u32) -> Self {
         Self {
             revision: 0,

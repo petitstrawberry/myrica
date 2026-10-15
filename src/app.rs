@@ -9,8 +9,9 @@ use scarlet_ui::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mou
 use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
-    Application, ComponentElement, Element, Listenable, SgfxCanvas, SgfxCanvasFrame,
-    SgfxCanvasHandle, Size, View, Window, WindowContentLayout, WindowDecoration, generate_state_id,
+    Application, ComponentElement, Element, ExternalGpuSurface, Listenable, SgfxCanvas,
+    SgfxCanvasFrame, SgfxCanvasHandle, SgfxTexture, Size, View, Window, WindowContentLayout,
+    WindowDecoration, generate_state_id,
 };
 use scarlet_ui::{hstack, vstack};
 
@@ -31,6 +32,9 @@ pub struct MyricaApp {
     snapshot: State<BrowserSnapshot>,
     canvas_handle: SgfxCanvasHandle,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    // The outer state switches view kind only once a GPU page arrives. Further
+    // frames notify the inner paint state without rebuilding browser chrome.
+    gpu_surface: State<Option<State<Arc<SgfxTexture>>>>,
     presentation_leases: Rc<RefCell<PresentationLeases>>,
     webview_size: State<Size>,
     webview_focused: State<bool>,
@@ -72,6 +76,7 @@ impl MyricaApp {
             snapshot: State::new(generate_state_id(), initial_snapshot),
             canvas_handle: SgfxCanvasHandle::new(),
             canvas_frame: State::new(generate_state_id(), initial_frame),
+            gpu_surface: State::new(generate_state_id(), None),
             presentation_leases: Rc::new(RefCell::new(PresentationLeases::default())),
             webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
@@ -122,26 +127,35 @@ impl MyricaApp {
         let event_backend = Rc::clone(&self.backend);
         let webview_size = self.webview_size.get();
         let observed_webview_size = self.webview_size.clone();
-        let canvas = SgfxCanvas::from_state(
-            self.canvas_handle,
-            webview_size.width,
-            webview_size.height,
-            self.canvas_frame.clone(),
-        )
-        .on_geometry_change(
-            |geometry| geometry.size(),
-            move |size| {
-                if observed_webview_size.get() != size {
-                    observed_webview_size.set(size);
-                }
-            },
-        )
-        .focusable(self.webview_focused.clone())
-        .text_input(self.webview_text_input.clone())
-        // The focused wrapper is the keyboard target. Keep the event handler
-        // outside it so key/IME events reach this ancestor during bubbling.
-        .on_event(move |event| dispatch_webview_event(&event_backend, event))
-        .frame(f32::INFINITY, f32::INFINITY);
+        let page = if let Some(texture) = self.gpu_surface.get() {
+            Either::A(ExternalGpuSurface::from_state(
+                webview_size.width,
+                webview_size.height,
+                texture,
+            ))
+        } else {
+            Either::B(SgfxCanvas::from_state(
+                self.canvas_handle,
+                webview_size.width,
+                webview_size.height,
+                self.canvas_frame.clone(),
+            ))
+        };
+        let canvas = page
+            .on_geometry_change(
+                |geometry| geometry.size(),
+                move |size| {
+                    if observed_webview_size.get() != size {
+                        observed_webview_size.set(size);
+                    }
+                },
+            )
+            .focusable(self.webview_focused.clone())
+            .text_input(self.webview_text_input.clone())
+            // The focused wrapper is the keyboard target. Keep the event handler
+            // outside it so key/IME events reach this ancestor during bubbling.
+            .on_event(move |event| dispatch_webview_event(&event_backend, event))
+            .frame(f32::INFINITY, f32::INFINITY);
 
         let status = Text::new(format!(
             "{} · {}",
@@ -171,6 +185,32 @@ impl MyricaApp {
         self.backend.borrow_mut().shutdown();
     }
 
+    fn set_gpu_surface(&self, texture: Arc<SgfxTexture>) {
+        if let Some(state) = self.gpu_surface.get() {
+            state.set(texture);
+        } else {
+            self.gpu_surface
+                .set(Some(State::new(generate_state_id(), texture)));
+        }
+    }
+
+    fn apply_frame(
+        &self,
+        frame: BrowserFrame,
+    ) -> std::result::Result<(), crate::backend::BackendError> {
+        let lease = frame.lease.clone();
+        if let Some(texture) = frame.try_external_gpu_texture()? {
+            self.set_gpu_surface(texture);
+        } else {
+            self.canvas_frame.set(frame.try_into_canvas_frame()?);
+            if self.gpu_surface.get().is_some() {
+                self.gpu_surface.set(None);
+            }
+        }
+        self.presentation_leases.borrow_mut().stage(lease);
+        Ok(())
+    }
+
     fn synchronize_backend_state(&self) {
         let focused = self.webview_focused.get();
         if self.last_webview_focused.replace(focused) && !focused {
@@ -182,13 +222,8 @@ impl MyricaApp {
             backend.poll()
         };
         if let Some(frame) = frame {
-            let lease = frame.lease.clone();
-            match frame.try_into_canvas_frame() {
-                Ok(canvas) => {
-                    self.presentation_leases.borrow_mut().stage(lease);
-                    self.canvas_frame.set(canvas);
-                }
-                Err(error) => eprintln!("myrica: {error}"),
+            if let Err(error) = self.apply_frame(frame) {
+                eprintln!("myrica: {error}");
             }
         }
         let latest = self.backend.borrow().snapshot();
@@ -230,6 +265,7 @@ impl View for MyricaApp {
             &self.snapshot,
             &self.webview_size,
             &self.webview_focused,
+            &self.gpu_surface,
         ]
     }
 
@@ -481,6 +517,80 @@ fn map_key(key: KeyCode) -> BrowserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_page_uses_a_direct_surface_and_updates_only_its_texture_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct ExternalImage;
+        fn count<T: 'static>(element: &dyn Element) -> usize {
+            usize::from(
+                element
+                    .render_object()
+                    .is_some_and(|render| render.as_any().is::<T>()),
+            ) + element
+                .children()
+                .iter()
+                .map(|child| count::<T>(child.as_ref()))
+                .sum::<usize>()
+        }
+
+        // Opaque image payloads test the shell's actual view selection without
+        // pretending to decode video or supply a native GPU capability.
+        let app = MyricaApp::new("about:blank").unwrap();
+        let kind_changes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&kind_changes);
+        app.gpu_surface.subscribe_any(Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        app.set_gpu_surface(SgfxTexture::external_bgra8(
+            800,
+            600,
+            Arc::new(ExternalImage),
+        ));
+        let texture_state = app.gpu_surface.get().unwrap();
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let root = tree.root().unwrap();
+        assert_eq!(count::<scarlet_ui::ExternalGpuSurfaceRenderObject>(root), 1);
+        assert_eq!(count::<scarlet_ui::SgfxCanvasRenderObject>(root), 0);
+        let size = app.webview_size.get();
+
+        let next = SgfxTexture::external_bgra8(800, 600, Arc::new(ExternalImage));
+        app.set_gpu_surface(Arc::clone(&next));
+        assert_eq!(app.gpu_surface.get().unwrap().id(), texture_state.id());
+        assert!(Arc::ptr_eq(&texture_state.get(), &next));
+        assert_eq!(
+            kind_changes.load(Ordering::Relaxed),
+            1,
+            "frames must not rebuild browser chrome"
+        );
+        tree.layout(LayoutConstraints::tight(420.0, 340.0));
+        assert_ne!(
+            app.webview_size.get(),
+            size,
+            "direct surface retains the geometry observer"
+        );
+
+        app.apply_frame(BrowserFrame::empty(420, 340)).unwrap();
+        assert!(
+            app.gpu_surface.get().is_none(),
+            "CPU scene returns to the canvas path"
+        );
+        let mut canvas = scarlet_ui::ElementTree::new();
+        canvas.set_root(app.content().create_element());
+        canvas.layout(LayoutConstraints::tight(420.0, 340.0));
+        assert_eq!(
+            count::<scarlet_ui::ExternalGpuSurfaceRenderObject>(canvas.root().unwrap()),
+            0
+        );
+        assert_eq!(
+            count::<scarlet_ui::SgfxCanvasRenderObject>(canvas.root().unwrap()),
+            1
+        );
+    }
 
     #[cfg(feature = "backend-blitz")]
     #[test]
