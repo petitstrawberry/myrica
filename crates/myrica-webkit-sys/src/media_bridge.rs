@@ -19,6 +19,8 @@ const MAX_EVENTS: usize = 64;
 const MAX_LEASES: usize = 8;
 const MAX_VIDEO_FRAMES: usize = 3;
 const MAX_AUDIO_BYTES: usize = 1024 * 1024;
+const AUDIO_LOW_WATER_SECONDS: f64 = 0.1;
+const VIDEO_EARLY_US: i64 = 5_000;
 const OK: i32 = 0;
 const AGAIN: i32 = 1;
 const ERROR: i32 = -1;
@@ -817,6 +819,17 @@ struct HardwareVideoDecoder {
 }
 
 impl HardwareVideoDecoder {
+    fn pending_frames(&self) -> usize {
+        #[cfg(target_os = "scarlet")]
+        {
+            self.reorder.pending.len()
+        }
+        #[cfg(not(target_os = "scarlet"))]
+        {
+            0
+        }
+    }
+
     #[cfg(target_os = "scarlet")]
     fn new(track: &Track, cancellation: Arc<AtomicBool>) -> Result<Self, MediaError> {
         use scarlet_video_client::{
@@ -1017,11 +1030,75 @@ fn update_duration(state: &mut SessionState) {
     );
 }
 
+// Only display-owned output is discarded. Decoder reference pictures, future
+// output and already acquired leases are outside this queue operation.
+fn coalesce_due_frames<T>(
+    queue: &mut VecDeque<T>,
+    playing: bool,
+    cutoff_us: i64,
+    pts: impl Fn(&T) -> i64,
+) -> u64 {
+    let mut dropped = 0;
+    if playing {
+        while queue.front().is_some_and(|frame| pts(frame) <= cutoff_us)
+            && queue.get(1).is_some_and(|frame| pts(frame) <= cutoff_us)
+        {
+            queue.pop_front();
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+fn prune_video_output(state: &mut SessionState) {
+    // Apply the existing seek preroll rule before normal playback coalescing.
+    if let Some(target) = state.seek_target {
+        while state.video.front().is_some_and(|frame| {
+            (frame.pts_us as f64 + frame.duration_us as f64) / 1_000_000.0 <= target
+        }) {
+            state.video.pop_front();
+            state.status.dropped_frames += 1;
+        }
+        if !state.video.is_empty() {
+            state.seek_target = None;
+        }
+    }
+    let cutoff = ((state.clock.now() * 1_000_000.0) as i64).saturating_add(VIDEO_EARLY_US);
+    state.status.dropped_frames +=
+        coalesce_due_frames(&mut state.video, state.clock.playing, cutoff, |frame| {
+            frame.pts_us
+        });
+}
+
+fn video_output_reservation(has_sample: bool, pending_reordered: usize) -> usize {
+    // push emits at most one reordered picture; EOS emits the actual remainder.
+    if has_sample { 1 } else { pending_reordered }
+}
+
+fn video_output_has_capacity(queued: usize, reserved: usize) -> bool {
+    queued <= MAX_VIDEO_FRAMES && reserved <= MAX_VIDEO_FRAMES - queued
+}
+
+fn choose_decode_track(
+    candidates: impl Iterator<Item = (u32, Codec, usize)>,
+    last: Option<u32>,
+    audio_seconds: f64,
+) -> Option<(u32, Codec, usize)> {
+    candidates.min_by_key(|(id, codec, _)| {
+        (
+            !(*codec == Codec::Aac && audio_seconds < AUDIO_LOW_WATER_SECONDS),
+            last.is_some_and(|previous| *id <= previous),
+            *id,
+        )
+    })
+}
+
 fn session_worker(shared: &SessionShared) {
     let mut decoders: BTreeMap<u32, TrackDecoder> = BTreeMap::new();
     let mut audio = AudioOutput::new();
     let mut last_generation = 0;
     let mut last_audio_generation = 0;
+    let mut last_decoded_track = None;
     loop {
         let mut state = lock(&shared.state);
         if state.stopping {
@@ -1039,6 +1116,9 @@ fn session_worker(shared: &SessionShared) {
             continue;
         }
         let reset_all = last_generation != state.generation;
+        if reset_all {
+            last_decoded_track = None;
+        }
         let retired_ids: Vec<_> = decoders
             .iter()
             .filter_map(|(&id, decoder)| {
@@ -1102,43 +1182,54 @@ fn session_worker(shared: &SessionShared) {
         state.audio_seconds = audio.seconds();
         state.audio_drained = audio.is_empty();
         state.status.current_time = state.clock.now();
+        prune_video_output(&mut state);
         let video_empty = state.video.is_empty();
+        let queued_video = state.video.len();
         let audio_capacity = state.audio_bytes < MAX_AUDIO_BYTES && state.audio_seconds < 0.25;
         let state_audio_seconds = state.audio_seconds;
-        let work = state.tracks.iter_mut().find_map(|(&id, track)| {
+        let candidates = state.tracks.iter().filter_map(|(&id, track)| {
+            let has_sample = !track.samples.is_empty();
+            if !has_sample && !(track.ended && !track.drained) {
+                return None;
+            }
+            let reserved = if track.track.codec == Codec::H264 {
+                let pending = match decoders.get(&id).map(|decoder| &decoder.decoder) {
+                    Some(Decoder::Video(decoder)) => decoder.pending_frames(),
+                    _ => 0,
+                };
+                video_output_reservation(has_sample, pending)
+            } else {
+                0
+            };
             let capacity = match track.track.codec {
-                Codec::H264 => video_empty,
+                Codec::H264 => video_output_has_capacity(queued_video, reserved),
                 Codec::Aac => {
                     audio_capacity
                         && (state_audio_seconds + 1024.0 / f64::from(track.track.sample_rate)
                             <= 0.25)
                 }
             };
-            if !capacity {
-                return None;
-            }
-            if let Some(sample) = track.samples.pop_front() {
-                Some((
-                    id,
-                    track.generation,
-                    track.track.clone(),
-                    track.cancellation.clone(),
-                    Some(sample),
-                ))
-            } else if track.ended && !track.drained {
-                track.drained = true;
-                Some((
-                    id,
-                    track.generation,
-                    track.track.clone(),
-                    track.cancellation.clone(),
-                    None,
-                ))
-            } else {
-                None
-            }
+            capacity.then_some((id, track.track.codec, reserved))
         });
-        if let Some((id, generation, track, cancellation, sample)) = work {
+        let work = choose_decode_track(candidates, last_decoded_track, state_audio_seconds).map(
+            |(id, _, reserved)| {
+                let track = state.tracks.get_mut(&id).expect("selected decode track");
+                let sample = track.samples.pop_front();
+                if sample.is_none() {
+                    track.drained = true;
+                }
+                (
+                    id,
+                    track.generation,
+                    track.track.clone(),
+                    track.cancellation.clone(),
+                    sample,
+                    reserved,
+                )
+            },
+        );
+        if let Some((id, generation, track, cancellation, sample, reserved)) = work {
+            last_decoded_track = Some(id);
             if let Some(sample) = &sample {
                 state.input_bytes -= sample.sample.data.len();
             }
@@ -1228,7 +1319,9 @@ fn session_worker(shared: &SessionShared) {
             }
             match result {
                 Ok(DecodeOutput::Video(mut frames)) => {
-                    if frames.len() > MAX_VIDEO_FRAMES || !frames.iter().all(decoded_video_is_valid)
+                    if frames.len() > reserved
+                        || !video_output_has_capacity(state.video.len(), frames.len())
+                        || !frames.iter().all(decoded_video_is_valid)
                     {
                         state.status.error = ERROR;
                         continue;
@@ -1250,9 +1343,10 @@ fn session_worker(shared: &SessionShared) {
                     }) {
                         state.clock.mark_ready();
                     }
-                    // Each access unit is decoded only when the presentation
-                    // queue is empty. Reordered outputs fit as a complete batch.
+                    // Capacity was reserved before decoding. Keep running ahead
+                    // of the painter within the bounded display-output queue.
                     state.video.extend(frames.into_iter().map(Box::new));
+                    prune_video_output(&mut state);
                 }
                 Ok(DecodeOutput::Audio(frame)) => {
                     if decoder.non_displaying.remove(&frame.pts_us) {
@@ -1790,25 +1884,16 @@ pub unsafe extern "C" fn scarlet_media_session_acquire_frame(
     if state.leases.len() >= 2 {
         return OK;
     }
-    let now_us = (state.clock.now() * 1_000_000.0) as i64;
-    // Seeking reenqueues from a preceding random access point. Decode those
-    // pictures for reference state, but never present the preroll pictures.
-    if let Some(target) = state.seek_target {
-        while state.video.front().is_some_and(|frame| {
-            (frame.pts_us as f64 + frame.duration_us as f64) / 1_000_000.0 <= target
-        }) {
-            state.video.pop_front();
-            state.status.dropped_frames += 1;
-        }
-        if !state.video.is_empty() {
-            state.seek_target = None;
-        }
+    let queued = state.video.len();
+    prune_video_output(&mut state);
+    if state.video.len() != queued {
         session.shared.wake.notify_all();
     }
+    let now_us = (state.clock.now() * 1_000_000.0) as i64;
     let Some(next) = state.video.front() else {
         return OK;
     };
-    if next.pts_us > now_us + 5_000 {
+    if next.pts_us > now_us.saturating_add(VIDEO_EARLY_US) {
         return OK;
     }
     let frame = state.video.pop_front().expect("due frame");
@@ -2334,6 +2419,128 @@ impl AudioRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_queue_keeps_latest_due_and_all_future_output() {
+        let mut queue = VecDeque::from([0, 10_000, 20_000, 40_000]);
+        assert_eq!(coalesce_due_frames(&mut queue, true, 25_000, |pts| *pts), 2);
+        assert_eq!(queue, [20_000, 40_000]);
+        // Even malformed ordering must not discard a future picture.
+        let mut future_first = VecDeque::from([50_000, 10_000]);
+        assert_eq!(
+            coalesce_due_frames(&mut future_first, true, 20_000, |pts| *pts),
+            0
+        );
+        assert_eq!(future_first, [50_000, 10_000]);
+    }
+
+    #[test]
+    fn presentation_queue_preserves_paused_preview_and_final_eos_picture() {
+        let mut paused = VecDeque::from([0, 10_000, 20_000]);
+        assert_eq!(
+            coalesce_due_frames(&mut paused, false, 1_000_000, |pts| *pts),
+            0
+        );
+        assert_eq!(paused, [0, 10_000, 20_000]);
+        let mut final_frame = VecDeque::from([20_000]);
+        assert_eq!(
+            coalesce_due_frames(&mut final_frame, true, 1_000_000, |pts| *pts),
+            0
+        );
+        assert_eq!(final_frame.pop_front(), Some(20_000));
+        assert!(final_frame.is_empty());
+    }
+
+    #[test]
+    fn presentation_queue_duplicate_pts_keeps_last_output_and_releases_superseded_payload() {
+        struct Output {
+            pts: i64,
+            serial: u32,
+            returned: Arc<Mutex<Vec<u32>>>,
+        }
+        impl Drop for Output {
+            fn drop(&mut self) {
+                lock(&self.returned).push(self.serial);
+            }
+        }
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let mut queue: VecDeque<_> = [(0, 1), (0, 2), (40_000, 3)]
+            .into_iter()
+            .map(|(pts, serial)| Output {
+                pts,
+                serial,
+                returned: returned.clone(),
+            })
+            .collect();
+        assert_eq!(
+            coalesce_due_frames(&mut queue, true, 5_000, |frame| frame.pts),
+            1
+        );
+        assert_eq!(*lock(&returned), [1]);
+        assert_eq!(queue.front().unwrap().serial, 2);
+        let leased = queue.pop_front().unwrap();
+        assert_eq!(
+            coalesce_due_frames(&mut queue, true, 1_000_000, |frame| frame.pts),
+            0
+        );
+        assert_eq!(*lock(&returned), [1]);
+        drop(leased);
+        assert_eq!(*lock(&returned), [1, 2]);
+    }
+
+    #[test]
+    fn decode_reservation_keeps_normal_and_eos_output_within_three_frames() {
+        assert_eq!(video_output_reservation(true, 2), 1);
+        assert_eq!(video_output_reservation(false, 2), 2);
+        assert_eq!(video_output_reservation(false, 0), 0);
+        assert!(video_output_has_capacity(
+            2,
+            video_output_reservation(true, 2)
+        ));
+        assert!(!video_output_has_capacity(
+            3,
+            video_output_reservation(true, 2)
+        ));
+        assert!(video_output_has_capacity(
+            1,
+            video_output_reservation(false, 2)
+        ));
+        assert!(!video_output_has_capacity(
+            2,
+            video_output_reservation(false, 2)
+        ));
+        assert!(!video_output_has_capacity(usize::MAX, 1));
+    }
+
+    #[test]
+    fn decode_scheduler_prioritizes_low_audio_then_rotates_ready_tracks() {
+        let candidates = [(1, Codec::H264, 1), (2, Codec::Aac, 0)];
+        assert_eq!(
+            choose_decode_track(candidates.into_iter(), Some(2), 0.02)
+                .unwrap()
+                .0,
+            2
+        );
+        assert_eq!(
+            choose_decode_track(candidates.into_iter(), Some(1), 0.12)
+                .unwrap()
+                .0,
+            2
+        );
+        assert_eq!(
+            choose_decode_track(candidates.into_iter(), Some(2), 0.12)
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(
+            choose_decode_track([(1, Codec::H264, 1)].into_iter(), Some(1), 0.0)
+                .unwrap()
+                .0,
+            1
+        );
+        assert!(choose_decode_track([].into_iter(), None, 0.0).is_none());
+    }
 
     #[test]
     fn capability_rejects_codecs_we_do_not_decode() {
