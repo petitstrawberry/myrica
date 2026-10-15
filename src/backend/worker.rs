@@ -15,6 +15,8 @@ const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 // Preserve that contract: a backend wake is an early-poll hint, not a promise
 // that every pending operation will notify us before it can make progress.
 const ENGINE_POLL_INTERVAL: Duration = FRAME_INTERVAL;
+// Fence collection has no JS/layout work and must not consume a frame deadline.
+const GPU_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrowserViewport {
@@ -400,6 +402,9 @@ fn run_engine_polling(
     let mut dirty = false;
     let mut next_frame_at = Instant::now();
     let mut next_poll_at = Instant::now();
+    let mut next_completion_at = Instant::now();
+    let mut pending_frame = None;
+    let mut waiting_for_lease = false;
     let mut last_snapshot = None;
     let mut rendered_viewport = None;
     let mut published_frame = None;
@@ -414,15 +419,20 @@ fn run_engine_polling(
                     || !mailbox.commands.is_empty()
                     || mailbox.engine_woken
                     || Instant::now() >= next_poll_at
-                    || (dirty && Instant::now() >= next_frame_at)
+                    || (pending_frame.is_some() && Instant::now() >= next_completion_at)
+                    || (dirty
+                        && pending_frame.is_none()
+                        && !waiting_for_lease
+                        && Instant::now() >= next_frame_at)
                 {
                     break;
                 }
-                let deadline = if dirty {
-                    next_frame_at.min(next_poll_at)
-                } else {
-                    next_poll_at
-                };
+                let mut deadline = next_poll_at;
+                if pending_frame.is_some() {
+                    deadline = deadline.min(next_completion_at);
+                } else if dirty && !waiting_for_lease {
+                    deadline = deadline.min(next_frame_at);
+                }
                 mailbox = shared
                     .ready
                     .wait_timeout(mailbox, deadline.saturating_duration_since(Instant::now()))
@@ -444,6 +454,10 @@ fn run_engine_polling(
             )
         };
 
+        let snapshot_due = tick_due || !commands.is_empty() || !returned_frames.is_empty();
+        if !returned_frames.is_empty() {
+            waiting_for_lease = false;
+        }
         for token in returned_frames {
             backend.release_frame(token);
         }
@@ -459,6 +473,7 @@ fn run_engine_polling(
                     }
                 }
                 navigation => {
+                    pending_frame = None;
                     generation = command_generation;
                     dirty = true;
                     match navigation {
@@ -479,19 +494,42 @@ fn run_engine_polling(
             dirty |= backend.tick();
             next_poll_at = Instant::now() + poll_interval;
         }
-        let snapshot = backend.snapshot();
-        if last_snapshot
-            .as_ref()
-            .is_none_or(|(previous_generation, previous)| {
-                *previous_generation != generation || *previous != snapshot
-            })
-        {
-            shared.publish(generation, snapshot.clone(), None);
-            last_snapshot = Some((generation, snapshot));
+        if snapshot_due {
+            let snapshot = backend.snapshot();
+            if last_snapshot
+                .as_ref()
+                .is_none_or(|(previous_generation, previous)| {
+                    *previous_generation != generation || *previous != snapshot
+                })
+            {
+                shared.publish(generation, snapshot.clone(), None);
+                last_snapshot = Some((generation, snapshot));
+            }
         }
-        if dirty && Instant::now() >= next_frame_at {
-            next_frame_at = Instant::now() + FRAME_INTERVAL;
+        if let Some((submitted_generation, submitted_viewport)) = pending_frame
+            && Instant::now() >= next_completion_at
+        {
+            if let Some(frame) = backend.poll_pending_frame() {
+                let identity = (submitted_generation, submitted_viewport, frame.revision);
+                if published_frame != Some(identity) {
+                    shared.publish(
+                        submitted_generation,
+                        backend.snapshot(),
+                        Some((submitted_viewport, frame)),
+                    );
+                    published_frame = Some(identity);
+                }
+            }
+            if !backend.has_pending_frame() {
+                pending_frame = None;
+            }
+            next_completion_at = Instant::now() + GPU_COMPLETION_POLL_INTERVAL;
+        }
+        if dirty && pending_frame.is_none() && !waiting_for_lease && Instant::now() >= next_frame_at
+        {
             if backend.can_render() {
+                // Charge the submission start, never its completion/collection.
+                next_frame_at = Instant::now() + FRAME_INTERVAL;
                 if let Some(frame) =
                     backend.render_if_ready(viewport.width, viewport.height, viewport.scale)
                 {
@@ -501,8 +539,16 @@ fn run_engine_polling(
                         published_frame = Some(identity);
                     }
                 }
+                if backend.has_pending_frame() {
+                    pending_frame = Some((generation, viewport));
+                    next_completion_at = Instant::now() + GPU_COMPLETION_POLL_INTERVAL;
+                }
                 rendered_viewport = Some(viewport);
                 dirty = false;
+            } else {
+                // Capacity is restored by the UI's returned-frame wake, not by
+                // repeated capacity probes or extra engine ticks.
+                waiting_for_lease = true;
             }
         }
     }
@@ -888,8 +934,11 @@ mod tests {
             received.recv_timeout(Duration::from_secs(2)).unwrap(),
             Signal::Capacity
         );
-        // Let several painting deadlines run while there is no free image.
-        thread::sleep(FRAME_INTERVAL * 3);
+        // No repeated capacity probes, rendering, or ticks while lease-blocked.
+        assert_eq!(
+            received.recv_timeout(FRAME_INTERVAL * 3),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
         shared.mailbox.lock().unwrap().returned_frames.push_back(7);
         shared.ready.notify_one();
         loop {
@@ -914,6 +963,232 @@ mod tests {
         shared.mailbox.lock().unwrap().shutdown = true;
         shared.ready.notify_one();
         worker.join().unwrap();
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum AsyncSignal {
+        Tick,
+        Submit(u64),
+        Poll,
+        Complete(u64),
+        Snapshot,
+    }
+
+    // Models only the asynchronous scheduling protocol. No pixels/device/GPU
+    // success is manufactured or asserted by these worker tests.
+    struct AsyncBackend {
+        signals: Sender<AsyncSignal>,
+        completed: Receiver<()>,
+        pending: Option<(u64, u32, u32)>,
+        revision: u64,
+    }
+    impl BrowserBackend for AsyncBackend {
+        fn navigate(&mut self, _: &str) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn reload(&mut self) {}
+        fn go_back(&mut self) {}
+        fn go_forward(&mut self) {}
+        fn tick(&mut self) -> bool {
+            self.signals.send(AsyncSignal::Tick).unwrap();
+            false
+        }
+        fn render(&mut self, _: u32, _: u32, _: f32) -> BrowserFrame {
+            panic!("asynchronous backend requires submit/collect")
+        }
+        fn render_if_ready(&mut self, width: u32, height: u32, _: f32) -> Option<BrowserFrame> {
+            assert!(
+                self.pending.is_none(),
+                "paint must not overwrite an in-flight target"
+            );
+            self.revision += 1;
+            self.pending = Some((self.revision, width, height));
+            self.signals
+                .send(AsyncSignal::Submit(self.revision))
+                .unwrap();
+            None
+        }
+        fn has_pending_frame(&mut self) -> bool {
+            self.pending.is_some()
+        }
+        fn poll_pending_frame(&mut self) -> Option<BrowserFrame> {
+            self.signals.send(AsyncSignal::Poll).unwrap();
+            if self.completed.try_recv().is_err() {
+                return None;
+            }
+            let (revision, width, height) = self.pending.take().unwrap();
+            self.signals.send(AsyncSignal::Complete(revision)).unwrap();
+            let mut frame = BrowserFrame::empty(width, height);
+            frame.revision = revision;
+            Some(frame)
+        }
+        fn handle_input(&mut self, _: BrowserInput) -> bool {
+            true
+        }
+        fn snapshot(&self) -> BrowserSnapshot {
+            self.signals.send(AsyncSignal::Snapshot).unwrap();
+            BrowserSnapshot {
+                backend_name: "scheduling-protocol",
+                url: String::new(),
+                title: String::new(),
+                load_state: LoadState::Ready,
+                can_go_back: false,
+                can_go_forward: false,
+                text_input: None,
+            }
+        }
+    }
+    fn async_worker() -> (
+        Arc<Shared>,
+        thread::JoinHandle<()>,
+        Receiver<AsyncSignal>,
+        Sender<()>,
+    ) {
+        let (signals, received) = mpsc::channel();
+        let (complete, completed) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            mailbox: Mutex::new(Mailbox {
+                commands: VecDeque::from([(1, Command::Navigate("first".into()))]),
+                returned_frames: VecDeque::new(),
+                viewport: VIEWPORT,
+                generation: 1,
+                engine_woken: true,
+                shutdown: false,
+                shutdown_hook: None,
+                update: None,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            run_engine_polling(
+                Box::new(AsyncBackend {
+                    signals,
+                    completed,
+                    pending: None,
+                    revision: 0,
+                }),
+                &worker_shared,
+                Duration::from_secs(5),
+            )
+        });
+        (shared, worker, received, complete)
+    }
+    fn stop_test_worker(shared: &Shared, worker: thread::JoinHandle<()>) {
+        shared.mailbox.lock().unwrap().shutdown = true;
+        shared.ready.notify_one();
+        worker.join().unwrap();
+    }
+    fn await_async(received: &Receiver<AsyncSignal>, expected: AsyncSignal) {
+        loop {
+            if received.recv_timeout(Duration::from_secs(2)).unwrap() == expected {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_submission_collection_does_not_tick_or_charge_another_frame_interval() {
+        let (shared, worker, received, complete) = async_worker();
+        await_async(&received, AsyncSignal::Submit(1));
+        // A real input invalidates the page while the previous submission is
+        // pending. Hold that submission beyond its existing frame deadline.
+        shared
+            .mailbox
+            .lock()
+            .unwrap()
+            .commands
+            .push_back((1, Command::Input(BrowserInput::Text('x'))));
+        shared.ready.notify_one();
+        await_async(&received, AsyncSignal::Tick);
+        await_async(&received, AsyncSignal::Snapshot);
+        thread::sleep(FRAME_INTERVAL * 2);
+        complete.send(()).unwrap();
+        loop {
+            match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+                AsyncSignal::Poll => {}
+                AsyncSignal::Complete(1) => break,
+                other => panic!("completion-only polling ran engine work: {other:?}"),
+            }
+        }
+        // Publishing the completed frame takes one snapshot. The next submit
+        // must then happen in this same worker iteration, without another
+        // snapshot/tick/deadline wait before it.
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AsyncSignal::Snapshot
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AsyncSignal::Submit(2)
+        );
+        stop_test_worker(&shared, worker);
+    }
+
+    #[test]
+    fn pending_completion_keeps_the_submitted_viewport_after_resize() {
+        let (shared, worker, received, complete) = async_worker();
+        await_async(&received, AsyncSignal::Submit(1));
+        let resized = BrowserViewport {
+            width: 640,
+            height: 480,
+            ..VIEWPORT
+        };
+        {
+            let mut mailbox = shared.mailbox.lock().unwrap();
+            mailbox.viewport = resized;
+            mailbox.engine_woken = true;
+        }
+        shared.ready.notify_one();
+        await_async(&received, AsyncSignal::Tick);
+        await_async(&received, AsyncSignal::Snapshot);
+        complete.send(()).unwrap();
+        await_async(&received, AsyncSignal::Complete(1));
+        await_async(&received, AsyncSignal::Submit(2));
+        {
+            let mailbox = shared.mailbox.lock().unwrap();
+            let (submitted, frame) = mailbox.update.as_ref().unwrap().frame.as_ref().unwrap();
+            assert_eq!(*submitted, VIEWPORT);
+            assert_ne!(*submitted, mailbox.viewport);
+            assert_eq!(
+                (frame.width, frame.height),
+                (VIEWPORT.width, VIEWPORT.height)
+            );
+        }
+        complete.send(()).unwrap();
+        await_async(&received, AsyncSignal::Complete(2));
+        await_async(&received, AsyncSignal::Snapshot);
+        // Wait for publication, using the worker mutex rather than a timing delay.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let mailbox = shared.mailbox.lock().unwrap();
+            let (submitted, frame) = mailbox.update.as_ref().unwrap().frame.as_ref().unwrap();
+            if *submitted == resized {
+                assert_eq!((frame.width, frame.height), (640, 480));
+                break;
+            }
+            drop(mailbox);
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        stop_test_worker(&shared, worker);
+    }
+
+    #[test]
+    fn collected_submission_stops_completion_polling_when_idle() {
+        let (shared, worker, received, complete) = async_worker();
+        await_async(&received, AsyncSignal::Submit(1));
+        complete.send(()).unwrap();
+        await_async(&received, AsyncSignal::Complete(1));
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            AsyncSignal::Snapshot
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_millis(40)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        stop_test_worker(&shared, worker);
     }
 
     #[test]

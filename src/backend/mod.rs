@@ -252,6 +252,17 @@ pub trait BrowserBackend {
         Some(self.render(width, height, scale))
     }
 
+    /// Whether an earlier render has an uncollected asynchronous submission.
+    /// This query must neither tick the engine nor begin another paint.
+    fn has_pending_frame(&mut self) -> bool {
+        false
+    }
+
+    /// Collect only an earlier submission, without starting layout or painting.
+    fn poll_pending_frame(&mut self) -> Option<BrowserFrame> {
+        None
+    }
+
     /// Start a new top-level navigation.
     fn navigate(&mut self, location: &str) -> Result<(), BackendError>;
 

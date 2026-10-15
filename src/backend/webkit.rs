@@ -106,6 +106,65 @@ impl WebKitBackend {
         })
     }
 
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn acquire_gpu_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<BrowserFrame>, BackendError> {
+        let mut image = ffi::GpuFrame::default();
+        // SAFETY: the returned handle is newly owned; the lease remains in
+        // WebCore until UI replacement/discard queues its owner-thread return.
+        let status = unsafe { ffi::scarlet_webview_gpu_frame(self.view.as_ptr(), &mut image) };
+        if status == ffi::EMPTY {
+            return Ok(None);
+        }
+        check(status, "paint WebCore GPU page")?;
+        let capability = super::frame::OwnedGpuCapability::new(image.handle);
+        let Some(release) = self.frame_releaser.as_ref() else {
+            // SAFETY: a just-acquired frame has never reached a consumer.
+            unsafe {
+                ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), image.generation);
+            }
+            return Err(BackendError::new(
+                "GPU frame return queue was not installed",
+            ));
+        };
+        let lease = super::FrameLease::new(image.generation, Arc::clone(release));
+        let mut allocation_id = 0;
+        // SAFETY: the acquired frame's lease is live on its owning view.
+        check(
+            unsafe {
+                ffi::scarlet_webview_gpu_frame_image_id(
+                    self.view.as_ptr(),
+                    image.generation,
+                    &mut allocation_id,
+                )
+            },
+            "query WebCore GPU image identity",
+        )?;
+        if allocation_id == 0 {
+            return Err(BackendError::new(
+                "WebCore returned a zero GPU allocation identity",
+            ));
+        }
+        let owned = super::frame::OwnedGpuImage::new(capability.into_raw(), allocation_id);
+        let frame = self.renderer.gpu_frame(image, owned, lease)?;
+        if frame.width != width || frame.height != height {
+            return Err(BackendError::new(
+                "WebCore returned a mismatched GPU page extent",
+            ));
+        }
+        self.last_frame = frame.revision;
+        if !self.gpu_logged {
+            eprintln!(
+                "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none"
+            );
+            self.gpu_logged = true;
+        }
+        Ok::<_, BackendError>(Some(frame))
+    }
+
     /// Inspect the engine's actual raster work for native integration checks.
     pub fn paint_statistics(&mut self) -> Result<ffi::PaintStatistics, BackendError> {
         let mut statistics = ffi::PaintStatistics::default();
@@ -531,6 +590,45 @@ impl BrowserBackend for WebKitBackend {
     }
 
     #[cfg(feature = "backend-webkit-vulkan")]
+    fn has_pending_frame(&mut self) -> bool {
+        let mut state = 0;
+        // SAFETY: Pure owner-thread state query; it does not poll or submit.
+        let status =
+            unsafe { ffi::scarlet_webview_gpu_frame_state(self.view.as_ptr(), &mut state) };
+        if status == ffi::UNSUPPORTED {
+            return false;
+        }
+        if let Err(error) = check(status, "query pending WebCore GPU frame") {
+            self.fail(error);
+            return false;
+        }
+        match state {
+            0 => false,
+            1 | 2 => true,
+            _ => {
+                self.fail(BackendError::new("invalid WebCore GPU frame state"));
+                false
+            }
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn poll_pending_frame(&mut self) -> Option<BrowserFrame> {
+        if !self.has_pending_frame() {
+            return None;
+        }
+        // The native pending branch only checks completion and exports the
+        // completed allocation. It cannot start a new paint or run JS/layout.
+        match self.acquire_gpu_frame(self.width, self.height) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.fail(error);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
     fn render(&mut self, width: u32, height: u32, scale: f32) -> BrowserFrame {
         self.render_if_ready(width, height, scale)
             .unwrap_or_else(|| BrowserFrame::empty(width, height))
@@ -556,57 +654,7 @@ impl BrowserBackend for WebKitBackend {
                     "paint resized WebCore",
                 )?;
             }
-            let mut image = ffi::GpuFrame::default();
-            // SAFETY: the returned handle is newly owned; the lease remains in
-            // WebCore until UI replacement/discard queues its owner-thread return.
-            let status = unsafe { ffi::scarlet_webview_gpu_frame(self.view.as_ptr(), &mut image) };
-            if status == ffi::EMPTY {
-                return Ok(None);
-            }
-            check(status, "paint WebCore GPU page")?;
-            let capability = super::frame::OwnedGpuCapability::new(image.handle);
-            let Some(release) = self.frame_releaser.as_ref() else {
-                // SAFETY: a just-acquired frame has never reached a consumer.
-                unsafe {
-                    ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), image.generation);
-                }
-                return Err(BackendError::new(
-                    "GPU frame return queue was not installed",
-                ));
-            };
-            let lease = super::FrameLease::new(image.generation, Arc::clone(release));
-            let mut allocation_id = 0;
-            // SAFETY: the acquired frame's lease is live on its owning view.
-            check(
-                unsafe {
-                    ffi::scarlet_webview_gpu_frame_image_id(
-                        self.view.as_ptr(),
-                        image.generation,
-                        &mut allocation_id,
-                    )
-                },
-                "query WebCore GPU image identity",
-            )?;
-            if allocation_id == 0 {
-                return Err(BackendError::new(
-                    "WebCore returned a zero GPU allocation identity",
-                ));
-            }
-            let owned = super::frame::OwnedGpuImage::new(capability.into_raw(), allocation_id);
-            let frame = self.renderer.gpu_frame(image, owned, lease)?;
-            if frame.width != width || frame.height != height {
-                return Err(BackendError::new(
-                    "WebCore returned a mismatched GPU page extent",
-                ));
-            }
-            self.last_frame = frame.revision;
-            if !self.gpu_logged {
-                eprintln!(
-                    "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none"
-                );
-                self.gpu_logged = true;
-            }
-            Ok::<_, BackendError>(Some(frame))
+            self.acquire_gpu_frame(width, height)
         })();
         match result {
             Ok(frame) => frame,
