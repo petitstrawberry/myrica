@@ -218,6 +218,7 @@ fn run() -> Result<(), String> {
     };
     let fixture_only = std::env::args().any(|argument| argument == "--fixture-only");
     let media_only = std::env::args().any(|argument| argument == "--media-only");
+    let compositor_only = std::env::args().any(|argument| argument == "--compositor-only");
     if (base == "--pages" || base == "--video-pages") && pages.is_empty() {
         return Err(String::from("page probes require URLs"));
     }
@@ -225,7 +226,16 @@ fn run() -> Result<(), String> {
     let worker = thread::Builder::new()
         .name(String::from("myrica-webkit-smoke"))
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || engine_probe(&base, sender, &pages, fixture_only, media_only))
+        .spawn(move || {
+            engine_probe(
+                &base,
+                sender,
+                &pages,
+                fixture_only,
+                media_only,
+                compositor_only,
+            )
+        })
         .map_err(|error| error.to_string())?;
     let mut owner = Owner {
         worker: Some(worker),
@@ -272,6 +282,7 @@ fn engine_probe(
     pages: &[String],
     fixture_only: bool,
     media_only: bool,
+    compositor_only: bool,
 ) -> Result<(), String> {
     let wake: WakeCallback = Arc::new(|| {});
     let mut engine = ProbeEngine::new(wake)?;
@@ -282,6 +293,16 @@ fn engine_probe(
                 .ok_or("missing native interruption hook")?,
         ))
         .map_err(|error| error.to_string())?;
+    if compositor_only {
+        #[cfg(feature = "backend-webkit-vulkan")]
+        {
+            compositor_video_probe(&mut engine, base)?;
+            drop(engine);
+            return Ok(());
+        }
+        #[cfg(not(feature = "backend-webkit-vulkan"))]
+        return Err("--compositor-only requires backend-webkit-vulkan".into());
+    }
     if media_only {
         for path in [
             "normal",
@@ -1807,12 +1828,32 @@ fn inspect_video_layout(
     } else {
         (130.0, 100.0)
     };
-    let colour = video_colour(frame, physical(first.0), physical(first.1))
-        .ok_or("first actual GPU video sample is not a decoded fixture colour")?;
-    if video_colour(frame, physical(second.0), physical(second.1)) != Some(colour) {
-        return Err("expanded/restored video has stale, clipped or missing GPU pixels".into());
+    let first_xy = (physical(first.0), physical(first.1));
+    let second_xy = (physical(second.0), physical(second.1));
+    let first_colour = video_colour(frame, first_xy.0, first_xy.1);
+    let second_colour = video_colour(frame, second_xy.0, second_xy.1);
+    match (first_colour, second_colour) {
+        (Some(colour), Some(other)) if colour == other => Ok(colour),
+        _ => {
+            let rgba = |(x, y): (u32, u32)| -> Option<[u8; 4]> {
+                if x >= frame.width || y >= frame.height {
+                    return None;
+                }
+                let offset = (y as usize * frame.width as usize + x as usize) * 4;
+                frame.rgba.get(offset..offset + 4)?.try_into().ok()
+            };
+            let edge_samples =
+                [2032, 2040, 2048, 2056].map(|x| (x, first_xy.1, rgba((x, first_xy.1))));
+            Err(format!(
+                "expanded/restored video has stale, clipped or missing GPU pixels: first_xy={first_xy:?} first_rgba={:?} first_colour={first_colour:?} second_xy={second_xy:?} second_rgba={:?} second_colour={second_colour:?} edge_samples={edge_samples:?} frame={}x{} revision={} viewport={viewport:?} layout={layout}",
+                rgba(first_xy),
+                rgba(second_xy),
+                frame.width,
+                frame.height,
+                frame.revision
+            ))
+        }
     }
-    Ok(colour)
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
