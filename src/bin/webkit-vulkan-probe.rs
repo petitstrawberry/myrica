@@ -268,6 +268,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 "PASS: WebCore DOM/CSS/JS/input Retina GPU pages, two-image backpressure and immutable leased readback"
             );
             compositor_page_contract(view)?;
+            pending_cover_boundary_contract(view)?;
             Ok(())
         })();
         let destroyed = check(ffi::scarlet_webview_destroy(view), "destroy");
@@ -430,8 +431,17 @@ const COMPOSITOR_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>com
 <div id="clip"><div></div></div><div id="mask"></div><div id="scroll"><div id="stripes"></div></div>
 <div id="change" onclick="document.getElementById('moving').style.transform='translate3d(96px,0,0)';document.getElementById('moving').style.opacity='.5'"></div>
 <div id="small" onclick="document.getElementById('scroll').scrollTop=16"></div>
-<div id="large" onclick="document.getElementById('scroll').scrollTop=1100"></div>
-<script>const colours=['red','blue','lime','yellow','magenta','cyan'];for(let i=0;i<20;i++){const stripe=document.createElement('div');stripe.style.background=colours[i%6];document.getElementById('stripes').appendChild(stripe)}</script>"#;
+<div id="large" onclick="document.getElementById('scroll').scrollTop=10316"></div>
+<script>const colours=['red','blue','lime','yellow','magenta','cyan'];for(let i=0;i<100;i++){const stripe=document.createElement('div');stripe.style.background=colours[i%6];document.getElementById('stripes').appendChild(stripe)}</script>"#;
+
+#[cfg(feature = "backend-webkit-vulkan")]
+const PENDING_COVER_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>cover-ready</title>
+<style>html,body{margin:0;width:640px;height:480px;overflow:hidden;background:white}
+#huge{position:absolute;left:-1000px;top:-1000px;width:4096px;height:4096px;will-change:transform;transform:translateZ(0);background:linear-gradient(to right,#20c040 0%,#20c040 60%,#3050d0 60%,#3050d0 100%)}
+#hide,#show{position:fixed;left:520px;top:360px;width:90px;height:40px;z-index:2;background:#ddd}#show{top:420px}
+</style><div id="huge"></div>
+<div id="hide" onclick="document.getElementById('huge').style.transform='translate3d(100000px,0,0)';document.title='cover-hidden'">Hide</div>
+<div id="show" onclick="document.getElementById('huge').style.transform='translateZ(0)';document.title='cover-returned'">Show</div>"#;
 
 #[cfg(feature = "backend-webkit-vulkan")]
 struct ContractGpuFrame {
@@ -636,6 +646,82 @@ unsafe fn settle_contract_composition(
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn pending_cover_boundary_contract(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    if unsafe { ffi::scarlet_webview_resize(view, 640, 480, 1.0) } != ffi::OK {
+        return Err("resize pending-cover fixture failed".into());
+    }
+    unsafe {
+        contract_navigation(
+            view,
+            "https://myrica.test/pending-cover",
+            PENDING_COVER_HTML,
+        )
+    }?;
+    let before = unsafe { compositor_snapshot(view) }?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Observe the first real tile raster pass, without acquiring a final image:
+    // acquire also flushes layers and could finish the incremental outer cover.
+    // The 4096px gradient cannot use the solid-colour layer shortcut. Its
+    // interior visible rect has prefetch cover on every side of the viewport.
+    let first_pass = loop {
+        if unsafe { ffi::scarlet_webview_tick(view) } != ffi::OK {
+            return Err("tick pending-cover initial raster failed".into());
+        }
+        let statistics = unsafe { compositor_snapshot(view) }?;
+        if statistics.tile_paints > before.tile_paints
+            && statistics.tile_pixels.saturating_sub(before.tile_pixels) > 640 * 480
+        {
+            break statistics;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "large gradient did not create real backing tiles: {before:?} -> {statistics:?}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    // Move it out immediately, while cover expansion has not been drained.
+    // Empty visible geometry must clear old pending creation rather than
+    // keeping needs_paint true forever.
+    unsafe { click_fixture(view, 560.0, 380.0) }?;
+    let (hidden, hidden_pixels) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 40, 40, [255; 4])
+        })
+    }?;
+    unsafe { settle_contract_composition(view) }?;
+    let empty_cover = unsafe { compositor_snapshot(view) }?;
+    unsafe { click_fixture(view, 560.0, 440.0) }?;
+    let (returned, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 40, 40, [32, 192, 64, 255])?;
+            contract_pixel(pixels, width, 320, 240, [32, 192, 64, 255])
+        })
+    }?;
+    if unsafe { copy_contract_pixels(&hidden) }? != hidden_pixels {
+        return Err("returning visible cover mutated an old leased output".into());
+    }
+    drop(hidden);
+    drop(returned);
+    unsafe { settle_contract_composition(view) }?;
+    let restored = unsafe { compositor_snapshot(view) }?;
+    if restored.tile_paints <= empty_cover.tile_paints
+        || restored.tile_pixels <= empty_cover.tile_pixels
+    {
+        return Err(format!(
+            "returning visible cover omitted new tile work: {empty_cover:?} -> {restored:?}"
+        ));
+    }
+    println!(
+        "PASS: pending cover moved outside viewport drains to needs_paint=0/EMPTY, return paints new visible tiles; initial={first_pass:?} hidden={empty_cover:?} restored={restored:?}"
+    );
+    Ok(())
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
