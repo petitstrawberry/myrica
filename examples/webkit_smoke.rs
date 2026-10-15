@@ -1217,6 +1217,9 @@ fn video_page_probe_inner(
                         "MYRICA_WEBKIT_SMOKE_PASS stage=actual-video-page url={url} changed_video_pixels={changed} statistics={statistics:?} state={:?}",
                         engine.snapshot()
                     );
+                    if is_youtube_url(url) {
+                        youtube_theater_probe(engine, sender, statistics, frame)?;
+                    }
                     return Ok(());
                 }
             }
@@ -1238,6 +1241,134 @@ fn video_page_probe_inner(
         }
         thread::sleep(Duration::from_millis(40));
     }
+}
+
+fn is_youtube_url(url: &str) -> bool {
+    reqwest::Url::parse(url).ok().is_some_and(|url| {
+        url.host_str().is_some_and(|host| {
+            host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtu.be"
+        })
+    })
+}
+
+fn video_rect_matches(
+    left: &myrica_webkit_sys::MediaStatistics,
+    right: &myrica_webkit_sys::MediaStatistics,
+) -> bool {
+    [
+        (left.rect_x, right.rect_x),
+        (left.rect_y, right.rect_y),
+        (left.rect_width, right.rect_width),
+        (left.rect_height, right.rect_height),
+    ]
+    .iter()
+    .all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= 2.0)
+}
+
+/// Exercise YouTube's own keyboard handler and player. No diagnostic DOM or
+/// replacement media element is inserted into the real site.
+fn youtube_theater_probe(
+    engine: &mut ProbeEngine,
+    sender: &mpsc::Sender<OwnerMessage>,
+    original: myrica_webkit_sys::MediaStatistics,
+    initial_frame: ProbeFrame,
+) -> Result<(), String> {
+    let mut statistics = original;
+    let mut frame = initial_frame;
+    for (stage, toggle, viewport, restore) in [
+        ("youtube-theater-toggle", true, (1280, 720), false),
+        ("youtube-theater-return", true, (1280, 720), true),
+        ("youtube-player-resize-wide", false, (1600, 900), false),
+        ("youtube-player-resize-return", false, (1280, 720), true),
+    ] {
+        let before = statistics;
+        let before_revision = frame.revision;
+        if toggle {
+            // This is the site's genuine 't' shortcut, not a synthetic CSS mode.
+            key(engine, BrowserKey::Character('t'), true);
+            key(engine, BrowserKey::Character('t'), false);
+        }
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut heartbeat = Instant::now();
+        let mut reference: Option<(ProbeFrame, myrica_webkit_sys::MediaStatistics)> = None;
+        let mut last = String::from("no changed native video geometry");
+        loop {
+            engine.tick();
+            frame = engine.render(viewport.0, viewport.1, 1.0)?;
+            statistics = engine
+                .media_statistics(0)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("{stage}: the actual site's video disappeared"))?;
+            // YouTube can adapt its encoded resolution after a viewport
+            // resize; require continuing decoded video without fixing its ABR.
+            let geometry_changed = (statistics.rect_width - before.rect_width).abs() >= 8.0
+                || (statistics.rect_height - before.rect_height).abs() >= 8.0;
+            let geometry_restored = !restore || video_rect_matches(&statistics, &original);
+            if geometry_changed
+                && geometry_restored
+                && statistics.rect_width > 0.0
+                && statistics.rect_height > 0.0
+                && frame.revision > before_revision
+            {
+                if reference
+                    .as_ref()
+                    .is_none_or(|(_, rect)| !video_rect_matches(&statistics, rect))
+                {
+                    reference = Some((frame.clone(), statistics));
+                }
+                let (first, _) = reference.as_ref().ok_or("missing video pixel reference")?;
+                // Sample inside the real video rectangle, away from player
+                // chrome. A geometry-only repaint cannot satisfy this check.
+                let left = (statistics.rect_x + statistics.rect_width * 0.15)
+                    .clamp(0.0, f64::from(frame.width)) as usize;
+                let right = (statistics.rect_x + statistics.rect_width * 0.85)
+                    .clamp(0.0, f64::from(frame.width)) as usize;
+                let top = (statistics.rect_y + statistics.rect_height * 0.15)
+                    .clamp(0.0, f64::from(frame.height)) as usize;
+                let bottom = (statistics.rect_y + statistics.rect_height * 0.85)
+                    .clamp(0.0, f64::from(frame.height)) as usize;
+                let mut changed = 0;
+                if frame.revision > first.revision {
+                    for y in top..bottom {
+                        for x in left..right {
+                            let offset = (y * frame.width as usize + x) * 4;
+                            if first.rgba[offset..offset + 4] != frame.rgba[offset..offset + 4] {
+                                changed += 1;
+                            }
+                        }
+                    }
+                }
+                if changed >= 100
+                    && statistics.current_time > before.current_time + 0.5
+                    && statistics.presented_frames >= before.presented_frames + 4
+                    && statistics.paused == 0
+                    && statistics.ended == 0
+                {
+                    println!(
+                        "MYRICA_WEBKIT_SMOKE_PASS stage={stage} viewport={}x{} changed_video_pixels={changed} revision={}..{} before={before:?} after={statistics:?}",
+                        viewport.0, viewport.1, before_revision, frame.revision
+                    );
+                    break;
+                }
+                last = format!(
+                    "geometry changed but future video has not advanced: changed_video_pixels={changed} statistics={statistics:?}"
+                );
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{stage}: real YouTube shortcut/resize did not produce continuing video: {last}; before={before:?}; after={statistics:?}"
+                ));
+            }
+            if heartbeat.elapsed() >= Duration::from_secs(5) {
+                sender
+                    .send(OwnerMessage::PageProgress)
+                    .map_err(|error| error.to_string())?;
+                heartbeat = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Ok(())
 }
 
 fn verify_media_presentation_history(state: &serde_json::Value, path: &str) -> Result<(), String> {
