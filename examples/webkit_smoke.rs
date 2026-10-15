@@ -214,7 +214,9 @@ fn run() -> Result<(), String> {
     let pages: Vec<String> = if base == "--pages" || base == "--video-pages" {
         std::env::args()
             .skip(2)
-            .filter(|argument| argument != "--youtube-comments")
+            .filter(|argument| {
+                !matches!(argument.as_str(), "--youtube-comments" | "--youtube-search")
+            })
             .collect()
     } else {
         Vec::new()
@@ -1479,6 +1481,9 @@ fn video_page_probe_inner(
                         if std::env::args().any(|argument| argument == "--youtube-comments") {
                             youtube_comments_probe(engine, sender)?;
                         }
+                        if std::env::args().any(|argument| argument == "--youtube-search") {
+                            youtube_search_probe(engine, sender)?;
+                        }
                     }
                     return Ok(());
                 }
@@ -1629,6 +1634,72 @@ fn youtube_theater_probe(
         }
     }
     Ok(())
+}
+
+fn youtube_search_probe(
+    engine: &mut ProbeEngine,
+    sender: &mpsc::Sender<OwnerMessage>,
+) -> Result<(), String> {
+    // Use the site's genuine search input and event handlers. Text content
+    // excludes the input's value, so it can distinguish returned suggestions
+    // from merely typing the query into an otherwise unresponsive control.
+    let before = engine
+        .text_content("masthead")
+        .map_err(|e| e.to_string())?
+        .ok_or("YouTube masthead is absent")?;
+    click(engine, 500.0, 28.0);
+    let mut max_input = Duration::ZERO;
+    let mut max_tick = Duration::ZERO;
+    let started = Instant::now();
+    for character in "scarlet".chars() {
+        let input_started = Instant::now();
+        type_character(engine, character);
+        max_input = max_input.max(input_started.elapsed());
+        let tick_started = Instant::now();
+        engine.tick();
+        max_tick = max_tick.max(tick_started.elapsed());
+        engine.render(1280, 720, 1.0)?;
+        thread::sleep(Duration::from_millis(120));
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut heartbeat = Instant::now();
+    loop {
+        let tick_started = Instant::now();
+        engine.tick();
+        max_tick = max_tick.max(tick_started.elapsed());
+        engine.render(1280, 720, 1.0)?;
+        let text = engine
+            .text_content("masthead")
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        if text != before && text.to_ascii_lowercase().contains("scarlet") {
+            println!(
+                "MYRICA_WEBKIT_SMOKE_PASS stage=youtube-search-suggestions elapsed_ms={} max_input_us={} max_tick_us={} text={:?}",
+                started.elapsed().as_millis(),
+                max_input.as_micros(),
+                max_tick.as_micros(),
+                text.chars().take(512).collect::<String>()
+            );
+            key(engine, BrowserKey::Escape, true);
+            key(engine, BrowserKey::Escape, false);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "YouTube search suggestions missing: max_input_us={} max_tick_us={} masthead={:?}",
+                max_input.as_micros(),
+                max_tick.as_micros(),
+                text.chars().take(512).collect::<String>()
+            ));
+        }
+        if heartbeat.elapsed() >= Duration::from_secs(5) {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|e| e.to_string())?;
+            heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn youtube_comments_probe(
