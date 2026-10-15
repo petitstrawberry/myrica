@@ -567,10 +567,12 @@ const COMPOSITOR_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>com
 #clip{position:absolute;left:24px;top:144px;width:96px;height:96px;border-radius:24px;overflow:hidden;background:lime;transform:translateZ(0)}
 #clip div{position:absolute;left:20px;top:20px;width:140px;height:140px;background:blue}
 #mask{position:absolute;left:160px;top:144px;width:96px;height:96px;background:red;transform:translateZ(0);mask-image:linear-gradient(to right,black 50%,transparent 50%);-webkit-mask-image:linear-gradient(to right,black 50%,transparent 50%)}
+#blur{position:absolute;left:24px;top:304px;width:64px;height:64px;background:red;filter:blur(4px);transform:translateZ(0)}
+#shadow{position:absolute;left:160px;top:304px;width:48px;height:48px;background:blue;filter:drop-shadow(64px 0 4px lime);transform:translateZ(0)}
 #scroll{position:absolute;left:384px;top:24px;width:128px;height:240px;overflow:auto;will-change:scroll-position;transform:translateZ(0)}
 #stripes div{height:128px}#change,#small,#large{position:absolute;left:560px;width:64px;height:40px;background:#888;top:320px}#small{top:368px}#large{top:416px}
 </style><div id="moving"></div><div id="group"><div></div><div></div></div>
-<div id="clip"><div></div></div><div id="mask"></div><div id="scroll"><div id="stripes"></div></div>
+<div id="clip"><div></div></div><div id="mask"></div><div id="blur"></div><div id="shadow"></div><div id="scroll"><div id="stripes"></div></div>
 <div id="change" onclick="document.getElementById('moving').style.transform='translate3d(96px,0,0)';document.getElementById('moving').style.opacity='.5'"></div>
 <div id="small" onclick="document.getElementById('scroll').scrollTop=16"></div>
 <div id="large" onclick="document.getElementById('scroll').scrollTop=10316"></div>
@@ -722,6 +724,37 @@ fn contract_pixel(
             bytes.get(offset..offset + 4)
         ))
     }
+}
+
+// Test the filtered output, including pixels outside the source rectangles.
+// Deep interiors have exact colours; the gaussian fringe allows differences
+// between Skia's supported blur kernels while rejecting white or unblurred edges.
+#[cfg(feature = "backend-webkit-vulkan")]
+fn verify_filter_pixels(bytes: &[u8], width: u32) -> Result<(), String> {
+    contract_pixel(bytes, width, 56, 336, [255, 0, 0, 255])?;
+    contract_pixel(bytes, width, 184, 328, [0, 0, 255, 255])?;
+    contract_pixel(bytes, width, 248, 328, [0, 255, 0, 255])?;
+    contract_pixel(bytes, width, 304, 328, [255; 4])?;
+    for (x, y, rgba) in [
+        (22, 336, [255, 166, 166, 255]),
+        (222, 328, [166, 255, 166, 255]),
+    ] {
+        let offset = (y * width as usize + x) * 4;
+        let expected = [rgba[2], rgba[1], rgba[0], rgba[3]];
+        if !bytes.get(offset..offset + 4).is_some_and(|actual| {
+            actual[3] == 255
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(&a, b)| a.abs_diff(b) <= 40)
+        }) {
+            return Err(format!(
+                "CSS filter fringe ({x},{y}) expected RGBA {rgba:?} (+/-40), got BGRA {:?}",
+                bytes.get(offset..offset + 4)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
@@ -891,9 +924,10 @@ unsafe fn compositor_page_contract(
             ] {
                 contract_pixel(pixels, width, x, y, colour)?;
             }
-            Ok(())
+            verify_filter_pixels(pixels, width)
         })
     }?;
+    println!("PASS: actual GPU CSS blur and drop-shadow source, shadow and gaussian fringe pixels");
     let first_id = unsafe { gpu_image_id(view, first.native.generation) }?;
     unsafe { settle_contract_composition(view) }?;
     let initial = unsafe { compositor_snapshot(view) }?;
@@ -1042,4 +1076,33 @@ unsafe fn compositor_page_contract(
         "PASS: navigation detaches old compositor tree, resize preserves immutable leases and cumulative tile metrics"
     );
     Ok(())
+}
+
+#[cfg(all(test, feature = "backend-webkit-vulkan"))]
+mod filter_pixel_tests {
+    use super::verify_filter_pixels;
+
+    #[test]
+    fn filter_contract_rejects_missing_filter_outputs() {
+        let width = 640;
+        let mut pixels = vec![255; width * 480 * 4];
+        for (x, y, bgra) in [
+            (56, 336, [0, 0, 255, 255]),
+            (184, 328, [255, 0, 0, 255]),
+            (248, 328, [0, 255, 0, 255]),
+            (22, 336, [166, 166, 255, 255]),
+            (222, 328, [166, 255, 166, 255]),
+        ] {
+            let offset = (y * width + x) * 4;
+            pixels[offset..offset + 4].copy_from_slice(&bgra);
+        }
+        assert!(verify_filter_pixels(&pixels, width as u32).is_ok());
+        for (x, y) in [(248, 328), (22, 336), (222, 328)] {
+            let offset = (y * width + x) * 4;
+            let previous = pixels[offset..offset + 4].to_vec();
+            pixels[offset..offset + 4].fill(255);
+            assert!(verify_filter_pixels(&pixels, width as u32).is_err());
+            pixels[offset..offset + 4].copy_from_slice(&previous);
+        }
+    }
 }
