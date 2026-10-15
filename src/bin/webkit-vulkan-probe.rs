@@ -58,15 +58,17 @@ fn main() -> ExitCode {
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
+fn check(status: i32, operation: &str) -> Result<(), String> {
+    if status == myrica_webkit_sys::OK {
+        Ok(())
+    } else {
+        Err(format!("{operation}: status {status}"))
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
 fn gpu_page_contract() -> Result<(), String> {
     use myrica_webkit_sys as ffi;
-    fn check(status: i32, operation: &str) -> Result<(), String> {
-        if status == ffi::OK {
-            Ok(())
-        } else {
-            Err(format!("{operation}: status {status}"))
-        }
-    }
     // Every call runs on this owner. The fixture uses the ordinary HTTP response
     // bridge, parser, JavaScriptCore, CSS layout and frame-view GPU painting.
     unsafe {
@@ -88,6 +90,7 @@ fn gpu_page_contract() -> Result<(), String> {
             ffi::scarlet_webview_create(&configuration, &mut view),
             "create",
         )?;
+        let mut pending_teardown = false;
         let result = (|| {
             let location = "https://myrica.test/gpu-contract";
             check(
@@ -258,6 +261,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 "release resized",
             )?;
             verify_stale_image_id(view, resized.generation)?;
+            async_gpu_lifetime_contract(view, &second, second_id, resized.generation)?;
             close_frame(second.handle);
             check(
                 ffi::scarlet_webview_release_gpu_frame(view, second.generation),
@@ -269,23 +273,161 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
             );
             compositor_page_contract(view)?;
             pending_cover_boundary_contract(view)?;
+            let mut compositor = ffi::CompositingStatistics::default();
+            if ffi::scarlet_webview_compositing_statistics(view, &mut compositor) == ffi::OK {
+                // Start an actual GPU update and immediately destroy its owner.
+                // No completion poll or readback may drain this on our behalf.
+                check(
+                    ffi::scarlet_webview_resize(view, 706, 514, 1.0),
+                    "pending teardown resize",
+                )?;
+                check(ffi::scarlet_webview_tick(view), "pending teardown layout")?;
+                let mut unfinished = ffi::GpuFrame::default();
+                if ffi::scarlet_webview_gpu_frame(view, &mut unfinished) != ffi::EMPTY
+                    || unfinished.handle != -1
+                    || unfinished.generation != 0
+                {
+                    return Err("pending teardown exposed unfinished GPU output".into());
+                }
+                pending_teardown = true;
+            }
             Ok(())
         })();
         let destroyed = check(ffi::scarlet_webview_destroy(view), "destroy");
         let shutdown = check(ffi::scarlet_webview_shutdown(), "shutdown");
-        result.and(destroyed).and(shutdown)
+        let result = result.and(destroyed).and(shutdown);
+        if result.is_ok() && pending_teardown {
+            println!(
+                "PASS: pending GPU submission drains during actual owner destruction and engine shutdown"
+            );
+        }
+        result
     }
 }
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn async_gpu_lifetime_contract(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    leased: &myrica_webkit_sys::GpuFrame,
+    leased_id: u64,
+    last_generation: u64,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    let mut compositor = ffi::CompositingStatistics::default();
+    let status = unsafe { ffi::scarlet_webview_compositing_statistics(view, &mut compositor) };
+    if status == ffi::UNSUPPORTED {
+        return Ok(());
+    }
+    check(status, "async compositor profile")?;
+    let mut before = ffi::PaintStatistics::default();
+    check(
+        unsafe { ffi::scarlet_webview_paint_statistics(view, &mut before) },
+        "before pending submit",
+    )?;
+    check(
+        unsafe { ffi::scarlet_webview_resize(view, 448, 288, 2.0) },
+        "pending resize",
+    )?;
+    check(
+        unsafe { ffi::scarlet_webview_tick(view) },
+        "pending resize layout",
+    )?;
+    let mut pending = ffi::GpuFrame::default();
+    let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut pending) };
+    if status != ffi::EMPTY
+        || pending.handle != -1
+        || pending.generation != 0
+        || pending.width != 0
+        || pending.height != 0
+    {
+        return Err(format!(
+            "async submit published before completion observation: status={status} handle={} generation={} size={}x{}",
+            pending.handle, pending.generation, pending.width, pending.height
+        ));
+    }
+    let mut submitted = ffi::PaintStatistics::default();
+    check(
+        unsafe { ffi::scarlet_webview_paint_statistics(view, &mut submitted) },
+        "pending paint statistics",
+    )?;
+    if submitted.paints != before.paints || submitted.painted_pixels != before.painted_pixels {
+        return Err("in-flight GPU page advanced completed paint statistics".into());
+    }
+    unsafe { verify_stale_image_id(view, last_generation + 1) }?;
+    // Cancel while the target is reserved, before any tick/capacity poll can
+    // observe completion. Resize must drain it without publishing or reusing
+    // the old storage early, while the second output remains externally leased.
+    check(
+        unsafe { ffi::scarlet_webview_resize(view, 480, 320, 2.0) },
+        "resize during pending submit",
+    )?;
+    unsafe { verify_stale_image_id(view, last_generation + 1) }?;
+    let native = unsafe { acquire_gpu(view) }?;
+    let completed = ContractGpuFrame { view, native };
+    if completed.native.generation != last_generation + 1
+        || completed.native.width != 480
+        || completed.native.height != 320
+    {
+        return Err("canceled GPU page consumed a generation or leaked an old extent".into());
+    }
+    if unsafe { gpu_image_id(view, completed.native.generation) }? == leased_id {
+        return Err("pending resize reused the still-leased allocation".into());
+    }
+    unsafe {
+        verify_gpu_pixels(
+            view,
+            completed.native.generation,
+            [0, 255, 255, 255],
+            [0, 255, 0, 255],
+        )
+    }?;
+    unsafe { verify_gpu_pixels(view, leased.generation, [0, 0, 255, 255], [0, 255, 0, 255]) }?;
+    if unsafe { gpu_image_id(view, leased.generation) }? != leased_id {
+        return Err("async cancellation changed a still-leased allocation identity".into());
+    }
+    let mut after = ffi::PaintStatistics::default();
+    check(
+        unsafe { ffi::scarlet_webview_paint_statistics(view, &mut after) },
+        "completed paint statistics",
+    )?;
+    if after.paints != before.paints + 1 {
+        return Err("canceled submit was counted as a completed GPU page".into());
+    }
+    println!(
+        "PASS: async completion gates capability/generation/statistics, pending resize drains and preserves old GPU lease"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "backend-webkit-vulkan")]
 unsafe fn acquire_gpu(
     view: *mut myrica_webkit_sys::ScarletWebView,
 ) -> Result<myrica_webkit_sys::GpuFrame, String> {
-    let mut frame = myrica_webkit_sys::GpuFrame::default();
-    let status = unsafe { myrica_webkit_sys::scarlet_webview_gpu_frame(view, &mut frame) };
-    if status != 0 || frame.handle < 0 {
-        Err(format!("acquire GPU page: {status}"))
-    } else {
-        Ok(frame)
+    use myrica_webkit_sys as ffi;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut frame = ffi::GpuFrame::default();
+        let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut frame) };
+        if status == ffi::OK {
+            if frame.handle < 0 || frame.generation == 0 {
+                return Err("completed GPU page has no valid capability/generation".into());
+            }
+            return Ok(frame);
+        }
+        if status != ffi::EMPTY {
+            return Err(format!("acquire GPU page: {status}"));
+        }
+        // An in-flight target is never published as a usable native capability.
+        if frame.handle != -1 || frame.generation != 0 || frame.width != 0 || frame.height != 0 {
+            return Err("pending GPU page exposed an unfinished capability".into());
+        }
+        check(
+            unsafe { ffi::scarlet_webview_tick(view) },
+            "GPU completion tick",
+        )?;
+        if std::time::Instant::now() >= deadline {
+            return Err("actual GPU page completion timed out".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 #[cfg(feature = "backend-webkit-vulkan")]

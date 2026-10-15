@@ -56,49 +56,63 @@ impl ProbeEngine {
         }
     }
     fn render(&mut self, width: u32, height: u32, scale: f32) -> Result<ProbeFrame, String> {
-        self.release_returned();
-        if let Some(frame) = self.engine.render_if_ready(width, height, scale) {
-            let result = (|| {
-                #[cfg(feature = "backend-webkit-vulkan")]
-                let rgba: Arc<[u8]> = self
-                    .engine
-                    .diagnostic_gpu_frame_rgba(&frame)
-                    .map_err(|error| error.to_string())?
-                    .into();
-                #[cfg(not(feature = "backend-webkit-vulkan"))]
-                let rgba = {
-                    let texture = frame
-                        .draws
-                        .first()
-                        .and_then(|draw| draw.texture.as_ref())
-                        .ok_or("native frame has no real texture")?;
-                    match &texture.source {
-                        backend::BrowserTextureSource::Rgba8(pixels) => Arc::clone(pixels),
-                        #[cfg(target_os = "scarlet")]
-                        _ => return Err(String::from("CPU probe received a GPU capability")),
-                    }
-                };
-                Ok::<_, String>(ProbeFrame {
-                    revision: frame.revision,
-                    width: frame.width,
-                    height: frame.height,
-                    rgba,
-                })
-            })();
-            // Close the exported capability, then return its storage lease on
-            // the genuine WebCore owner even when diagnostic readback failed.
-            drop(frame);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             self.release_returned();
-            self.cached = Some(result?);
+            if let Some(frame) = self.engine.render_if_ready(width, height, scale) {
+                let result = (|| {
+                    #[cfg(feature = "backend-webkit-vulkan")]
+                    let rgba: Arc<[u8]> = self
+                        .engine
+                        .diagnostic_gpu_frame_rgba(&frame)
+                        .map_err(|error| error.to_string())?
+                        .into();
+                    #[cfg(not(feature = "backend-webkit-vulkan"))]
+                    let rgba = {
+                        let texture = frame
+                            .draws
+                            .first()
+                            .and_then(|draw| draw.texture.as_ref())
+                            .ok_or("native frame has no real texture")?;
+                        match &texture.source {
+                            backend::BrowserTextureSource::Rgba8(pixels) => Arc::clone(pixels),
+                            #[cfg(target_os = "scarlet")]
+                            _ => return Err(String::from("CPU probe received a GPU capability")),
+                        }
+                    };
+                    Ok::<_, String>(ProbeFrame {
+                        revision: frame.revision,
+                        width: frame.width,
+                        height: frame.height,
+                        rgba,
+                    })
+                })();
+                // Close the exported capability, then return its storage lease on
+                // the genuine WebCore owner even when diagnostic readback failed.
+                drop(frame);
+                self.release_returned();
+                self.cached = Some(result?);
+            }
+            if let LoadState::Failed(error) = self.engine.snapshot().load_state {
+                return Err(format!("native paint failed: {error}"));
+            }
+            if let Some(frame) = self
+                .cached
+                .as_ref()
+                .filter(|frame| frame.width == width && frame.height == height)
+            {
+                return Ok(frame.clone());
+            }
+            // Only initial/resize acquisition waits for actual GPU completion.
+            // Existing matching cached frames preserve the normal nonblocking poll.
+            if Instant::now() >= deadline {
+                return Err(String::from(
+                    "native GPU frame completion timed out without diagnostic pixels",
+                ));
+            }
+            self.engine.tick();
+            thread::sleep(Duration::from_millis(1));
         }
-        if let LoadState::Failed(error) = self.engine.snapshot().load_state {
-            return Err(format!("native paint failed: {error}"));
-        }
-        self.cached
-            .as_ref()
-            .filter(|frame| frame.width == width && frame.height == height)
-            .cloned()
-            .ok_or_else(|| String::from("native frame has no diagnostic pixels"))
     }
 }
 impl std::ops::Deref for ProbeEngine {
