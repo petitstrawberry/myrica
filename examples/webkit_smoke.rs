@@ -227,14 +227,16 @@ fn run() -> Result<(), String> {
         .name(String::from("myrica-webkit-smoke"))
         .stack_size(8 * 1024 * 1024)
         .spawn(move || {
-            engine_probe(
+            let result = engine_probe(
                 &base,
                 sender,
                 &pages,
                 fixture_only,
                 media_only,
                 compositor_only,
-            )
+            );
+            eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=owner-body-returned");
+            result
         })
         .map_err(|error| error.to_string())?;
     let mut owner = Owner {
@@ -264,10 +266,14 @@ fn run() -> Result<(), String> {
             Err(error) => return Err(format!("native owner stalled: {error}")),
         }
     }
+    eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=before-owner-join");
     owner.join()?;
+    eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=after-owner-join");
     // SAFETY: The concurrent-safe API must now report that genuine owner
     // shutdown revoked its VM binding; a joined thread alone is insufficient.
+    eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=before-revocation-check");
     let status = unsafe { myrica_webkit_sys::scarlet_webview_request_termination() };
+    eprintln!("MYRICA_WEBKIT_SMOKE_TRACE stage=after-revocation-check status={status}");
     if status != myrica_webkit_sys::NOT_INITIALIZED {
         return Err(format!(
             "owner returned without native shutdown (status {status})"
