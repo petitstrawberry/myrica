@@ -604,6 +604,30 @@ fn engine_probe(
     }
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=view-transition-skipped-dom-update state={state}");
 
+    engine
+        .navigate(&format!("{base}/js-execution"))
+        .map_err(|error| error.to_string())?;
+    wait_title(&mut engine, "js-execution-ready")?;
+    let before = engine.render(800, 600, 1.0)?;
+    assert_pixel(&before, 30, 30, [0x12, 0x34, 0x56, 255])?;
+    click(&mut engine, 60.0, 155.0);
+    wait_title(&mut engine, "js-execution-done")?;
+    let observation = engine
+        .text_content("js-execution-state")
+        .map_err(|error| error.to_string())?
+        .ok_or("JavaScript execution observation missing")?;
+    let state: serde_json::Value =
+        serde_json::from_str(&observation).map_err(|error| error.to_string())?;
+    verify_js_execution(&state)?;
+    let after = engine.render(800, 600, 1.0)?;
+    assert_pixel(&after, 30, 30, [0x65, 0x43, 0x21, 255])?;
+    if after.revision == before.revision {
+        return Err(String::from(
+            "JavaScript DOM callback did not update GPU pixels",
+        ));
+    }
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=js-execution-contract state={state}");
+
     if fixture_only {
         drop(engine);
         println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
@@ -621,6 +645,30 @@ fn engine_probe(
     // Drop runs genuine Page destruction and native WebCore owner shutdown.
     drop(engine);
     println!("MYRICA_WEBKIT_SMOKE_PASS stage=owner-destroyed");
+    Ok(())
+}
+
+fn verify_js_execution(state: &serde_json::Value) -> Result<(), String> {
+    let expected = serde_json::json!({
+        "calls": [9, 4, 9, 13, 63],
+        "arity": [[7, "undefined", 1], [7, "number", 3]],
+        "recursion": 5040,
+        "closure": [42, 43, 50],
+        "prototype": [42, 20, true],
+        "exceptions": ["js-sentinel", "finally-js", "SyntaxError", "finally-dom"],
+        "typedArray": [30, 9, 7],
+        "allocation": [523776, 1024],
+        "rooted": ["root-live", 26, 42, true],
+        "map": [13, 2, 2],
+        "promise": 17,
+        "order": ["sync", "after-schedule", "microtask", "await", "timer"],
+        "dom": [1, 1, 17]
+    });
+    if state != &expected {
+        return Err(format!(
+            "JavaScript execution contract mismatch: expected {expected}, got {state}"
+        ));
+    }
     Ok(())
 }
 

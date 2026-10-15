@@ -146,6 +146,87 @@ document.getElementById('transition').addEventListener('click', async () => {
 publishTransitionState();
 </script>"""
 
+JS_EXECUTION = b"""<!doctype html><meta charset="utf-8"><title>js-execution-ready</title>
+<style>body{margin:0}#patch{position:absolute;left:20px;top:20px;width:128px;height:96px;background:#123456}
+button{position:absolute;left:20px;top:140px;width:128px;height:32px}</style>
+<div id="patch"></div><button id="execute">Run contract</button>
+<span id="js-execution-state" style="display:none"></span>
+<script>
+let clicks = 0;
+document.getElementById('execute').addEventListener('click', async () => {
+  clicks++;
+  try {
+    function sum(a, b) { return (a ?? 0) + (b ?? 0); }
+    function arity(a, b) { return [a, typeof b, arguments.length]; }
+    function factorial(n) { return n < 2 ? 1 : n * factorial(n - 1); }
+    function counter(value) { return (step = 1) => value += step; }
+    function invoke(fn, ...args) { return fn(...args); }
+    const count = counter(40);
+    function Box(value) { this.value = value; }
+    Box.prototype.twice = function() { return this.value * 2; };
+    const box = new Box(21);
+    const child = Object.create(box);
+    child.value = 10;
+    const result = {
+      calls: [sum(4, 5), sum(4), sum(4, 5, 99), sum.apply(null, [6, 7, 8]), Math.imul(7, 9)],
+      arity: [arity(7), arity(7, 8, 9)],
+      recursion: factorial(7),
+      closure: [count(2), count(), invoke(count, 7)],
+      prototype: [box.twice(), child.twice(), Object.getPrototypeOf(box) === Box.prototype]
+    };
+    const exceptions = [];
+    function throwFromCall() { throw new Error('js-sentinel'); }
+    try { throwFromCall(); }
+    catch (error) { exceptions.push(error.message); }
+    finally { exceptions.push('finally-js'); }
+    try { document.querySelector('['); }
+    catch (error) { exceptions.push(error.name); }
+    finally { exceptions.push('finally-dom'); }
+    result.exceptions = exceptions;
+    const bytes = new Uint8Array([3, 5, 7, 11]);
+    new DataView(bytes.buffer).setUint8(1, 9);
+    result.typedArray = [bytes.reduce((a, b) => a + b, 0), ...bytes.subarray(1, 3)];
+    const rooted = {text: 'root-live', values: [5, 8, 13], check: () => box.twice()};
+    const map = new Map([[rooted, {value: 13}], ['count', 2]]);
+    let allocationChecksum = 0;
+    let batches = 0;
+    // Bounded, short-lived allocations only: retain the closure/object/Map
+    // roots across calls and microtask suspension without a nonstandard gc().
+    for (let i = 0; i < 1024; i++) {
+      const temporary = Array.from({length: 8}, (_, j) => ({value: i + j, owner: rooted}));
+      allocationChecksum += temporary[0].value;
+      batches++;
+      if ((i & 63) === 63) await Promise.resolve();
+    }
+    result.allocation = [allocationChecksum, batches];
+    result.rooted = [rooted.text, rooted.values.reduce((a, b) => a + b, 0), rooted.check(), map.has(rooted)];
+    result.map = [map.get(rooted).value, map.get('count'), map.size];
+    const order = ['sync'];
+    const pending = Promise.resolve().then(() => { order.push('microtask'); return 17; });
+    order.push('after-schedule');
+    result.promise = await pending;
+    order.push('await');
+    await new Promise(resolve => setTimeout(() => { order.push('timer'); resolve(); }, 0));
+    result.order = order;
+    let domCallbacks = 0;
+    let detail = 0;
+    const patch = document.getElementById('patch');
+    patch.addEventListener('contract-update', event => {
+      domCallbacks++;
+      detail = event.detail;
+      patch.style.backgroundColor = '#654321';
+    }, {once: true});
+    patch.dispatchEvent(new CustomEvent('contract-update', {detail: result.promise}));
+    result.dom = [clicks, domCallbacks, detail];
+    document.getElementById('js-execution-state').textContent = JSON.stringify(result);
+    document.title = 'js-execution-done';
+  } catch (error) {
+    document.getElementById('js-execution-state').textContent = JSON.stringify({error: String(error)});
+    document.title = 'js-execution-failed:' + error;
+  }
+});
+</script>"""
+
 HUNG = b"""<!doctype html><html><head><meta charset="utf-8">
 <title>hung-loading</title></head><body><script>
 document.title = 'hung-entered'; while (true) {}
@@ -582,6 +663,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", SECOND)
         elif path == "/view-transition":
             self.reply(200, "text/html; charset=utf-8", VIEW_TRANSITION)
+        elif path == "/js-execution":
+            self.reply(200, "text/html; charset=utf-8", JS_EXECUTION)
         elif path == "/damage":
             self.reply(200, "text/html", b"<!doctype html><title>damage-ready</title><body style='margin:0'><div style='position:absolute;left:20px;top:20px;width:20px;height:20px;background:#123456' id='patch'></div><script>window.addEventListener('keydown',()=>{document.getElementById('patch').style.backgroundColor='#654321';document.title='damage-changed'})</script></body>")
         elif path == "/storage":
