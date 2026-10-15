@@ -676,9 +676,26 @@ pub unsafe extern "C" fn scarlet_media_parser_release(parser: *mut MediaParser, 
     parser.shared.wake.notify_all();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecoderResetReason {
+    Configure,
+    Flush,
+    Seek,
+}
+impl DecoderResetReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Configure => "configure",
+            Self::Flush => "flush",
+            Self::Seek => "seek",
+        }
+    }
+}
+
 struct SessionTrack {
     track: Track,
     generation: u64,
+    reset_reason: DecoderResetReason,
     samples: VecDeque<QueuedSample>,
     ended: bool,
     drained: bool,
@@ -867,9 +884,6 @@ impl HardwareVideoDecoder {
             .map_err(MediaError::Decode)?;
         let reorder = PresentationReorder::new(configuration.max_reorder_frames())?;
         let dimensions = (configuration.width(), configuration.height());
-        eprintln!(
-            "[myrica:media] video-decoder=scarlet-native device=/dev/video0 output=nv12 cpu-h264-fallback=none"
-        );
         Ok(Self {
             decoder,
             configuration,
@@ -1223,12 +1237,13 @@ fn session_worker(shared: &SessionShared) {
                     track.generation,
                     track.track.clone(),
                     track.cancellation.clone(),
+                    track.reset_reason,
                     sample,
                     reserved,
                 )
             },
         );
-        if let Some((id, generation, track, cancellation, sample, reserved)) = work {
+        if let Some((id, generation, track, cancellation, reason, sample, reserved)) = work {
             last_decoded_track = Some(id);
             if let Some(sample) = &sample {
                 state.input_bytes -= sample.sample.data.len();
@@ -1246,6 +1261,18 @@ fn session_worker(shared: &SessionShared) {
                 };
                 match decoder {
                     Ok(decoder) => {
+                        if track.codec == Codec::H264 {
+                            eprintln!(
+                                "[myrica:media] video-decoder=scarlet-native device=/dev/video0 output=nv12 cpu-h264-fallback=none session={:#x} track={} generation={} reason={} width={} height={} configuration_bytes={}",
+                                shared as *const SessionShared as usize,
+                                id,
+                                generation,
+                                reason.label(),
+                                track.width,
+                                track.height,
+                                track.extradata.len()
+                            );
+                        }
                         decoders.insert(
                             id,
                             TrackDecoder {
@@ -1423,9 +1450,8 @@ fn session_worker(shared: &SessionShared) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn scarlet_media_session_create() -> *mut MediaSession {
-    let shared = Arc::new(SessionShared {
+fn new_session_shared() -> Arc<SessionShared> {
+    Arc::new(SessionShared {
         state: Mutex::new(SessionState {
             generation: 1,
             next_track_generation: 1,
@@ -1450,7 +1476,12 @@ pub extern "C" fn scarlet_media_session_create() -> *mut MediaSession {
             },
         }),
         wake: Condvar::new(),
-    });
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn scarlet_media_session_create() -> *mut MediaSession {
+    let shared = new_session_shared();
     let worker_shared = shared.clone();
     let Ok(worker) = thread::Builder::new()
         .name("webkit-media-decode".into())
@@ -1521,6 +1552,20 @@ unsafe fn owned_track(track: &MediaTrack) -> Result<Track, ()> {
     })
 }
 
+// Repeated MSE initialization segments are legal metadata updates. Only a
+// decoder-input change invalidates references/reorder state or accepted samples;
+// duration belongs to the timeline and must not reopen a hardware session.
+fn same_decoder_configuration(left: &Track, right: &Track) -> bool {
+    left.id == right.id
+        && left.codec == right.codec
+        && left.extradata == right.extradata
+        && left.width == right.width
+        && left.height == right.height
+        && left.sample_rate == right.sample_rate
+        && left.channels == right.channels
+        && left.timescale == right.timescale
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn scarlet_media_session_configure(
     session: *mut MediaSession,
@@ -1546,6 +1591,14 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
     {
         return ERROR;
     }
+    if let Some(existing) = state.tracks.get_mut(&track.id)
+        && same_decoder_configuration(&existing.track, &track)
+    {
+        existing.track.duration_us = track.duration_us;
+        update_duration(&mut state);
+        session.shared.wake.notify_all();
+        return OK;
+    }
     let generation = state.next_track_generation;
     state.next_track_generation = generation.wrapping_add(1);
     if let Some(old) = state.tracks.remove(&track.id) {
@@ -1570,6 +1623,7 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
         SessionTrack {
             track,
             generation,
+            reset_reason: DecoderResetReason::Configure,
             samples: VecDeque::new(),
             ended: false,
             drained: false,
@@ -1685,6 +1739,7 @@ pub unsafe extern "C" fn scarlet_media_session_flush(session: *mut MediaSession,
         track.cancellation.store(true, Ordering::Release);
         track.cancellation = Arc::new(AtomicBool::new(false));
         track.generation = generation;
+        track.reset_reason = DecoderResetReason::Flush;
         let video = track.track.codec == Codec::H264;
         state.input_bytes -= bytes;
         if video {
@@ -1844,6 +1899,7 @@ pub unsafe extern "C" fn scarlet_media_session_seek(session: *mut MediaSession, 
                 track.cancellation.store(true, Ordering::Release);
                 track.cancellation = Arc::new(AtomicBool::new(false));
                 track.generation = generation;
+                track.reset_reason = DecoderResetReason::Seek;
                 track.media_end_seconds = seconds;
                 generation = generation.wrapping_add(1);
             }
@@ -3033,6 +3089,147 @@ mod tests {
         assert_eq!(size_of::<MediaFrame>(), 120);
         assert_eq!(offset_of!(MediaFrame, planes), 48);
         assert_eq!(size_of::<MediaStatus>(), 56);
+    }
+
+    /// Real MP4 demux plus the production configure/enqueue ABI. No decoder or
+    /// device is substituted: this state-level regression has no decode worker.
+    #[test]
+    #[ignore = "requires SCARLET_MEDIA_BRIDGE_FIXTURE generated by ffmpeg"]
+    fn repeated_real_init_segments_preserve_generation_and_accepted_samples() {
+        let data = std::fs::read(std::env::var("SCARLET_MEDIA_BRIDGE_FIXTURE").unwrap()).unwrap();
+        let mut init_end = 0;
+        while init_end + 8 <= data.len() {
+            let length =
+                u32::from_be_bytes(data[init_end..init_end + 4].try_into().unwrap()) as usize;
+            assert!(length >= 8 && length <= data.len() - init_end);
+            if &data[init_end + 4..init_end + 8] == b"moof" {
+                break;
+            }
+            init_end += length;
+        }
+        assert!(
+            init_end > 0 && init_end < data.len(),
+            "fixture must be fragmented MP4"
+        );
+        let shared = new_session_shared();
+        let session = Box::into_raw(Box::new(MediaSession {
+            shared: shared.clone(),
+            worker: None,
+        }));
+        let mut parser = Mp4Parser::new();
+        parser.push_bytes(&data).unwrap();
+        let mut accepted = Vec::new();
+        let mut track_id = 0;
+        while let Some(event) = parser.next_event().unwrap() {
+            match event {
+                ParserEvent::Track(track) => {
+                    track_id = track.id;
+                    assert_eq!(
+                        unsafe { scarlet_media_session_configure(session, &track_view(&track)) },
+                        OK
+                    );
+                }
+                ParserEvent::Sample(sample) => {
+                    accepted.push(sample.data.clone());
+                    assert_eq!(
+                        unsafe { scarlet_media_session_enqueue(session, &sample_view(&sample)) },
+                        OK
+                    );
+                }
+            }
+        }
+        assert_eq!(accepted.len(), 16);
+        let (generation, next_generation, cancellation, input_bytes) = {
+            let state = lock(&shared.state);
+            (
+                state.tracks[&track_id].generation,
+                state.next_track_generation,
+                state.tracks[&track_id].cancellation.clone(),
+                state.input_bytes,
+            )
+        };
+        for _ in 0..50 {
+            parser.push_bytes(&data[..init_end]).unwrap();
+            let mut tracks = 0;
+            while let Some(event) = parser.next_event().unwrap() {
+                let ParserEvent::Track(track) = event else {
+                    panic!("init emitted a coded sample");
+                };
+                tracks += 1;
+                assert_eq!(
+                    unsafe { scarlet_media_session_configure(session, &track_view(&track)) },
+                    OK
+                );
+            }
+            assert_eq!(
+                tracks, 1,
+                "actual demux must reemit the repeated initialization track"
+            );
+            let state = lock(&shared.state);
+            assert_eq!(state.tracks[&track_id].generation, generation);
+            assert_eq!(state.next_track_generation, next_generation);
+            assert_eq!(state.input_bytes, input_bytes);
+            assert!(!cancellation.load(Ordering::Acquire));
+            assert!(Arc::ptr_eq(
+                &state.tracks[&track_id].cancellation,
+                &cancellation
+            ));
+            assert_eq!(
+                state.tracks[&track_id]
+                    .samples
+                    .iter()
+                    .map(|sample| &sample.sample.data)
+                    .collect::<Vec<_>>(),
+                accepted.iter().collect::<Vec<_>>()
+            );
+        }
+        let metadata_track = lock(&shared.state).tracks[&track_id].track.clone();
+        let mut updated = track_view(&metadata_track);
+        updated.duration = 8.0;
+        assert_eq!(
+            unsafe { scarlet_media_session_configure(session, &updated) },
+            OK
+        );
+        {
+            let state = lock(&shared.state);
+            assert_eq!(state.status.duration, 8.0);
+            assert_eq!(state.tracks[&track_id].generation, generation);
+            assert_eq!(state.input_bytes, input_bytes);
+        }
+        // Genuine input configuration changes still cancel the old decoder and
+        // discard its reference/sample queue. Explicit flush/seek remain resets.
+        updated.width += 2;
+        assert_eq!(
+            unsafe { scarlet_media_session_configure(session, &updated) },
+            OK
+        );
+        assert!(cancellation.load(Ordering::Acquire));
+        {
+            let state = lock(&shared.state);
+            assert_ne!(state.tracks[&track_id].generation, generation);
+            assert_eq!(
+                state.tracks[&track_id].reset_reason,
+                DecoderResetReason::Configure
+            );
+            assert_eq!(state.input_bytes, 0);
+        }
+        unsafe {
+            scarlet_media_session_flush(session, track_id as u64);
+        }
+        assert_eq!(
+            lock(&shared.state).tracks[&track_id].reset_reason,
+            DecoderResetReason::Flush
+        );
+        unsafe {
+            scarlet_media_session_seek(session, 0.25);
+        }
+        assert_eq!(
+            lock(&shared.state).tracks[&track_id].reset_reason,
+            DecoderResetReason::Seek
+        );
+        unsafe {
+            scarlet_media_session_destroy(session);
+        }
     }
 
     /// The harness generates this file with an independent encoder in an
