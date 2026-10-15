@@ -5,7 +5,7 @@ find_package(Git REQUIRED)
 
 # Cargo owns this build directory. FetchContent owns downloads and their state;
 # the application source tree never contains a second WebKit checkout.
-set(_webkit_revision "a169eb4ef6ef343ba71868d30063d232c358974c")
+set(_webkit_revision "e5b0ff9e9aee5cbbac638c403fa805bdd4ac4141")
 FetchContent_Declare(webkit
     DOWNLOAD_COMMAND
         "${GIT_EXECUTABLE}" init <SOURCE_DIR>
