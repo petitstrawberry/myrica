@@ -462,6 +462,33 @@ fn run_engine_polling(
             backend.release_frame(token);
         }
 
+        // Publish an already-completed image before input handlers or JS can
+        // block the owner. Navigation must cancel its obsolete submission first;
+        // a concurrent navigation is also rejected by Shared::publish's generation
+        // check. Keep the submitted viewport so resize filtering remains on the UI.
+        if commands
+            .iter()
+            .all(|(_, command)| matches!(command, Command::Input(_)))
+            && let Some((submitted_generation, submitted_viewport)) = pending_frame
+            && (tick_due || Instant::now() >= next_completion_at)
+        {
+            if let Some(frame) = backend.poll_pending_frame() {
+                let identity = (submitted_generation, submitted_viewport, frame.revision);
+                if published_frame != Some(identity) {
+                    shared.publish(
+                        submitted_generation,
+                        backend.snapshot(),
+                        Some((submitted_viewport, frame)),
+                    );
+                    published_frame = Some(identity);
+                }
+            }
+            if !backend.has_pending_frame() {
+                pending_frame = None;
+            }
+            next_completion_at = Instant::now() + GPU_COMPLETION_POLL_INTERVAL;
+        }
+
         // A wake asks us to poll asynchronous work. Only the backend can tell
         // whether that work changed the page (a JS timer may change nothing).
         dirty |= rendered_viewport != Some(viewport);
@@ -489,27 +516,6 @@ fn run_engine_polling(
                     }
                 }
             }
-        }
-        // A finished image can reach the UI while the following JS/timer tick
-        // runs. Navigation has already canceled any obsolete native submission.
-        if let Some((submitted_generation, submitted_viewport)) = pending_frame
-            && (tick_due || Instant::now() >= next_completion_at)
-        {
-            if let Some(frame) = backend.poll_pending_frame() {
-                let identity = (submitted_generation, submitted_viewport, frame.revision);
-                if published_frame != Some(identity) {
-                    shared.publish(
-                        submitted_generation,
-                        backend.snapshot(),
-                        Some((submitted_viewport, frame)),
-                    );
-                    published_frame = Some(identity);
-                }
-            }
-            if !backend.has_pending_frame() {
-                pending_frame = None;
-            }
-            next_completion_at = Instant::now() + GPU_COMPLETION_POLL_INTERVAL;
         }
         if tick_due {
             dirty |= backend.tick();
@@ -974,6 +980,8 @@ mod tests {
         Poll,
         Complete(u64),
         Snapshot,
+        Input,
+        Navigation,
     }
 
     // Models only the asynchronous scheduling protocol. No pixels/device/GPU
@@ -986,14 +994,29 @@ mod tests {
         ticks: u32,
         render_gate: Option<Receiver<()>>,
         tick_gate: Option<Receiver<()>>,
+        input_gate: Option<Receiver<()>>,
+    }
+    impl AsyncBackend {
+        fn cancel_for_navigation(&mut self) {
+            self.pending = None;
+            while self.completed.try_recv().is_ok() {}
+            self.signals.send(AsyncSignal::Navigation).unwrap();
+        }
     }
     impl BrowserBackend for AsyncBackend {
         fn navigate(&mut self, _: &str) -> Result<(), BackendError> {
+            self.cancel_for_navigation();
             Ok(())
         }
-        fn reload(&mut self) {}
-        fn go_back(&mut self) {}
-        fn go_forward(&mut self) {}
+        fn reload(&mut self) {
+            self.cancel_for_navigation();
+        }
+        fn go_back(&mut self) {
+            self.cancel_for_navigation();
+        }
+        fn go_forward(&mut self) {
+            self.cancel_for_navigation();
+        }
         fn tick(&mut self) -> bool {
             self.ticks += 1;
             self.signals.send(AsyncSignal::Tick).unwrap();
@@ -1037,6 +1060,10 @@ mod tests {
             Some(frame)
         }
         fn handle_input(&mut self, _: BrowserInput) -> bool {
+            self.signals.send(AsyncSignal::Input).unwrap();
+            if let Some(gate) = self.input_gate.take() {
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             true
         }
         fn snapshot(&self) -> BrowserSnapshot {
@@ -1058,11 +1085,12 @@ mod tests {
         Receiver<AsyncSignal>,
         Sender<()>,
     ) {
-        async_worker_with_gates(None, None)
+        async_worker_with_gates(None, None, None)
     }
     fn async_worker_with_gates(
         render_gate: Option<Receiver<()>>,
         tick_gate: Option<Receiver<()>>,
+        input_gate: Option<Receiver<()>>,
     ) -> (
         Arc<Shared>,
         thread::JoinHandle<()>,
@@ -1095,6 +1123,7 @@ mod tests {
                     ticks: 0,
                     render_gate,
                     tick_gate,
+                    input_gate,
                 }),
                 &worker_shared,
                 Duration::from_secs(5),
@@ -1120,7 +1149,7 @@ mod tests {
         let (resume_submit, submit_gate) = mpsc::channel();
         let (resume_tick, tick_gate) = mpsc::channel();
         let (shared, worker, received, complete) =
-            async_worker_with_gates(Some(submit_gate), Some(tick_gate));
+            async_worker_with_gates(Some(submit_gate), Some(tick_gate), None);
         await_async(&received, AsyncSignal::Submit(1));
         // The owner is still inside the first submit. Queue completion and a
         // timer/network wake together before allowing its next iteration.
@@ -1141,6 +1170,89 @@ mod tests {
         resume_tick.send(()).unwrap();
         stop_test_worker(&shared, worker);
         assert_eq!(published, Some((VIEWPORT, 1)));
+    }
+
+    #[test]
+    fn completed_frame_is_published_before_a_blocked_input_handler() {
+        let (resume_submit, submit_gate) = mpsc::channel();
+        let (resume_input, input_gate) = mpsc::channel();
+        let (shared, worker, received, complete) =
+            async_worker_with_gates(Some(submit_gate), None, Some(input_gate));
+        await_async(&received, AsyncSignal::Submit(1));
+        shared.mailbox.lock().unwrap().commands.push_back((
+            1,
+            Command::Input(BrowserInput::Wheel {
+                delta_x: 0.0,
+                delta_y: 32.0,
+                x: 10.0,
+                y: 10.0,
+            }),
+        ));
+        complete.send(()).unwrap();
+        resume_submit.send(()).unwrap();
+        await_async(&received, AsyncSignal::Input);
+        // The handler is blocked, not merely slow: the UI must already be able
+        // to consume the completed frame without finishing this input or tick.
+        let published = {
+            let mailbox = shared.mailbox.lock().unwrap();
+            mailbox
+                .update
+                .as_ref()
+                .and_then(|update| update.frame.as_ref())
+                .map(|(viewport, frame)| (*viewport, frame.revision))
+        };
+        resume_input.send(()).unwrap();
+        stop_test_worker(&shared, worker);
+        assert_eq!(published, Some((VIEWPORT, 1)));
+    }
+
+    #[test]
+    fn navigation_cancels_completed_frames_before_input_publication() {
+        for navigation in [
+            Command::Navigate("second".into()),
+            Command::Reload,
+            Command::Back,
+            Command::Forward,
+        ] {
+            let (resume_submit, submit_gate) = mpsc::channel();
+            let (resume_input, input_gate) = mpsc::channel();
+            let (shared, worker, received, complete) =
+                async_worker_with_gates(Some(submit_gate), None, Some(input_gate));
+            await_async(&received, AsyncSignal::Submit(1));
+            {
+                let mut mailbox = shared.mailbox.lock().unwrap();
+                mailbox.generation = 2;
+                mailbox.update = None;
+                mailbox.commands.push_back((2, navigation));
+                mailbox
+                    .commands
+                    .push_back((2, Command::Input(BrowserInput::Text('x'))));
+            }
+            complete.send(()).unwrap();
+            resume_submit.send(()).unwrap();
+            let mut polled_obsolete_frame = false;
+            loop {
+                match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+                    AsyncSignal::Input => break,
+                    AsyncSignal::Poll | AsyncSignal::Complete(1) => polled_obsolete_frame = true,
+                    _ => {}
+                }
+            }
+            let published = shared
+                .mailbox
+                .lock()
+                .unwrap()
+                .update
+                .as_ref()
+                .is_some_and(|update| update.frame.is_some());
+            resume_input.send(()).unwrap();
+            stop_test_worker(&shared, worker);
+            assert!(
+                !polled_obsolete_frame,
+                "navigation must cancel before collection"
+            );
+            assert!(!published, "an obsolete generation must not reach the UI");
+        }
     }
 
     #[test]
