@@ -911,6 +911,14 @@ fn inspect_painting_workers(frame: &ProbeFrame) -> Result<(), String> {
 }
 
 fn image_pipeline_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    let revision = engine.cached_revision();
+    engine
+        .navigate(&format!("{base}/images-firstpaint"))
+        .map_err(|error| error.to_string())?;
+    await_image_frame(engine, "images-firstpaint", revision, |frame| {
+        inspect_image_board(frame, false, false)
+    })?;
+    println!("MYRICA_WEBKIT_SMOKE_PASS stage=image-first-paint-without-explicit-decode");
     let previous_revision = engine.cached_revision();
     engine
         .navigate(&format!("{base}/images"))

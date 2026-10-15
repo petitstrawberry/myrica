@@ -51,6 +51,7 @@ backend-webkit = [
     "dep:flate2",
     "dep:myrica-webkit-sys",
     "dep:reqwest",
+    "reqwest/http2",
     "dep:tokio",
 ]
 

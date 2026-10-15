@@ -594,7 +594,10 @@ function publishImages() {
   });
 }
 function failImage(error) { document.title = 'images-error:' + error; publishImages(); }
-Promise.all(Array.from(document.images, async image => {
+if (location.pathname === '/images-firstpaint') {
+  // Exercise ordinary first painting without pre-decoding through decode().
+  window.addEventListener('load', () => { publishImages(); document.title = 'images-firstpaint'; });
+} else Promise.all(Array.from(document.images, async image => {
   await image.decode();
   decoded.add(image.id);
 })).then(() => { publishImages(); document.title = 'images-ready'; }).catch(failImage);
@@ -1046,7 +1049,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", MEDIA_PAGE)
         elif path in ("/", "/main"):
             self.reply(200, "text/html; charset=utf-8", MAIN)
-        elif path == "/images":
+        elif path in ("/images", "/images-firstpaint"):
             self.reply(200, "text/html; charset=utf-8", IMAGE_PAGE)
         elif path == "/painting-workers":
             self.reply(200, "text/html; charset=utf-8", PAINTING_WORKERS_PAGE)

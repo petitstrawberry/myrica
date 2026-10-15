@@ -268,6 +268,7 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
     }
 
     let mut response = builder.send().await.map_err(|error| error.to_string())?;
+    profile_http_version(&response);
     let response_has_entity =
         request_has_entity && !matches!(response.status().as_u16(), 204 | 304);
     if response_has_entity
@@ -323,6 +324,24 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
         headers,
         body,
     })
+}
+
+fn profile_http_version(response: &reqwest::Response) {
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    };
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if *ENABLED.get_or_init(|| std::env::var("SCARLET_WEBVIEW_PROFILE").is_ok_and(|v| v == "1"))
+        && response.version() == reqwest::Version::HTTP_2
+        && !REPORTED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[myrica:webkit] transport=http2 host={}",
+            response.url().host_str().unwrap_or("")
+        );
+    }
 }
 
 /// ResourceHandle receives entity bytes after HTTP content decoding, as it
