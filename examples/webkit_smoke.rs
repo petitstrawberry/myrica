@@ -277,6 +277,8 @@ fn engine_probe(
                 .map_err(|error| error.to_string())?;
             media_probe(&mut engine, base, path)?;
         }
+        #[cfg(feature = "backend-webkit-vulkan")]
+        compositor_video_probe(&mut engine, base)?;
         drop(engine);
         return Ok(());
     }
@@ -1071,6 +1073,122 @@ fn media_probe(engine: &mut ProbeEngine, base: &str, path: &str) -> Result<(), S
         thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+/// Observe real native decoder output separately from static tile raster work.
+#[cfg(feature = "backend-webkit-vulkan")]
+fn compositor_video_probe(engine: &mut ProbeEngine, base: &str) -> Result<(), String> {
+    engine.render(400, 240, 1.0)?;
+    let before_fixture = engine
+        .compositing_statistics()
+        .map_err(|error| error.to_string())?
+        .ok_or("video compositor unexpectedly disabled")?;
+    engine
+        .navigate(&format!("{base}/media/compositor"))
+        .map_err(|error| error.to_string())?;
+    wait_title(engine, "media-ready")?;
+    engine.render(400, 240, 1.0)?;
+    click(engine, 60.0, 155.0);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut baseline: Option<(
+        myrica_webkit_sys::CompositingStatistics,
+        u64,
+        u64,
+        ProbeFrame,
+    )> = None;
+    loop {
+        engine.tick();
+        let state = media_state(engine)?;
+        if state["error"].as_u64().unwrap_or(0) != 0
+            || engine.snapshot().title.starts_with("media-error:")
+        {
+            return Err(format!("compositor native video failed: {state}"));
+        }
+        let frame = engine.render(400, 240, 1.0)?;
+        let statistics = engine
+            .compositing_statistics()
+            .map_err(|error| error.to_string())?
+            .ok_or("video compositor unexpectedly disabled")?;
+        let callbacks = state["callbacks"].as_u64().unwrap_or(0);
+        let time = state["time"].as_f64().unwrap_or(0.0);
+        let colour_offset = (60 * frame.width as usize + 60) * 4;
+        let red = frame.rgba[colour_offset] > 200
+            && frame.rgba[colour_offset + 1] < 30
+            && frame.rgba[colour_offset + 2] < 30;
+        assert_pixel(&frame, 280, 60, [0x12, 0x34, 0x56, 255])?;
+        if baseline.is_none() && callbacks >= 1 && time > 0.0 && red {
+            if statistics.tile_paints <= before_fixture.tile_paints
+                || statistics.tile_pixels <= before_fixture.tile_pixels
+            {
+                return Err(format!(
+                    "static video board has no actual tile raster work: {statistics:?}"
+                ));
+            }
+            let page_paints = engine
+                .paint_statistics()
+                .map_err(|error| error.to_string())?
+                .paints;
+            baseline = Some((statistics, callbacks, page_paints, frame.clone()));
+        }
+        if let Some((initial, initial_callbacks, initial_page_paints, first)) = &baseline {
+            if statistics != *initial {
+                return Err(format!(
+                    "video-only frames repainted static tiles: {initial:?} -> {statistics:?}, state={state}"
+                ));
+            }
+            // The encoded fixture changes red -> blue -> green. Waiting for
+            // decoded pixels and native frame callbacks avoids a fixed delay.
+            let blue = frame.rgba[colour_offset] < 30
+                && frame.rgba[colour_offset + 1] < 30
+                && frame.rgba[colour_offset + 2] > 200;
+            if blue && callbacks >= initial_callbacks + 2 {
+                let page_paints = engine
+                    .paint_statistics()
+                    .map_err(|error| error.to_string())?
+                    .paints;
+                if page_paints <= *initial_page_paints || frame.revision <= first.revision {
+                    return Err("video callbacks did not submit fresh GPU compositions".into());
+                }
+                let mut changed_video = 0;
+                for y in 20..116usize {
+                    for x in 20..148usize {
+                        let offset = (y * frame.width as usize + x) * 4;
+                        changed_video += usize::from(
+                            first.rgba[offset..offset + 4] != frame.rgba[offset..offset + 4],
+                        );
+                    }
+                }
+                for y in 20..200usize {
+                    for x in 200..360usize {
+                        let offset = (y * frame.width as usize + x) * 4;
+                        if first.rgba[offset..offset + 4] != frame.rgba[offset..offset + 4] {
+                            return Err(format!(
+                                "video composition mutated static board at {x},{y}"
+                            ));
+                        }
+                    }
+                }
+                if changed_video < 100 {
+                    return Err(format!(
+                        "video advanced without changing GPU pixels: {changed_video}"
+                    ));
+                }
+                println!(
+                    "MYRICA_WEBKIT_SMOKE_PASS stage=compositor-video-static-tiles tile_delta=0 page_compositions={} callback_delta={} changed_video_pixels={changed_video}",
+                    page_paints - initial_page_paints,
+                    callbacks - initial_callbacks
+                );
+                return Ok(());
+            }
+        }
+        if state["ended"] == true || Instant::now() >= deadline {
+            return Err(format!(
+                "native compositor video contract incomplete: baseline={} state={state}",
+                baseline.is_some()
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn wait_title(engine: &mut WebKitBackend, expected: &str) -> Result<(), String> {

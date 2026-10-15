@@ -267,6 +267,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
             println!(
                 "PASS: WebCore DOM/CSS/JS/input Retina GPU pages, two-image backpressure and immutable leased readback"
             );
+            compositor_page_contract(view)?;
             Ok(())
         })();
         let destroyed = check(ffi::scarlet_webview_destroy(view), "destroy");
@@ -411,4 +412,406 @@ unsafe fn close_frame(handle: i32) {
     unsafe {
         scarlet_sys::syscall1(scarlet_sys::Syscall::HandleClose, handle as usize);
     }
+}
+
+// This page exercises native composited CSS, never pre-rendered fixture pixels.
+#[cfg(feature = "backend-webkit-vulkan")]
+const COMPOSITOR_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>compositor-ready</title>
+<style>html,body{margin:0;width:640px;height:480px;background:white;overflow:hidden}
+#moving{position:absolute;left:24px;top:24px;width:64px;height:64px;background:red;will-change:transform,opacity;transform:translateZ(0)}
+#group{position:absolute;left:240px;top:24px;width:128px;height:80px;opacity:.5;will-change:opacity}
+#group div{position:absolute;width:64px;height:64px;background:red}#group div+div{left:32px;background:blue}
+#clip{position:absolute;left:24px;top:144px;width:96px;height:96px;border-radius:24px;overflow:hidden;background:lime;transform:translateZ(0)}
+#clip div{position:absolute;left:20px;top:20px;width:140px;height:140px;background:blue}
+#mask{position:absolute;left:160px;top:144px;width:96px;height:96px;background:red;transform:translateZ(0);mask-image:linear-gradient(to right,black 50%,transparent 50%);-webkit-mask-image:linear-gradient(to right,black 50%,transparent 50%)}
+#scroll{position:absolute;left:384px;top:24px;width:128px;height:240px;overflow:auto;will-change:scroll-position;transform:translateZ(0)}
+#stripes div{height:128px}#change,#small,#large{position:absolute;left:560px;width:64px;height:40px;background:#888;top:320px}#small{top:368px}#large{top:416px}
+</style><div id="moving"></div><div id="group"><div></div><div></div></div>
+<div id="clip"><div></div></div><div id="mask"></div><div id="scroll"><div id="stripes"></div></div>
+<div id="change" onclick="document.getElementById('moving').style.transform='translate3d(96px,0,0)';document.getElementById('moving').style.opacity='.5'"></div>
+<div id="small" onclick="document.getElementById('scroll').scrollTop=16"></div>
+<div id="large" onclick="document.getElementById('scroll').scrollTop=1100"></div>
+<script>const colours=['red','blue','lime','yellow','magenta','cyan'];for(let i=0;i<20;i++){const stripe=document.createElement('div');stripe.style.background=colours[i%6];document.getElementById('stripes').appendChild(stripe)}</script>"#;
+
+#[cfg(feature = "backend-webkit-vulkan")]
+struct ContractGpuFrame {
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    native: myrica_webkit_sys::GpuFrame,
+}
+#[cfg(feature = "backend-webkit-vulkan")]
+impl Drop for ContractGpuFrame {
+    fn drop(&mut self) {
+        // These guards never outlive their creating view or leave its owner.
+        unsafe {
+            close_frame(self.native.handle);
+            myrica_webkit_sys::scarlet_webview_release_gpu_frame(self.view, self.native.generation);
+        }
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn compositor_snapshot(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<myrica_webkit_sys::CompositingStatistics, String> {
+    let mut statistics = myrica_webkit_sys::CompositingStatistics::default();
+    let status =
+        unsafe { myrica_webkit_sys::scarlet_webview_compositing_statistics(view, &mut statistics) };
+    if status != myrica_webkit_sys::OK || statistics.enabled != 1 || statistics.reserved != 0 {
+        return Err(format!(
+            "GPU compositor unavailable: status={status} statistics={statistics:?}"
+        ));
+    }
+    Ok(statistics)
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn contract_navigation(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    location: &str,
+    html: &str,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    let status = unsafe { ffi::scarlet_webview_navigate(view, ffi::Bytes::from_str(location)) };
+    if status != ffi::OK {
+        return Err(format!("navigate compositor fixture: {status}"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = unsafe { ffi::scarlet_webview_tick(view) };
+        if status != ffi::OK {
+            return Err(format!("tick compositor navigation: {status}"));
+        }
+        let mut request = ffi::Request::default();
+        let status = unsafe { ffi::scarlet_webview_poll_request(view, &mut request) };
+        if status == ffi::OK && request.is_cancel == 0 {
+            let header = ffi::Header {
+                name: ffi::Bytes::from_str("Content-Type"),
+                value: ffi::Bytes::from_str("text/html; charset=utf-8"),
+            };
+            let response = ffi::Response {
+                request_id: request.request_id,
+                status_code: 200,
+                final_url: ffi::Bytes::from_str(location),
+                status_text: ffi::Bytes::from_str("OK"),
+                headers: &header,
+                header_count: 1,
+                body: ffi::Bytes::from_str(html),
+                ..Default::default()
+            };
+            let status = unsafe { ffi::scarlet_webview_complete_request(view, &response) };
+            return if status == ffi::OK {
+                Ok(())
+            } else {
+                Err(format!("complete compositor HTML: {status}"))
+            };
+        }
+        if status != ffi::EMPTY && status != ffi::OK {
+            return Err(format!("poll compositor request: {status}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("compositor fixture produced no request".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn copy_contract_pixels(frame: &ContractGpuFrame) -> Result<Vec<u8>, String> {
+    use myrica_webkit_sys as ffi;
+    let mut pixels = ffi::Pixels::default();
+    let status = unsafe {
+        ffi::scarlet_webview_gpu_frame_readback(frame.view, frame.native.generation, &mut pixels)
+    };
+    let row = frame.native.width as usize * 4;
+    if status != ffi::OK
+        || pixels.data.is_null()
+        || pixels.width != frame.native.width
+        || pixels.height != frame.native.height
+        || (pixels.stride as usize) < row
+        || (pixels.stride as usize)
+            .checked_mul(pixels.height as usize)
+            .is_none_or(|size| size > pixels.length)
+        || pixels.format != ffi::PIXEL_FORMAT_BGRA_PREMULTIPLIED
+        || pixels.generation != frame.native.generation
+    {
+        return Err(format!("invalid compositor GPU readback: status={status}"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(pixels.data, pixels.length) };
+    let mut copied = Vec::with_capacity(row * pixels.height as usize);
+    for source in bytes
+        .chunks(pixels.stride as usize)
+        .take(pixels.height as usize)
+    {
+        copied.extend_from_slice(&source[..row]);
+    }
+    Ok(copied)
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+fn contract_pixel(
+    bytes: &[u8],
+    width: u32,
+    x: usize,
+    y: usize,
+    rgba: [u8; 4],
+) -> Result<(), String> {
+    let offset = (y * width as usize + x) * 4;
+    let expected = [rgba[2], rgba[1], rgba[0], rgba[3]];
+    if bytes.get(offset..offset + 4).is_some_and(|actual| {
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(&a, b)| a.abs_diff(b) <= 1)
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "compositor pixel ({x},{y}) expected RGBA {rgba:?}, got BGRA {:?}",
+            bytes.get(offset..offset + 4)
+        ))
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn await_contract_frame(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    inspect: impl Fn(&[u8], u32) -> Result<(), String>,
+) -> Result<(ContractGpuFrame, Vec<u8>), String> {
+    use myrica_webkit_sys as ffi;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_error = String::from("no completed GPU frame");
+    loop {
+        let status = unsafe { ffi::scarlet_webview_tick(view) };
+        if status != ffi::OK {
+            return Err(format!("compositor tick: {status}"));
+        }
+        let mut native = ffi::GpuFrame::default();
+        let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut native) };
+        if status == ffi::OK {
+            let frame = ContractGpuFrame { view, native };
+            let pixels = unsafe { copy_contract_pixels(&frame) }?;
+            match inspect(&pixels, frame.native.width) {
+                Ok(()) => return Ok((frame, pixels)),
+                Err(error) => last_error = error,
+            }
+        } else if status != ffi::EMPTY {
+            return Err(format!("acquire compositor GPU frame: {status}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "compositor output did not reach expected native state: {last_error}"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+// Drain only genuine pending rendering updates. Static fixtures have no timers
+// or animations; an EMPTY acquire plus needs_paint=0 establishes quiescence.
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn settle_contract_composition(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if unsafe { ffi::scarlet_webview_tick(view) } != ffi::OK {
+            return Err("settle compositor tick failed".into());
+        }
+        let mut dirty = 1;
+        if unsafe { ffi::scarlet_webview_needs_paint(view, &mut dirty) } != ffi::OK {
+            return Err("query compositor pending work failed".into());
+        }
+        let mut native = ffi::GpuFrame::default();
+        let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut native) };
+        if status == ffi::OK {
+            drop(ContractGpuFrame { view, native });
+        } else if status == ffi::EMPTY && dirty == 0 {
+            return Ok(());
+        } else if status != ffi::EMPTY {
+            return Err(format!("settle compositor acquisition failed: {status}"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("static compositor did not drain actual pending work".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn compositor_page_contract(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    if unsafe { ffi::scarlet_webview_resize(view, 640, 480, 1.0) } != ffi::OK {
+        return Err("resize compositor fixture failed".into());
+    }
+    let before_fixture = unsafe { compositor_snapshot(view) }?;
+    unsafe { contract_navigation(view, "https://myrica.test/compositor", COMPOSITOR_HTML) }?;
+    let (first, first_pixels) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            for (x, y, colour) in [
+                (40, 40, [255, 0, 0, 255]),
+                (248, 40, [255, 128, 128, 255]),
+                (280, 40, [128, 128, 255, 255]),
+                (24, 144, [255; 4]),
+                (60, 180, [0, 0, 255, 255]),
+                (128, 190, [255; 4]),
+                (176, 176, [255, 0, 0, 255]),
+                (240, 176, [255; 4]),
+                (400, 144, [255, 0, 0, 255]),
+            ] {
+                contract_pixel(pixels, width, x, y, colour)?;
+            }
+            Ok(())
+        })
+    }?;
+    let first_id = unsafe { gpu_image_id(view, first.native.generation) }?;
+    unsafe { settle_contract_composition(view) }?;
+    let initial = unsafe { compositor_snapshot(view) }?;
+    if initial.tile_paints <= before_fixture.tile_paints
+        || initial.tile_pixels <= before_fixture.tile_pixels
+    {
+        return Err(format!(
+            "initial GPU output omitted actual tile raster work: {initial:?}"
+        ));
+    }
+    unsafe { click_fixture(view, 590.0, 336.0) }?;
+    let (second, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 40, 40, [255; 4])?;
+            contract_pixel(pixels, width, 136, 40, [255, 128, 128, 255])
+        })
+    }?;
+    unsafe { settle_contract_composition(view) }?;
+    let transformed = unsafe { compositor_snapshot(view) }?;
+    if transformed != initial {
+        return Err(format!(
+            "transform/opacity rerasterized tiles: {initial:?} -> {transformed:?}"
+        ));
+    }
+    if unsafe { copy_contract_pixels(&first) }? != first_pixels
+        || unsafe { gpu_image_id(view, second.native.generation) }? == first_id
+    {
+        return Err("composition mutated a leased GPU image or reused its live allocation".into());
+    }
+    drop(first);
+    drop(second);
+    println!(
+        "PASS: actual GPU compositor initial tiles, overlap group opacity, rounded clipping/mask, transform/opacity tile delta zero, immutable two leases"
+    );
+    unsafe { click_fixture(view, 590.0, 384.0) }?;
+    let (small, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 400, 144, [0, 0, 255, 255])
+        })
+    }?;
+    unsafe { settle_contract_composition(view) }?;
+    let small_stats = unsafe { compositor_snapshot(view) }?;
+    if small_stats != transformed {
+        return Err(format!(
+            "scroll within existing coverage rerasterized tiles: {transformed:?} -> {small_stats:?}"
+        ));
+    }
+    drop(small);
+    unsafe { click_fixture(view, 590.0, 432.0) }?;
+    let (exposed, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 400, 64, [0, 255, 0, 255])
+        })
+    }?;
+    unsafe { settle_contract_composition(view) }?;
+    let exposed_stats = unsafe { compositor_snapshot(view) }?;
+    if exposed_stats.tile_paints <= small_stats.tile_paints
+        || exposed_stats.tile_pixels <= small_stats.tile_pixels
+    {
+        return Err(format!(
+            "new scroll coverage did not rasterize new tiles: {small_stats:?} -> {exposed_stats:?}"
+        ));
+    }
+    drop(exposed);
+    // An idle page has no animation/timer. Owner ticks and snapshot queries must
+    // not trigger either tile raster work or final-page GPU submissions.
+    let idle_tiles = unsafe { compositor_snapshot(view) }?;
+    let mut idle_paints = ffi::PaintStatistics::default();
+    if unsafe { ffi::scarlet_webview_paint_statistics(view, &mut idle_paints) } != ffi::OK {
+        return Err("query idle page paints failed".into());
+    }
+    for _ in 0..32 {
+        if unsafe { ffi::scarlet_webview_tick(view) } != ffi::OK {
+            return Err("idle compositor tick failed".into());
+        }
+        let mut idle = ffi::GpuFrame::default();
+        let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut idle) };
+        if status != ffi::EMPTY {
+            if status == ffi::OK {
+                drop(ContractGpuFrame { view, native: idle });
+            }
+            return Err(format!(
+                "idle compositor unexpectedly produced a GPU frame: {status}"
+            ));
+        }
+    }
+    let mut after_idle_paints = ffi::PaintStatistics::default();
+    if unsafe { ffi::scarlet_webview_paint_statistics(view, &mut after_idle_paints) } != ffi::OK
+        || after_idle_paints.paints != idle_paints.paints
+        || after_idle_paints.painted_pixels != idle_paints.painted_pixels
+        || unsafe { compositor_snapshot(view) }? != idle_tiles
+    {
+        return Err("idle owner polling produced raster or composition work".into());
+    }
+    println!(
+        "PASS: scroll reuses cached tiles, new exposure paints new tiles, idle tile/page paint deltas zero"
+    );
+    // Keep the scroll page leased across native document teardown and resize.
+    unsafe { click_fixture(view, 590.0, 384.0) }?;
+    let (retired, retired_pixels) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 400, 144, [0, 0, 255, 255])
+        })
+    }?;
+    let retired_id = unsafe { gpu_image_id(view, retired.native.generation) }?;
+    unsafe {
+        contract_navigation(
+            view,
+            "https://myrica.test/compositor-detached",
+            "<!doctype html><style>html,body{margin:0;background:#2468ac}</style>",
+        )
+    }?;
+    let (new_page, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 300, 300, [36, 104, 172, 255])
+        })
+    }?;
+    if unsafe { copy_contract_pixels(&retired) }? != retired_pixels {
+        return Err("navigation mutated an old leased compositor frame".into());
+    }
+    drop(new_page);
+    if unsafe { ffi::scarlet_webview_resize(view, 704, 512, 1.0) } != ffi::OK {
+        return Err("resize detached compositor failed".into());
+    }
+    let (resized, _) = unsafe {
+        await_contract_frame(view, |pixels, width| {
+            contract_pixel(pixels, width, 300, 300, [36, 104, 172, 255])
+        })
+    }?;
+    if resized.native.width != 704
+        || resized.native.height != 512
+        || unsafe { gpu_image_id(view, resized.native.generation) }? == retired_id
+        || unsafe { copy_contract_pixels(&retired) }? != retired_pixels
+    {
+        return Err("resize reused or mutated a retired compositor allocation".into());
+    }
+    let final_stats = unsafe { compositor_snapshot(view) }?;
+    if final_stats.tile_paints < exposed_stats.tile_paints
+        || final_stats.tile_pixels < exposed_stats.tile_pixels
+    {
+        return Err("view-lifetime tile counters reset on navigation/resize".into());
+    }
+    drop(retired);
+    drop(resized);
+    println!(
+        "PASS: navigation detaches old compositor tree, resize preserves immutable leases and cumulative tile metrics"
+    );
+    Ok(())
 }

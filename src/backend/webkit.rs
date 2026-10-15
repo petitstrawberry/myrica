@@ -117,6 +117,25 @@ impl WebKitBackend {
         Ok(statistics)
     }
 
+    /// Inspect tile raster work without painting; None is the non-composited port.
+    pub fn compositing_statistics(
+        &mut self,
+    ) -> Result<Option<ffi::CompositingStatistics>, BackendError> {
+        let mut statistics = ffi::CompositingStatistics::default();
+        // SAFETY: This native view belongs to the current owner thread.
+        let status = unsafe {
+            ffi::scarlet_webview_compositing_statistics(self.view.as_ptr(), &mut statistics)
+        };
+        if status == ffi::UNSUPPORTED && statistics == ffi::CompositingStatistics::default() {
+            return Ok(None);
+        }
+        check(status, "inspect WebCore compositing statistics")?;
+        if statistics.enabled != 1 || statistics.reserved != 0 {
+            return Err(BackendError::new("invalid WebCore compositor statistics"));
+        }
+        Ok(Some(statistics))
+    }
+
     /// Inspect an actual page video without executing diagnostic JavaScript.
     pub fn media_statistics(
         &mut self,

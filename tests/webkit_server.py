@@ -410,6 +410,21 @@ else video.src = '/media/' + fixture + '.mp4';
 </script>"""
 
 
+# The video has its own accelerated layer; the board remains genuine static DOM
+# content. Frame callbacks/state update only a hidden span and cannot dirty it.
+COMPOSITOR_MEDIA_PAGE = MEDIA_PAGE.replace(
+    b"<video id=", b'<div id="static-board"></div><video id=', 1,
+).replace(
+    b"</style>",
+    b"body{background:#2468ac}#static-board{position:absolute;left:200px;top:20px;"
+    b"width:160px;height:180px;background:#123456}video{transform:translateZ(0);"
+    b"will-change:transform}</style>", 1,
+).replace(
+    b"const fixture = mse ? 'normal' : location.pathname.split('/').pop();",
+    b"const fixture = 'normal';", 1,
+)
+
+
 def media_segments(data: bytes) -> list[bytes]:
     """Split FFmpeg's fragmented MP4 into init and complete moof/mdat pairs."""
     segments: list[bytes] = []
@@ -652,6 +667,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
                            (("Accept-Ranges", "bytes"), ("Content-Range", f"bytes {start}-{end}/{len(content)}")))
             else:
                 self.reply(200, content_type, content, (("Accept-Ranges", "bytes"),))
+        elif path == "/media/compositor" and self.server.media:
+            self.reply(200, "text/html; charset=utf-8", COMPOSITOR_MEDIA_PAGE)
         elif path in ("/media/normal", "/media/normal-main", "/media/normal-high", "/media/normal-sniff", "/media/normal-sniff-reload", "/media/mse", "/media/mse-big") and self.server.media:
             if path == "/media/normal-sniff-reload":
                 with self.server.sniff_reload_lock:

@@ -22,6 +22,7 @@ pub const OK: i32 = 0;
 pub const EMPTY: i32 = 1;
 pub const STALE_REQUEST: i32 = -6;
 pub const NOT_INITIALIZED: i32 = -3;
+pub const UNSUPPORTED: i32 = -4;
 pub const SHIFT: u32 = 1;
 pub const CONTROL: u32 = 2;
 pub const ALT: u32 = 4;
@@ -69,6 +70,16 @@ impl Default for Bytes {
 pub struct PaintStatistics {
     pub paints: u64,
     pub painted_pixels: u64,
+}
+
+/// Lifetime-cumulative tile raster work, separate from final page composition.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompositingStatistics {
+    pub tile_paints: u64,
+    pub tile_pixels: u64,
+    pub enabled: u32,
+    pub reserved: u32,
 }
 
 /// Read-only state from an actual HTMLVideoElement in the main document.
@@ -338,6 +349,11 @@ unsafe extern "C" {
         view: *mut ScarletWebView,
         out: *mut PaintStatistics,
     ) -> c_int;
+    /// Read-only snapshot; does not trigger layout, tile painting, or composition.
+    pub fn scarlet_webview_compositing_statistics(
+        view: *mut ScarletWebView,
+        out: *mut CompositingStatistics,
+    ) -> c_int;
     pub fn scarlet_webview_media_statistics(
         view: *mut ScarletWebView,
         index: u32,
@@ -364,6 +380,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<KeyEvent>(), 96);
         assert_eq!(std::mem::size_of::<Request>(), 80);
         assert_eq!(std::mem::size_of::<Response>(), 104);
+        assert_eq!(std::mem::size_of::<CompositingStatistics>(), 24);
+        assert_eq!(std::mem::offset_of!(CompositingStatistics, tile_paints), 0);
+        assert_eq!(std::mem::offset_of!(CompositingStatistics, tile_pixels), 8);
+        assert_eq!(std::mem::offset_of!(CompositingStatistics, enabled), 16);
+        assert_eq!(std::mem::offset_of!(CompositingStatistics, reserved), 20);
         assert_eq!(std::mem::size_of::<MediaStatistics>(), 96);
         assert_eq!(std::mem::offset_of!(MediaStatistics, decoded_frames), 24);
         assert_eq!(std::mem::offset_of!(MediaStatistics, current_time), 48);
