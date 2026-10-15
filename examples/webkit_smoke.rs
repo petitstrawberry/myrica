@@ -174,6 +174,9 @@ fn main() -> std::process::ExitCode {
     unsafe {
         std::env::set_var("MYRICA_WEBKIT_TRACE_SHUTDOWN", "1");
         std::env::set_var("SCARLET_GC_DIAGNOSTICS", "1");
+        if std::env::args().any(|argument| argument == "--video-pages") {
+            std::env::set_var("SCARLET_WEBVIEW_PROFILE", "1");
+        }
     }
     match run() {
         Ok(()) => {
@@ -1023,7 +1026,52 @@ fn media_state(engine: &mut ProbeEngine) -> Result<serde_json::Value, String> {
     serde_json::from_str(&text).map_err(|error| format!("media state {text:?}: {error}"))
 }
 
+fn report_video_page_state(engine: &mut ProbeEngine, url: &str, reason: &str) {
+    // This existing getter also emits opt-in native currentSrc/error/buffered
+    // diagnostics. Do not execute script or replace the actual site's video.
+    let statistics = match engine.media_statistics(0) {
+        Ok(Some(state)) => serde_json::json!({
+            "videoCount": state.video_count,
+            "width": state.width,
+            "height": state.height,
+            "paused": state.paused != 0,
+            "ended": state.ended != 0,
+            "readyState": state.ready_state,
+            "currentTime": state.current_time,
+            "duration": state.duration,
+            "decodedFrames": state.decoded_frames,
+            "droppedFrames": state.dropped_frames,
+            "presentedFrames": state.presented_frames,
+        }),
+        Ok(None) => serde_json::Value::Null,
+        Err(error) => serde_json::json!({ "inspectionError": error.to_string() }),
+    };
+    let snapshot = engine.snapshot();
+    eprintln!(
+        "MYRICA_WEBKIT_SMOKE_DIAGNOSTIC stage=video-state data={}",
+        serde_json::json!({
+            "reason": reason,
+            "requestedUrl": url,
+            "pageUrl": snapshot.url,
+            "title": snapshot.title,
+            "statistics": statistics,
+        })
+    );
+}
+
 fn video_page_probe(
+    engine: &mut ProbeEngine,
+    url: &str,
+    sender: &mpsc::Sender<OwnerMessage>,
+) -> Result<(), String> {
+    let result = video_page_probe_inner(engine, url, sender);
+    if result.is_err() {
+        report_video_page_state(engine, url, "failure");
+    }
+    result
+}
+
+fn video_page_probe_inner(
     engine: &mut ProbeEngine,
     url: &str,
     sender: &mpsc::Sender<OwnerMessage>,
@@ -1118,6 +1166,7 @@ fn video_page_probe(
                 .send(OwnerMessage::PageProgress)
                 .map_err(|error| error.to_string())?;
             println!("MYRICA_WEBKIT_VIDEO_WAIT url={url} statistics={last_statistics:?}");
+            report_video_page_state(engine, url, "wait");
             progress = Instant::now();
         }
         thread::sleep(Duration::from_millis(40));
