@@ -215,7 +215,10 @@ fn run() -> Result<(), String> {
         std::env::args()
             .skip(2)
             .filter(|argument| {
-                !matches!(argument.as_str(), "--youtube-comments" | "--youtube-search")
+                !matches!(
+                    argument.as_str(),
+                    "--youtube-hover" | "--youtube-comments" | "--youtube-search"
+                )
             })
             .collect()
     } else {
@@ -1478,6 +1481,9 @@ fn video_page_probe_inner(
                     );
                     if is_youtube_url(url) {
                         youtube_theater_probe(engine, sender, statistics, frame)?;
+                        if std::env::args().any(|argument| argument == "--youtube-hover") {
+                            youtube_hover_probe(engine, sender)?;
+                        }
                         if std::env::args().any(|argument| argument == "--youtube-comments") {
                             youtube_comments_probe(engine, sender)?;
                         }
@@ -1632,6 +1638,76 @@ fn youtube_theater_probe(
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+    Ok(())
+}
+
+fn youtube_hover_probe(
+    engine: &mut ProbeEngine,
+    sender: &mpsc::Sender<OwnerMessage>,
+) -> Result<(), String> {
+    let before = engine
+        .media_statistics(0)
+        .map_err(|e| e.to_string())?
+        .ok_or("YouTube video is absent before hover probe")?;
+    let started = Instant::now();
+    let mut heartbeat = started;
+    let mut last_presentation = started;
+    let mut frames = before.presented_frames;
+    let mut max_gap = Duration::ZERO;
+    let mut max_turn = Duration::ZERO;
+    let mut turns = 0;
+    while started.elapsed() < Duration::from_secs(12) {
+        let turn = Instant::now();
+        // Genuine pointer events alternately expose the player's hover controls
+        // and move onto the recommendations. Do not inject page scripts.
+        let (x, y) = if (turns / 10) % 2 == 0 {
+            (500.0, 300.0)
+        } else {
+            (1120.0, 400.0)
+        };
+        engine.handle_input(BrowserInput::PointerMoved { x, y });
+        engine.tick();
+        engine.render(1280, 720, 1.0)?;
+        let now = engine
+            .media_statistics(0)
+            .map_err(|e| e.to_string())?
+            .ok_or("YouTube video disappeared while hovering")?;
+        let observed = Instant::now();
+        max_turn = max_turn.max(turn.elapsed());
+        // This includes native probe readback/observation latency and is not
+        // an exclusive GPU duration. Report freezes instead of hiding them in
+        // an average frame rate or asserting an arbitrary timing threshold.
+        max_gap = max_gap.max(observed.duration_since(last_presentation));
+        if now.presented_frames > frames {
+            frames = now.presented_frames;
+            last_presentation = observed;
+        }
+        turns += 1;
+        if heartbeat.elapsed() >= Duration::from_secs(5) {
+            sender
+                .send(OwnerMessage::PageProgress)
+                .map_err(|e| e.to_string())?;
+            heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let after = engine
+        .media_statistics(0)
+        .map_err(|e| e.to_string())?
+        .ok_or("YouTube video is absent after hover probe")?;
+    println!(
+        "MYRICA_WEBKIT_INTERACTION_METRIC stage=youtube-hover elapsed_ms={} turns={} max_owner_turn_us={} max_observed_presentation_gap_ms={} before={before:?} after={after:?}",
+        started.elapsed().as_millis(),
+        turns,
+        max_turn.as_micros(),
+        max_gap.as_millis(),
+    );
+    if after.paused != 0
+        || after.current_time <= before.current_time + 1.0
+        || after.presented_frames <= before.presented_frames + 4
+    {
+        return Err("YouTube video did not advance during native hover input".into());
     }
     Ok(())
 }

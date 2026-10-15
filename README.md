@@ -166,10 +166,17 @@ and requires advancing media time, real decoded/painted frames and changing
 GPU pixels within the video rectangle. It keeps the site's player and source
 selection intact and joins the native owner at exit.
 
-Add `--youtube-comments --youtube-search` to exercise comment scrolling,
-continuing playback on return, and the site's native search suggestions. The
+Add `--youtube-hover --youtube-comments --youtube-search` to exercise player
+hover controls, comment scrolling, continuing playback on return, and the
+site's native search suggestions. Hover reports the longest observed frame
+presentation gap, including owner scheduling and probe readback overhead. The
 probe reports input and owner-turn times; diagnostic GPU readback makes its
 frame counts unsuitable for measuring ordinary GUI playback throughput.
+
+With `SCARLET_WEBVIEW_PROFILE=1`, slow native response-completion callbacks
+report their duration, response size, content type and URL host/path. These
+times include synchronous WebCore parsing and script work; they measure owner
+thread blockage rather than network transfer duration. Query strings are omitted.
 
 On a Scarlet kernel with `sync-debug`, the `scarlet_cpu_sample` example accepts
 `PID [SECONDS]` and samples that process's threads through `GetTaskDebugInfo`.
