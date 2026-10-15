@@ -1,5 +1,6 @@
 //! The browser engine is confined to one worker; UI calls only exchange messages.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -95,6 +96,7 @@ pub struct BrowserWorker {
     worker: Option<thread::JoinHandle<()>>,
     join_on_shutdown: bool,
     frame_source: Option<Box<dyn BrowserFrameSource>>,
+    source_needs_full_damage: Cell<bool>,
 }
 
 impl BrowserWorker {
@@ -215,6 +217,7 @@ impl BrowserWorker {
             worker: Some(worker),
             join_on_shutdown,
             frame_source: None,
+            source_needs_full_damage: Cell::new(true),
         })
     }
 
@@ -276,6 +279,7 @@ impl BrowserWorker {
             .map_or(viewport, |maximum| viewport.fit_surface(maximum));
         let mut mailbox = self.shared.mailbox.lock().unwrap();
         if mailbox.viewport != viewport {
+            self.source_needs_full_damage.set(true);
             mailbox.viewport = viewport;
             mailbox.engine_woken = true;
             self.shared.ready.notify_one();
@@ -315,9 +319,17 @@ impl BrowserWorker {
         }
         if let Some(source) = &mut self.frame_source {
             match source.poll() {
-                Ok(Some(completed)) => {
+                Ok(Some(mut completed)) => {
                     if completed.generation == generation && completed.viewport == viewport {
+                        if self.source_needs_full_damage.replace(false) {
+                            completed.frame.damage = None;
+                        }
                         frame = Some(completed.frame);
+                    } else {
+                        // Native damage is relative to acquisition. A rejected
+                        // old epoch/viewport never reached the UI, so the next
+                        // accepted image must refresh all previously stale pixels.
+                        self.source_needs_full_damage.set(true);
                     }
                 }
                 Ok(None) => {}
@@ -787,6 +799,7 @@ mod tests {
         let present = |generation, viewport: BrowserViewport, revision| {
             let mut frame = BrowserFrame::empty(viewport.width, viewport.height);
             frame.revision = revision;
+            frame.damage = Some([4, 5, 8, 9]);
             send.send(super::super::PresentedFrame {
                 generation,
                 viewport,
@@ -796,7 +809,9 @@ mod tests {
         };
         for revision in 1..=8 {
             present(1, VIEWPORT, revision);
-            assert_eq!(worker.poll().unwrap().revision, revision);
+            let frame = worker.poll().unwrap();
+            assert_eq!(frame.revision, revision);
+            assert_eq!(frame.damage, (revision != 1).then_some([4, 5, 8, 9]));
         }
         // Navigation and resize take effect immediately on the UI, even though
         // the blocked owner cannot yet consume either command.
@@ -804,7 +819,9 @@ mod tests {
         present(1, VIEWPORT, 9);
         assert!(worker.poll().is_none());
         present(2, VIEWPORT, 10);
-        assert_eq!(worker.poll().unwrap().revision, 10);
+        let frame = worker.poll().unwrap();
+        assert_eq!(frame.revision, 10);
+        assert_eq!(frame.damage, None);
         let resized = BrowserViewport {
             width: 777,
             ..VIEWPORT
@@ -813,7 +830,9 @@ mod tests {
         present(2, VIEWPORT, 11);
         assert!(worker.poll().is_none());
         present(2, resized, 12);
-        assert_eq!(worker.poll().unwrap().width, 777);
+        let frame = worker.poll().unwrap();
+        assert_eq!(frame.width, 777);
+        assert_eq!(frame.damage, None);
         drop(worker);
         release.send(()).unwrap();
         dropped.recv_timeout(Duration::from_secs(5)).unwrap();
