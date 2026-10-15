@@ -14,6 +14,11 @@ name = "webkit-smoke"
 path = "examples/webkit_smoke.rs"
 required-features = ["backend-webkit"]
 
+[[example]]
+name = "webkit-threaded-presentation"
+path = "examples/webkit_threaded_presentation.rs"
+required-features = ["backend-webkit-vulkan"]
+
 [[bin]]
 name = "webkit-vulkan-probe"
 path = "src/bin/webkit-vulkan-probe.rs"

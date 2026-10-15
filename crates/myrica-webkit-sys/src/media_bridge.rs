@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_CHUNK: usize = 512 * 1024;
 const MAX_EVENTS: usize = 64;
+// Compressed packets are independent of parser-event batches and decoded
+// output. 64 AAC packets cover only ~1.4s and can starve interleaved video
+// during a long Page task. Keep bounded packet lookahead under the existing
+// aggregate 8 MiB byte limit; decoded output remains three video frames.
+const MAX_COMPRESSED_SAMPLES: usize = 512;
 const MAX_LEASES: usize = 8;
 const MAX_VIDEO_FRAMES: usize = 3;
 const MAX_AUDIO_BYTES: usize = 1024 * 1024;
@@ -1685,7 +1690,9 @@ pub unsafe extern "C" fn scarlet_media_session_enqueue(
     if sample.size > 4 * 1024 * 1024 {
         return ERROR;
     }
-    if state.input_bytes + sample.size > MAX_INPUT_BYTES || track.samples.len() >= MAX_EVENTS {
+    if state.input_bytes + sample.size > MAX_INPUT_BYTES
+        || track.samples.len() >= MAX_COMPRESSED_SAMPLES
+    {
         return AGAIN;
     }
     let Ok(data) = (unsafe { copy_bytes(sample.data, sample.size, 4 * 1024 * 1024) }) else {
@@ -1730,7 +1737,7 @@ pub unsafe extern "C" fn scarlet_media_session_has_capacity(
             && state
                 .tracks
                 .get(&(track as u32))
-                .is_some_and(|track| track.samples.len() < MAX_EVENTS),
+                .is_some_and(|track| track.samples.len() < MAX_COMPRESSED_SAMPLES),
     )
 }
 
@@ -3209,6 +3216,67 @@ mod tests {
             scarlet_media_parser_reset(parser);
             assert_eq!(scarlet_media_parser_append(parser, [1].as_ptr(), 1, 19), OK);
             scarlet_media_parser_destroy(parser);
+        }
+    }
+
+    #[test]
+    fn compressed_audio_lookahead_has_packet_and_byte_backpressure() {
+        // No decode worker: observe precisely what the caller can enqueue
+        // while the Page is busy and the playback worker drains independently.
+        let shared = new_session_shared();
+        let session = Box::into_raw(Box::new(MediaSession {
+            shared: shared.clone(),
+            worker: None,
+        }));
+        let mut track = empty_track();
+        track.identifier = 1;
+        track.kind = 2;
+        track.codec = 2;
+        track.sample_rate = 48000;
+        track.channels = 2;
+        track.duration = 30.0;
+        let sample = Sample {
+            track_id: 1,
+            data: vec![7; 32],
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 21_333,
+            keyframe: true,
+        };
+        unsafe {
+            assert_eq!(scarlet_media_session_configure(session, &track), OK);
+            for _ in 0..MAX_COMPRESSED_SAMPLES {
+                assert_eq!(
+                    scarlet_media_session_enqueue(session, &sample_view(&sample)),
+                    OK
+                );
+            }
+            assert_eq!(scarlet_media_session_has_capacity(session, 1), 0);
+            assert_eq!(
+                scarlet_media_session_enqueue(session, &sample_view(&sample)),
+                AGAIN
+            );
+            assert_eq!(lock(&shared.state).input_bytes, MAX_COMPRESSED_SAMPLES * 32);
+            scarlet_media_session_flush(session, 1);
+            let large = Sample {
+                data: vec![9; 4 * 1024 * 1024],
+                ..sample
+            };
+            assert_eq!(
+                scarlet_media_session_enqueue(session, &sample_view(&large)),
+                OK
+            );
+            assert_eq!(
+                scarlet_media_session_enqueue(session, &sample_view(&large)),
+                OK
+            );
+            assert_eq!(scarlet_media_session_has_capacity(session, 1), 0);
+            assert_eq!(
+                scarlet_media_session_enqueue(session, &sample_view(&large)),
+                AGAIN
+            );
+            assert_eq!(lock(&shared.state).input_bytes, MAX_INPUT_BYTES);
+            scarlet_media_session_destroy(session);
         }
     }
 

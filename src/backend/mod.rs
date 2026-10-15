@@ -235,8 +235,27 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// A completed compositor frame, independent of document execution.
+pub struct PresentedFrame {
+    pub generation: u64,
+    pub viewport: BrowserViewport,
+    pub frame: BrowserFrame,
+}
+
+/// This endpoint may exchange completed images and leases only. It must never
+/// enter the document, execute script, or wait for the engine/GPU.
+pub trait BrowserFrameSource: Send {
+    fn poll(&mut self) -> Result<Option<PresentedFrame>, BackendError>;
+}
+
 /// Narrow WebView-like interface implemented by each embedded browser engine.
 pub trait BrowserBackend {
+    fn take_frame_source(&mut self) -> Option<Box<dyn BrowserFrameSource>> {
+        None
+    }
+
+    fn set_frame_generation(&mut self, _generation: u64) {}
+
     /// Optional thread-safe interruption used before joining a native engine
     /// during shutdown. The callback must not enter owner-only engine APIs.
     fn shutdown_callback(&self) -> Option<WakeCallback> {

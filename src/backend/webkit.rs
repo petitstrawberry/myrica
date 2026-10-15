@@ -16,6 +16,8 @@ use super::{
 mod frame;
 mod network;
 mod pixels;
+#[cfg(feature = "backend-webkit-vulkan")]
+mod presentation;
 
 pub struct WebKitBackend {
     view: NonNull<ffi::ScarletWebView>,
@@ -33,6 +35,8 @@ pub struct WebKitBackend {
     frame_releaser: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     #[cfg(feature = "backend-webkit-vulkan")]
     gpu_logged: bool,
+    #[cfg(feature = "backend-webkit-vulkan")]
+    independent_output: bool,
     last_click: Option<(BrowserMouseButton, f32, f32, Instant, u32)>,
     pressed_keys: Vec<BrowserKey>,
     suppress_next_text: bool,
@@ -101,6 +105,8 @@ impl WebKitBackend {
             frame_releaser: None,
             #[cfg(feature = "backend-webkit-vulkan")]
             gpu_logged: false,
+            #[cfg(feature = "backend-webkit-vulkan")]
+            independent_output: false,
             last_click: None,
             pressed_keys: Vec::new(),
             suppress_next_text: false,
@@ -438,6 +444,8 @@ impl WebKitBackend {
         let error = read_string(state.last_error)?;
         let before = self.snapshot.clone();
         let changed = state.frame_generation != self.last_frame;
+        #[cfg(feature = "backend-webkit-vulkan")]
+        let changed = changed && !self.independent_output;
         self.last_frame = state.frame_generation;
         if !url.is_empty() {
             self.snapshot.url = url;
@@ -605,6 +613,33 @@ impl BrowserBackend for WebKitBackend {
     }
 
     #[cfg(feature = "backend-webkit-vulkan")]
+    fn take_frame_source(&mut self) -> Option<Box<dyn super::BrowserFrameSource>> {
+        if self.independent_output {
+            return None;
+        }
+        match presentation::FrameSource::new(self.view) {
+            Ok(source) => {
+                self.independent_output = true;
+                Some(Box::new(source))
+            }
+            Err(error) => {
+                self.fail(error);
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
+    fn set_frame_generation(&mut self, generation: u64) {
+        // SAFETY: Only the Page owner changes the tag for later scene commits.
+        let status =
+            unsafe { ffi::scarlet_webview_set_output_epoch(self.view.as_ptr(), generation) };
+        if let Err(error) = check(status, "tag WebCore compositor generation") {
+            self.fail(error);
+        }
+    }
+
+    #[cfg(feature = "backend-webkit-vulkan")]
     fn release_frame(&mut self, token: u64) {
         // SAFETY: returns a lease on this view's owner, across navigation/resize.
         let status = unsafe { ffi::scarlet_webview_release_gpu_frame(self.view.as_ptr(), token) };
@@ -615,6 +650,9 @@ impl BrowserBackend for WebKitBackend {
 
     #[cfg(feature = "backend-webkit-vulkan")]
     fn can_render(&mut self) -> bool {
+        if self.independent_output {
+            return true;
+        }
         let mut capacity = 0;
         // SAFETY: queries this live owner-thread view without painting.
         let status =
@@ -630,6 +668,9 @@ impl BrowserBackend for WebKitBackend {
 
     #[cfg(feature = "backend-webkit-vulkan")]
     fn has_pending_frame(&mut self) -> bool {
+        if self.independent_output {
+            return false;
+        }
         let mut state = 0;
         // SAFETY: Pure owner-thread state query; it does not poll or submit.
         let status =
@@ -693,7 +734,17 @@ impl BrowserBackend for WebKitBackend {
                     "paint resized WebCore",
                 )?;
             }
-            self.acquire_gpu_frame(width, height)
+            if self.independent_output {
+                // SAFETY: Commit runs only on this Page owner. Completed-image
+                // acquisition and lease return use the separate UI endpoint.
+                let status = unsafe { ffi::scarlet_webview_commit(self.view.as_ptr()) };
+                if status != ffi::EMPTY {
+                    check(status, "commit WebCore scene")?;
+                }
+                Ok(None)
+            } else {
+                self.acquire_gpu_frame(width, height)
+            }
         })();
         match result {
             Ok(frame) => frame,

@@ -1,4 +1,6 @@
-//! Raw bindings to `ScarletWebView.h`; all calls belong to the creating thread.
+//! Raw bindings to `ScarletWebView.h`. Page APIs belong to the creating thread;
+//! the independently owned compositor-output APIs exchange completed images
+//! and leases across threads without accessing that Page.
 
 #[cfg(target_os = "scarlet")]
 mod native_memory;
@@ -31,6 +33,12 @@ pub const PIXEL_FORMAT_BGRA_PREMULTIPLIED: u32 = 1;
 
 #[repr(C)]
 pub struct ScarletWebView {
+    _opaque: [u8; 0],
+}
+
+/// Independently owned, thread-safe completed-frame mailbox; contains no Page.
+#[repr(C)]
+pub struct CompositorOutput {
     _opaque: [u8; 0],
 }
 
@@ -309,6 +317,21 @@ unsafe extern "C" {
     pub fn scarlet_webview_gpu_frame_state(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_gpu_frame_capacity(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_gpu_frame(view: *mut ScarletWebView, out: *mut GpuFrame) -> c_int;
+    pub fn scarlet_webview_compositor_output(
+        view: *mut ScarletWebView,
+        out: *mut *mut CompositorOutput,
+    ) -> c_int;
+    pub fn scarlet_webview_output_destroy(output: *mut CompositorOutput);
+    pub fn scarlet_webview_output_acquire(
+        output: *mut CompositorOutput,
+        out: *mut GpuFrame,
+        image_id: *mut u64,
+        epoch: *mut u64,
+        scale: *mut f64,
+    ) -> c_int;
+    pub fn scarlet_webview_output_release(output: *mut CompositorOutput, generation: u64) -> c_int;
+    pub fn scarlet_webview_set_output_epoch(view: *mut ScarletWebView, epoch: u64) -> c_int;
+    pub fn scarlet_webview_commit(view: *mut ScarletWebView) -> c_int;
     /// Stable allocation identity, queried only while this frame lease is live.
     pub fn scarlet_webview_gpu_frame_image_id(
         view: *mut ScarletWebView,

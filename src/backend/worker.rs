@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
-    BackendError, BackendKind, BrowserBackend, BrowserFrame, BrowserInput, BrowserSnapshot,
-    LoadState, WakeCallback, create_backend, create_backend_selected,
+    BackendError, BackendKind, BrowserBackend, BrowserFrame, BrowserFrameSource, BrowserInput,
+    BrowserSnapshot, LoadState, WakeCallback, create_backend, create_backend_selected,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -53,6 +53,7 @@ struct Mailbox {
 struct Shared {
     mailbox: Mutex<Mailbox>,
     ready: Condvar,
+    frame_source: Mutex<Option<Box<dyn BrowserFrameSource>>>,
 }
 
 /// UI-side proxy. No document, JS runtime, or layout code runs in these methods.
@@ -61,6 +62,7 @@ pub struct BrowserWorker {
     snapshot: BrowserSnapshot,
     worker: Option<thread::JoinHandle<()>>,
     join_on_shutdown: bool,
+    frame_source: Option<Box<dyn BrowserFrameSource>>,
 }
 
 impl BrowserWorker {
@@ -136,6 +138,7 @@ impl BrowserWorker {
                 update: None,
             }),
             ready: Condvar::new(),
+            frame_source: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let failure_snapshot = snapshot.clone();
@@ -153,6 +156,7 @@ impl BrowserWorker {
                 });
                 match factory(wake_engine) {
                     Ok(mut backend) => {
+                        *worker_shared.frame_source.lock().unwrap() = backend.take_frame_source();
                         let weak = Arc::downgrade(&worker_shared);
                         backend.set_frame_releaser(Arc::new(move |token| {
                             if let Some(shared) = weak.upgrade() {
@@ -178,6 +182,7 @@ impl BrowserWorker {
             snapshot,
             worker: Some(worker),
             join_on_shutdown,
+            frame_source: None,
         })
     }
 
@@ -261,11 +266,26 @@ impl BrowserWorker {
             let mut mailbox = self.shared.mailbox.lock().unwrap();
             (mailbox.update.take(), mailbox.generation, mailbox.viewport)
         };
+        let mut frame = None;
         if let Some(update) = update.filter(|update| update.generation == generation) {
             self.snapshot = update.snapshot;
-            return update.frame.and_then(|(rendered_viewport, frame)| {
+            frame = update.frame.and_then(|(rendered_viewport, frame)| {
                 (rendered_viewport == viewport).then_some(frame)
             });
+        }
+        if self.frame_source.is_none() {
+            self.frame_source = self.shared.frame_source.lock().unwrap().take();
+        }
+        if let Some(source) = &mut self.frame_source {
+            match source.poll() {
+                Ok(Some(completed)) => {
+                    if completed.generation == generation && completed.viewport == viewport {
+                        frame = Some(completed.frame);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.snapshot.load_state = LoadState::Failed(error.to_string()),
+            }
         }
         if self
             .worker
@@ -275,7 +295,7 @@ impl BrowserWorker {
         {
             self.snapshot.load_state = LoadState::Failed(String::from("browser worker stopped"));
         }
-        None
+        frame
     }
     /// Close the engine explicitly when the application's event loop ends.
     /// WebKit's owner is joined before native process finalization.
@@ -502,6 +522,7 @@ fn run_engine_polling(
                 navigation => {
                     pending_frame = None;
                     generation = command_generation;
+                    backend.set_frame_generation(generation);
                     dirty = true;
                     match navigation {
                         Command::Navigate(location) => {
@@ -682,6 +703,55 @@ mod tests {
         })
         .unwrap();
         (worker, entered_rx, release, dropped_rx)
+    }
+
+    struct CompositorFrames(Receiver<super::super::PresentedFrame>);
+
+    impl BrowserFrameSource for CompositorFrames {
+        fn poll(&mut self) -> Result<Option<super::super::PresentedFrame>, BackendError> {
+            Ok(self.0.try_recv().ok())
+        }
+    }
+
+    #[test]
+    fn independent_compositor_keeps_presenting_while_engine_tick_is_blocked() {
+        let (mut worker, entered, release, dropped) = gated_worker(Stage::Tick);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (send, receive) = mpsc::channel();
+        *worker.shared.frame_source.lock().unwrap() = Some(Box::new(CompositorFrames(receive)));
+        let present = |generation, viewport: BrowserViewport, revision| {
+            let mut frame = BrowserFrame::empty(viewport.width, viewport.height);
+            frame.revision = revision;
+            send.send(super::super::PresentedFrame {
+                generation,
+                viewport,
+                frame,
+            })
+            .unwrap();
+        };
+        for revision in 1..=8 {
+            present(1, VIEWPORT, revision);
+            assert_eq!(worker.poll().unwrap().revision, revision);
+        }
+        // Navigation and resize take effect immediately on the UI, even though
+        // the blocked owner cannot yet consume either command.
+        worker.navigate("second").unwrap();
+        present(1, VIEWPORT, 9);
+        assert!(worker.poll().is_none());
+        present(2, VIEWPORT, 10);
+        assert_eq!(worker.poll().unwrap().revision, 10);
+        let resized = BrowserViewport {
+            width: 777,
+            ..VIEWPORT
+        };
+        worker.resize(resized);
+        present(2, VIEWPORT, 11);
+        assert!(worker.poll().is_none());
+        present(2, resized, 12);
+        assert_eq!(worker.poll().unwrap().width, 777);
+        drop(worker);
+        release.send(()).unwrap();
+        dropped.recv_timeout(Duration::from_secs(5)).unwrap();
     }
 
     #[test]
@@ -919,6 +989,7 @@ mod tests {
                 update: None,
             }),
             ready: Condvar::new(),
+            frame_source: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::spawn(move || {
@@ -1111,6 +1182,7 @@ mod tests {
                 update: None,
             }),
             ready: Condvar::new(),
+            frame_source: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::spawn(move || {

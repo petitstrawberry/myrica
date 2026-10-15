@@ -128,6 +128,17 @@ audio and its consumed PCM position supplies the playback clock. The supported
 profile is progressive 8-bit 4:2:0 AVC and AAC-LC mono/stereo; VP9, AV1, Opus,
 HE-AAC and `avc3` are rejected. Ordinary MP4 input must fit the media core's 8 MiB
 bound; MSE handles separate bounded initialization/media segments.
+
+The native coordinated scene, Ganesh context, video-plane upload, final page
+images and submission fences run on a separate compositing run loop. The UI
+acquires completed shared BGRA images and returns their leases through an
+independently owned mailbox, without waiting for the Page's JS/layout thread.
+WebCore retains layer clipping, transforms, occlusion and damage tracking.
+Vulkan contexts share the native device with externally synchronized queue
+submission; each Ganesh context remains confined to its own thread. Video
+presentation feedback is coalesced for the Page owner. Compressed lookahead is
+bounded by 512 packets per track and the existing aggregate 8 MiB limit;
+decoded output remains bounded to three video frames.
 WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
 service workers, and IME preedit are unavailable.
 URLs containing embedded usernames or passwords are rejected explicitly.
@@ -143,6 +154,14 @@ CARGO_TARGET_AARCH64_UNKNOWN_SCARLET_LINKER=rust-lld \
 cargo build --locked --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit --example webkit-smoke
 ```
+
+`webkit-threaded-presentation`, built with `backend-webkit-vulkan`, uses
+`/media/threaded` from the server's `--media-fixtures` mode. It runs a real
+three-second JavaScript click handler while another thread acquires completed
+GPU page images, checks continued native video presentation, joins the Page
+owner, and checks that the output handle can safely outlive Page destruction.
+Use `/compositor-threaded --css-only` with the same probe to check that native
+CSS transform/opacity animation also advances throughout the JS handler.
 
 Run `webkit-smoke http://10.0.2.2:PORT` in the guest, replacing `PORT` with the
 server's actual port. Use the HTTP base URL without a path.
@@ -189,8 +208,10 @@ execution regions rather than precise call stacks or individual callback cost.
 
 `BrowserBackend` is intentionally a WebView boundary rather than a common DOM
 API. It owns navigation and history, receives viewport input, advances engine
-work, and prepares retained SGFX meshes and textures on one dedicated engine
-thread. The UI sends commands and takes the latest completed frame without
+work on one dedicated engine thread. CPU backends prepare retained SGFX meshes
+there; native WebKit commits its retained scene to a separate compositor.
+`BrowserFrameSource` lets the UI acquire completed native images independently
+of that engine thread. The UI sends commands and takes the latest frame without
 waiting for HTML parsing, JavaScript, layout, or glyph rasterization. Pixel and
 mesh buffers are shared without copying on the UI thread; ScarletUI owns GPU
 presentation. Intermediate pointer moves and resize requests are coalesced,

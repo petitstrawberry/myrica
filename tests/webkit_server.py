@@ -634,6 +634,41 @@ window.addEventListener('scroll', () => { publishImages(); document.title = 'ima
 </script>"""
 
 
+THREADED_MEDIA_PAGE = b"""<!doctype html><meta charset="utf-8"><title>threaded-loading</title>
+<style>body{margin:0}video{position:absolute;left:20px;top:20px;width:320px;height:180px}
+button{position:absolute;top:220px;width:128px;height:32px}#play{left:20px}#busy{left:180px}</style>
+<video id="video" playsinline preload="auto" src="/media/compositor.mp4"></video>
+<button id="play">Play</button><button id="busy">Busy JS</button>
+<script>
+const video = document.getElementById('video');
+video.addEventListener('canplay', () => { document.title='threaded-ready'; });
+video.addEventListener('playing', () => { document.title='threaded-playing'; });
+video.addEventListener('error', () => { document.title='threaded-error:' + video.error?.code; });
+document.getElementById('play').onclick = () => video.play();
+document.getElementById('busy').onclick = () => {
+  const end = performance.now() + 3000;
+  while (performance.now() < end) {}
+  document.title='threaded-finished';
+};
+</script>"""
+
+
+THREADED_CSS_PAGE = b"""<!doctype html><meta charset="utf-8"><title>threaded-ready</title>
+<style>body{margin:0}#box{position:absolute;left:20px;top:20px;width:64px;height:64px;
+background:red;will-change:transform,opacity;animation:move 2s infinite alternate linear}
+@keyframes move{from{transform:translateX(0);opacity:1}to{transform:translateX(240px);opacity:.3}}
+button{position:absolute;top:220px;width:128px;height:32px}#play{left:20px}#busy{left:180px}</style>
+<div id="box"></div><button id="play">Start</button><button id="busy">Busy JS</button>
+<script>
+document.getElementById('play').onclick = () => { document.title='threaded-playing'; };
+document.getElementById('busy').onclick = () => {
+  const end = performance.now() + 3000;
+  while (performance.now() < end) {}
+  document.title='threaded-finished';
+};
+</script>"""
+
+
 MEDIA_PAGE = b"""<!doctype html><meta charset="utf-8"><title>media-loading</title>
 <style>body{margin:0}video{position:absolute;left:20px;top:20px;width:128px;height:96px}
 button{position:absolute;left:20px;top:140px;width:128px;height:32px}</style>
@@ -1050,6 +1085,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
                            (("Accept-Ranges", "bytes"), ("Content-Range", f"bytes {start}-{end}/{len(content)}")))
             else:
                 self.reply(200, content_type, content, (("Accept-Ranges", "bytes"),))
+        elif path == "/compositor-threaded":
+            self.reply(200, "text/html; charset=utf-8", THREADED_CSS_PAGE)
+        elif path == "/media/threaded" and self.server.media:
+            self.reply(200, "text/html; charset=utf-8", THREADED_MEDIA_PAGE)
         elif path == "/media/compositor" and self.server.media:
             self.reply(200, "text/html; charset=utf-8", COMPOSITOR_MEDIA_PAGE)
         elif path in ("/media/normal", "/media/normal-main", "/media/normal-high", "/media/normal-sniff", "/media/normal-sniff-reload", "/media/mse", "/media/mse-big") and self.server.media:
