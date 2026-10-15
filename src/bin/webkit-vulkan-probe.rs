@@ -143,7 +143,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 check(ffi::scarlet_webview_tick(view), "layout tick")?;
             }
             check(ffi::scarlet_webview_focus(view, 1), "focus")?;
-            let first = acquire_gpu(view)?;
+            let first = acquire_expected_gpu(view, (320, 224), [0, 0, 255, 255], [255, 0, 0, 255])?;
             let first_id = gpu_image_id(view, first.generation)?;
             verify_gpu_pixels(view, first.generation, [0, 0, 255, 255], [255, 0, 0, 255])?;
             let mut marker = ffi::Bytes::default();
@@ -159,7 +159,8 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 return Err("JavaScript marker did not execute".into());
             }
             click_fixture(view, 240.0, 160.0)?;
-            let second = acquire_gpu(view)?;
+            let second =
+                acquire_expected_gpu(view, (320, 224), [0, 0, 255, 255], [0, 255, 0, 255])?;
             let second_id = gpu_image_id(view, second.generation)?;
             if first_id == second_id {
                 return Err("concurrently leased GPU pages share an allocation identity".into());
@@ -201,7 +202,8 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
                 ffi::scarlet_webview_paint_statistics(view, &mut before),
                 "paint statistics before reuse",
             )?;
-            let third = acquire_gpu(view)?;
+            let third =
+                acquire_expected_gpu(view, (320, 224), [0, 255, 255, 255], [0, 255, 0, 255])?;
             if gpu_image_id(view, third.generation)? != first_id
                 || third.generation <= second.generation
             {
@@ -236,7 +238,8 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
             verify_stale_image_id(view, third.generation)?;
             check(ffi::scarlet_webview_resize(view, 384, 256, 2.0), "resize")?;
             check(ffi::scarlet_webview_tick(view), "resize tick")?;
-            let resized = acquire_gpu(view)?;
+            let resized =
+                acquire_expected_gpu(view, (384, 256), [0, 255, 255, 255], [0, 255, 0, 255])?;
             let resized_id = gpu_image_id(view, resized.generation)?;
             if resized.width != 384
                 || resized.height != 256
@@ -277,18 +280,26 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
             let mut compositor = ffi::CompositingStatistics::default();
             if ffi::scarlet_webview_compositing_statistics(view, &mut compositor) == ffi::OK {
                 // Start an actual GPU update and immediately destroy its owner.
-                // No completion poll or readback may drain this on our behalf.
+                // A concurrently completed image is valid; queued work must also retire safely.
                 check(
                     ffi::scarlet_webview_resize(view, 706, 514, 1.0),
                     "pending teardown resize",
                 )?;
                 check(ffi::scarlet_webview_tick(view), "pending teardown layout")?;
                 let mut unfinished = ffi::GpuFrame::default();
-                if ffi::scarlet_webview_gpu_frame(view, &mut unfinished) != ffi::EMPTY
-                    || unfinished.handle != -1
-                    || unfinished.generation != 0
-                {
-                    return Err("pending teardown exposed unfinished GPU output".into());
+                let status = ffi::scarlet_webview_gpu_frame(view, &mut unfinished);
+                if status == ffi::EMPTY {
+                    if unfinished.handle != -1 || unfinished.generation != 0 {
+                        return Err("teardown exposed unfinished GPU output".into());
+                    }
+                } else if status == ffi::OK {
+                    let completed = ContractGpuFrame {
+                        view,
+                        native: unfinished,
+                    };
+                    let _ = copy_contract_pixels(&completed)?;
+                } else {
+                    return Err(format!("teardown acquisition failed: {status}"));
                 }
                 pending_teardown = true;
             }
@@ -299,7 +310,7 @@ function yellow(){document.getElementById('r').style.background='yellow';}</scri
         let result = result.and(destroyed).and(shutdown);
         if result.is_ok() && pending_teardown {
             println!(
-                "PASS: pending GPU submission drains during actual owner destruction and engine shutdown"
+                "PASS: queued compositor/GPU work retires during actual owner destruction and engine shutdown"
             );
         }
         result
@@ -334,41 +345,53 @@ unsafe fn async_gpu_lifetime_contract(
     )?;
     let mut pending = ffi::GpuFrame::default();
     let status = unsafe { ffi::scarlet_webview_gpu_frame(view, &mut pending) };
-    if status != ffi::EMPTY
-        || pending.handle != -1
-        || pending.generation != 0
-        || pending.width != 0
-        || pending.height != 0
-    {
-        return Err(format!(
-            "async submit published before completion observation: status={status} handle={} generation={} size={}x{}",
-            pending.handle, pending.generation, pending.width, pending.height
-        ));
+    let observed_pending = status == ffi::EMPTY;
+    if observed_pending {
+        if pending.handle != -1
+            || pending.generation != 0
+            || pending.width != 0
+            || pending.height != 0
+        {
+            return Err("pending compositor exposed an unfinished capability".into());
+        }
+    } else if status == ffi::OK {
+        // The compositor observes completion without an owner tick. A fast
+        // completed frame is legal; verify it instead of assuming a CPU race.
+        let complete = ContractGpuFrame {
+            view,
+            native: pending,
+        };
+        unsafe {
+            verify_gpu_pixels(
+                view,
+                complete.native.generation,
+                [0, 255, 255, 255],
+                [0, 255, 0, 255],
+            )
+        }?;
+        if (complete.native.width, complete.native.height) != (448, 288) {
+            return Err("completed resize returned the previous extent".into());
+        }
+        drop(complete);
+    } else {
+        return Err(format!("asynchronous resize acquisition failed: {status}"));
     }
-    let mut submitted = ffi::PaintStatistics::default();
-    check(
-        unsafe { ffi::scarlet_webview_paint_statistics(view, &mut submitted) },
-        "pending paint statistics",
-    )?;
-    if submitted.paints != before.paints || submitted.painted_pixels != before.painted_pixels {
-        return Err("in-flight GPU page advanced completed paint statistics".into());
-    }
-    unsafe { verify_stale_image_id(view, last_generation + 1) }?;
-    // Cancel while the target is reserved, before any tick/capacity poll can
-    // observe completion. Resize must drain it without publishing or reusing
-    // the old storage early, while the second output remains externally leased.
+    // Race a later resize against queued or submitted compositor work. Already
+    // completed images may advance counters; unfinished storage must remain
+    // private, and the independently held image must remain immutable.
     check(
         unsafe { ffi::scarlet_webview_resize(view, 480, 320, 2.0) },
         "resize during pending submit",
     )?;
-    unsafe { verify_stale_image_id(view, last_generation + 1) }?;
-    let native = unsafe { acquire_gpu(view) }?;
+    unsafe { verify_stale_image_id(view, last_generation) }?;
+    let native =
+        unsafe { acquire_expected_gpu(view, (480, 320), [0, 255, 255, 255], [0, 255, 0, 255]) }?;
     let completed = ContractGpuFrame { view, native };
-    if completed.native.generation != last_generation + 1
+    if completed.native.generation <= last_generation
         || completed.native.width != 480
         || completed.native.height != 320
     {
-        return Err("canceled GPU page consumed a generation or leaked an old extent".into());
+        return Err("resize did not advance its generation or leaked an old extent".into());
     }
     if unsafe { gpu_image_id(view, completed.native.generation) }? == leased_id {
         return Err("pending resize reused the still-leased allocation".into());
@@ -390,13 +413,46 @@ unsafe fn async_gpu_lifetime_contract(
         unsafe { ffi::scarlet_webview_paint_statistics(view, &mut after) },
         "completed paint statistics",
     )?;
-    if after.paints != before.paints + 1 {
-        return Err("canceled submit was counted as a completed GPU page".into());
+    if after.paints <= before.paints {
+        return Err("completed resize was not counted as a completed GPU page".into());
     }
     println!(
-        "PASS: async completion gates capability/generation/statistics, pending resize drains and preserves old GPU lease"
+        "PASS: asynchronous resize preserves completed-pixel/extent/generation/lease contract, observed_pending={observed_pending}"
     );
     Ok(())
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn acquire_expected_gpu(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+    size: (u32, u32),
+    red: [u8; 4],
+    blue: [u8; 4],
+) -> Result<myrica_webkit_sys::GpuFrame, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let native = unsafe { acquire_gpu(view) }?;
+        let frame = ContractGpuFrame { view, native };
+        let pixels = unsafe { verify_gpu_pixels(view, frame.native.generation, red, blue) };
+        if (frame.native.width, frame.native.height) == size && pixels.is_ok() {
+            // Transfer the validated lease to the caller; RAII retires every
+            // superseded progressive frame before another acquisition.
+            let native = frame.native;
+            std::mem::forget(frame);
+            return Ok(native);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "GPU page did not reach expected asynchronous pixels: {pixels:?}"
+            ));
+        }
+        drop(frame);
+        check(
+            unsafe { myrica_webkit_sys::scarlet_webview_tick(view) },
+            "await DOM composition",
+        )?;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
@@ -809,7 +865,7 @@ unsafe fn await_contract_frame(
 }
 
 // Drain only genuine pending rendering updates. Static fixtures have no timers
-// or animations; an EMPTY acquire plus needs_paint=0 establishes quiescence.
+// or animations; EMPTY, needs_paint=0 and idle compositor state establish quiescence.
 #[cfg(feature = "backend-webkit-vulkan")]
 unsafe fn settle_contract_composition(
     view: *mut myrica_webkit_sys::ScarletWebView,
@@ -829,7 +885,14 @@ unsafe fn settle_contract_composition(
         if status == ffi::OK {
             drop(ContractGpuFrame { view, native });
         } else if status == ffi::EMPTY && dirty == 0 {
-            return Ok(());
+            let mut state = 1;
+            check(
+                unsafe { ffi::scarlet_webview_gpu_frame_state(view, &mut state) },
+                "settle compositor output state",
+            )?;
+            if state == 0 {
+                return Ok(());
+            }
         } else if status != ffi::EMPTY {
             return Err(format!("settle compositor acquisition failed: {status}"));
         }

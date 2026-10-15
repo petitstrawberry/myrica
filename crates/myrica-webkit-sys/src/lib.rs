@@ -129,7 +129,8 @@ pub struct Configuration {
     pub device_scale_factor: f64,
 }
 
-/// Owned native GPU capability and owner-thread frame lease.
+/// Owned native GPU capability and immutable storage lease. Return it through
+/// the same Page or compositor-output endpoint that acquired it.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GpuFrame {
@@ -293,7 +294,7 @@ impl Default for Response {
 unsafe extern "C" {
     pub fn scarlet_webview_initialize(font_configuration_path: Bytes) -> c_int;
     pub fn scarlet_webview_shutdown() -> c_int;
-    /// The sole thread-safe exception to the owner-thread-only view API.
+    /// Thread-safe interruption of the Page owner; output mailboxes are separate.
     pub fn scarlet_webview_request_termination() -> c_int;
     pub fn scarlet_webview_create(
         configuration: *const Configuration,
