@@ -708,6 +708,13 @@ struct QueuedSample {
     non_displaying: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct AudioProgress {
+    position: Option<f64>,
+    read_frames: Option<u64>,
+    write_frames: Option<u64>,
+}
+
 struct SessionState {
     generation: u64,
     next_track_generation: u64,
@@ -721,6 +728,8 @@ struct SessionState {
     audio_bytes: usize,
     audio_seconds: f64,
     audio_drained: bool,
+    audio_progress: AudioProgress,
+    first_frame_profiled: Option<(u64, u64)>,
     media_end_seconds: f64,
     seek_target: Option<f64>,
     clock: PlaybackClock,
@@ -1195,6 +1204,13 @@ fn session_worker(shared: &SessionShared) {
         state.audio_bytes = audio.bytes();
         state.audio_seconds = audio.seconds();
         state.audio_drained = audio.is_empty();
+        if media_profile_enabled() {
+            state.audio_progress = AudioProgress {
+                position: audio.position(),
+                read_frames: audio.ring.as_ref().map(AudioRing::read_frames),
+                write_frames: audio.ring.as_ref().map(AudioRing::write_frames),
+            };
+        }
         state.status.current_time = state.clock.now();
         prune_video_output(&mut state);
         let video_empty = state.video.is_empty();
@@ -1465,6 +1481,8 @@ fn new_session_shared() -> Arc<SessionShared> {
             audio_bytes: 0,
             audio_seconds: 0.0,
             audio_drained: true,
+            audio_progress: AudioProgress::default(),
+            first_frame_profiled: None,
             media_end_seconds: 0.0,
             seek_target: None,
             clock: PlaybackClock::new(),
@@ -1913,6 +1931,112 @@ pub unsafe extern "C" fn scarlet_media_session_seek(session: *mut MediaSession, 
         })
     };
 }
+fn media_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("SCARLET_WEBVIEW_PROFILE").is_ok_and(|value| value == "1"))
+}
+
+#[derive(Debug)]
+struct FirstFrameProfile {
+    session_generation: u64,
+    track_generation: u64,
+    pts_us: i64,
+    clock_seconds: f64,
+    playing: bool,
+    ready: bool,
+    paused: u32,
+    audio_master: bool,
+    ready_state: u32,
+    error: i32,
+    video_frames: usize,
+    encoded_video: usize,
+    encoded_audio: usize,
+    audio_bytes: usize,
+    audio_seconds: f64,
+    audio_drained: bool,
+    audio_progress: AudioProgress,
+    next_lease: u64,
+    leases: usize,
+}
+
+fn take_first_frame_profile(state: &mut SessionState) -> Option<FirstFrameProfile> {
+    if !media_profile_enabled() || state.video.len() < MAX_VIDEO_FRAMES {
+        return None;
+    }
+    let first_pts = state.video.front()?.pts_us;
+    let clock = state.clock.now();
+    let track_generation = state
+        .tracks
+        .values()
+        .find(|track| track.track.codec == Codec::H264)?
+        .generation;
+    let key = (state.generation, track_generation);
+    if state.first_frame_profiled == Some(key) {
+        return None;
+    }
+    state.first_frame_profiled = Some(key);
+    Some(FirstFrameProfile {
+        session_generation: state.generation,
+        track_generation,
+        pts_us: first_pts,
+        clock_seconds: clock,
+        playing: state.clock.playing,
+        ready: state.clock.ready,
+        paused: state.status.paused,
+        audio_master: state.clock.audio_master,
+        ready_state: state.status.ready_state,
+        error: state.status.error,
+        video_frames: state.video.len(),
+        encoded_video: state
+            .tracks
+            .values()
+            .filter(|track| track.track.codec == Codec::H264)
+            .map(|track| track.samples.len())
+            .sum(),
+        encoded_audio: state
+            .tracks
+            .values()
+            .filter(|track| track.track.codec == Codec::Aac)
+            .map(|track| track.samples.len())
+            .sum(),
+        audio_bytes: state.audio_bytes,
+        audio_seconds: state.audio_seconds,
+        audio_drained: state.audio_drained,
+        audio_progress: state.audio_progress,
+        next_lease: state.next_lease,
+        leases: state.leases.len(),
+    })
+}
+
+fn print_first_frame_profile(session: &MediaSession, profile: FirstFrameProfile) {
+    eprintln!(
+        "SCARLET_MEDIA_PROFILE first-frame session={:#x} generation={} track_generation={} first_pts_us={} clock={} playing={} ready={} paused={} audio_master={} ready_state={} error={} video_frames={} encoded_video={} encoded_audio={} audio_bytes={} audio_seconds={} audio_drained={} sas_position={:?} sas_read_frames={:?} sas_write_frames={:?} next_lease={} leases={}",
+        Arc::as_ptr(&session.shared) as usize,
+        profile.session_generation,
+        profile.track_generation,
+        profile.pts_us,
+        profile.clock_seconds,
+        profile.playing,
+        profile.ready,
+        profile.paused,
+        profile.audio_master,
+        profile.ready_state,
+        profile.error,
+        profile.video_frames,
+        profile.encoded_video,
+        profile.encoded_audio,
+        profile.audio_bytes,
+        profile.audio_seconds,
+        profile.audio_drained,
+        profile.audio_progress.position,
+        profile.audio_progress.read_frames,
+        profile.audio_progress.write_frames,
+        profile.next_lease,
+        profile.leases
+    );
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn scarlet_media_session_status(
     session: *mut MediaSession,
@@ -1922,9 +2046,14 @@ pub unsafe extern "C" fn scarlet_media_session_status(
     else {
         return ERROR;
     };
-    let state = lock(&session.shared.state);
+    let mut state = lock(&session.shared.state);
     *output = state.status;
     output.current_time = state.clock.now();
+    let profile = take_first_frame_profile(&mut state);
+    drop(state);
+    if let Some(profile) = profile {
+        print_first_frame_profile(session, profile);
+    }
     OK
 }
 #[unsafe(no_mangle)]
@@ -1937,6 +2066,11 @@ pub unsafe extern "C" fn scarlet_media_session_acquire_frame(
         return ERROR;
     };
     let mut state = lock(&session.shared.state);
+    if let Some(profile) = take_first_frame_profile(&mut state) {
+        drop(state);
+        print_first_frame_profile(session, profile);
+        state = lock(&session.shared.state);
+    }
     if state.leases.len() >= 2 {
         return OK;
     }
