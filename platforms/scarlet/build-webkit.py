@@ -109,6 +109,7 @@ def main():
         "libc++.a", "libc++abi.a", "libscarlet_cxx_support.a", "libscarlet_c_startup.a", "libscarlet_c.a"))
     configure_build_install(webkit, build / "webkit", prefix, [
         "-DPORT=Scarlet", "-DSCARLET_BUILD_EMBEDDING=ON", "-DSCARLET_BUILD_RENDERER=OFF",
+        "-DENABLE_C_LOOP=OFF",
         f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
         f"-DSCARLET_USE_SKIA_VULKAN={'ON' if args.vulkan_rendering else 'OFF'}",
         f"-DSCARLET_USE_NATIVE_MEDIA={'ON' if args.media else 'OFF'}",
