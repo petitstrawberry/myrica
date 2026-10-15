@@ -306,6 +306,7 @@ unsafe extern "C" {
     pub fn scarlet_webview_tick(view: *mut ScarletWebView) -> c_int;
     pub fn scarlet_webview_needs_paint(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_pixels(view: *mut ScarletWebView, out_pixels: *mut Pixels) -> c_int;
+    pub fn scarlet_webview_gpu_frame_state(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_gpu_frame_capacity(view: *mut ScarletWebView, out: *mut u32) -> c_int;
     pub fn scarlet_webview_gpu_frame(view: *mut ScarletWebView, out: *mut GpuFrame) -> c_int;
     /// Stable allocation identity, queried only while this frame lease is live.
