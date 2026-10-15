@@ -36,6 +36,7 @@ pub struct WebKitBackend {
     last_click: Option<(BrowserMouseButton, f32, f32, Instant, u32)>,
     pressed_keys: Vec<BrowserKey>,
     suppress_next_text: bool,
+    profile_completions: bool,
 }
 
 impl WebKitBackend {
@@ -103,6 +104,8 @@ impl WebKitBackend {
             last_click: None,
             pressed_keys: Vec::new(),
             suppress_next_text: false,
+            profile_completions: std::env::var("SCARLET_WEBVIEW_PROFILE")
+                .is_ok_and(|value| value == "1"),
         })
     }
 
@@ -380,9 +383,33 @@ impl WebKitBackend {
                     };
                     // SAFETY: All spans refer to owned response data kept alive
                     // through this call. No network thread enters WebCore.
+                    let started = self.profile_completions.then(Instant::now);
                     let result = unsafe {
                         ffi::scarlet_webview_complete_request(self.view.as_ptr(), &native)
                     };
+                    if let Some(started) = started {
+                        let elapsed = started.elapsed();
+                        if elapsed >= Duration::from_millis(8) {
+                            let url = reqwest::Url::parse(&response.final_url).ok();
+                            let mime = response
+                                .headers
+                                .iter()
+                                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                                .map(|(_, value)| value.as_str())
+                                .unwrap_or("");
+                            eprintln!(
+                                "MYRICA_WEBCORE_COMPLETION id={} elapsed_us={} bytes={} status={} result={} host={:?} path={:?} mime={:?}",
+                                completion.id,
+                                elapsed.as_micros(),
+                                response.body.len(),
+                                response.status,
+                                result,
+                                url.as_ref().and_then(|url| url.host_str()).unwrap_or(""),
+                                url.as_ref().map(|url| url.path()).unwrap_or(""),
+                                mime,
+                            );
+                        }
+                    }
                     if result != ffi::STALE_REQUEST {
                         check(result, "complete WebCore resource")?;
                     }
