@@ -160,9 +160,10 @@ impl WebKitBackend {
         let owned = super::frame::OwnedGpuImage::new(capability.into_raw(), allocation_id);
         let frame = self.renderer.gpu_frame(image, owned, lease)?;
         if frame.width != width || frame.height != height {
-            return Err(BackendError::new(
-                "WebCore returned a mismatched GPU page extent",
-            ));
+            // The compositor can finish an already submitted image after the
+            // owner requests a resize. Retire its capability and lease, then
+            // await the new extent just as the independent UI endpoint does.
+            return Ok(None);
         }
         self.last_frame = frame.revision;
         if !self.gpu_logged {
