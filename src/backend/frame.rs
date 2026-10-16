@@ -143,7 +143,9 @@ impl<T> GpuImageCache<T> {
             return Ok(image);
         }
         let image = create()?;
-        if self.entries.len() == 2 {
+        // Match WebCore's three output slots so rotating between them never
+        // reimports an allocation that is still part of the active viewport.
+        if self.entries.len() == 3 {
             self.entries.remove(0);
         }
         self.entries
@@ -310,7 +312,7 @@ mod gpu_image_cache_tests {
     }
 
     #[test]
-    fn two_entry_lru_retires_only_cache_ownership() {
+    fn three_entry_lru_retires_only_cache_ownership() {
         let drops = Rc::new(Cell::new(0));
         let mut cache = GpuImageCache::default();
         let first = cache
@@ -329,13 +331,19 @@ mod gpu_image_cache_tests {
                 .get_or_try_insert(3, 4, 4, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
                 .unwrap(),
         );
+        assert_eq!(cache.entries.len(), 3);
+        drop(
+            cache
+                .get_or_try_insert(4, 4, 4, || Ok(Arc::new(Resource(Rc::clone(&drops)))))
+                .unwrap(),
+        );
         assert_eq!(
             cache
                 .entries
                 .iter()
                 .map(|entry| entry.0)
                 .collect::<Vec<_>>(),
-            vec![1, 3]
+            vec![1, 3, 4]
         );
         assert_eq!(Arc::strong_count(&first), 2);
         assert_eq!(
@@ -347,9 +355,9 @@ mod gpu_image_cache_tests {
         drop(second);
         assert_eq!(drops.get(), 1);
         cache.clear();
-        assert_eq!(drops.get(), 2);
-        drop(first);
         assert_eq!(drops.get(), 3);
+        drop(first);
+        assert_eq!(drops.get(), 4);
     }
 
     #[test]
