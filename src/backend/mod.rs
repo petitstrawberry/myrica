@@ -25,6 +25,7 @@ mod webkit;
 #[cfg(all(test, not(feature = "backend-webkit")))]
 mod webkit {
     mod frame;
+    mod network;
     mod pixels;
 }
 

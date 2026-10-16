@@ -141,6 +141,12 @@ bounded by 512 packets per track and the existing aggregate 8 MiB limit;
 decoded output remains bounded to three video frames.
 WebGL/WebGPU, popup windows, downloads, clipboard, file uploads, WebSockets,
 service workers, and IME preedit are unavailable.
+Identity HTTP responses deliver headers and bounded body chunks before EOF,
+with bounded transport-to-Page queues. Redirects, response policies and cookies
+remain in WebCore. Compressed responses still use the strict bounded whole-entity
+decoder before chunk delivery. TCP window scaling is separate kernel work and
+is currently absent; this transport change does not remove the 65,535-byte
+advertised TCP receive-window limit.
 URLs containing embedded usernames or passwords are rejected explicitly.
 Committed Unicode text is delivered to WebCore. Compatibility with general
 websites therefore remains limited.

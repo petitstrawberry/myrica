@@ -2,11 +2,13 @@
 //!
 //! WebCore owns redirects, cookies, credentials, CSP, and CORS. This executor
 //! sends exactly the request it receives and never enters WebCore from its
-//! network workers. Completions cross a standard channel to the browser thread.
+//! network workers. Response events cross bounded channels to the browser thread.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -41,21 +43,35 @@ pub(super) struct FetchResponse {
 #[derive(Debug)]
 pub(super) struct Completion {
     pub id: u64,
-    pub result: Result<FetchResponse, String>,
+    pub result: Result<NetworkEvent, String>,
+}
+
+#[derive(Debug)]
+pub(super) enum NetworkEvent {
+    Response(FetchResponse),
+    Data(Vec<u8>),
+    Finished,
+}
+
+impl Completion {
+    pub(super) fn is_terminal(&self) -> bool {
+        matches!(self.result, Err(_) | Ok(NetworkEvent::Finished))
+    }
 }
 
 enum NetworkJob {
     Submit { id: u64, request: Request },
     Cancel(u64),
-    Finished(u64, Result<FetchResponse, String>),
     Shutdown,
 }
 
 pub(super) struct NetworkService {
     sender: UnboundedSender<NetworkJob>,
-    completion_sender: mpsc::Sender<Completion>,
-    completions: mpsc::Receiver<Completion>,
+    completion_sender: tokio::sync::mpsc::Sender<Completion>,
+    completions: tokio::sync::mpsc::Receiver<Completion>,
     wake: WakeCallback,
+    #[cfg(test)]
+    test_responses: HashMap<u64, FetchResponse>,
 }
 
 impl NetworkService {
@@ -69,8 +85,7 @@ impl NetworkService {
             .map_err(|error| BackendError::new(format!("create HTTP client: {error}")))?;
         let runtime = network_runtime()?;
         let (sender, receiver) = unbounded_channel();
-        let (completion_sender, completions) = mpsc::channel();
-        let worker_sender = sender.clone();
+        let (completion_sender, completions) = tokio::sync::mpsc::channel(32);
         let worker_completions = completion_sender.clone();
         let worker_wake = Arc::clone(&wake);
 
@@ -81,7 +96,6 @@ impl NetworkService {
                 runtime.block_on(run_worker(
                     client,
                     receiver,
-                    worker_sender,
                     worker_completions,
                     worker_wake,
                 ));
@@ -93,6 +107,8 @@ impl NetworkService {
             completion_sender,
             completions,
             wake,
+            #[cfg(test)]
+            test_responses: HashMap::new(),
         })
     }
 
@@ -103,7 +119,7 @@ impl NetworkService {
             .send(NetworkJob::Submit { id, request })
             .is_err()
         {
-            let _ = self.completion_sender.send(Completion {
+            let _ = self.completion_sender.try_send(Completion {
                 id,
                 result: Err(String::from("network worker stopped")),
             });
@@ -117,20 +133,19 @@ impl NetworkService {
         let _ = self.sender.send(NetworkJob::Cancel(id));
     }
 
-    pub(super) fn try_recv(&self) -> Option<Completion> {
+    pub(super) fn try_recv(&mut self) -> Option<Completion> {
         self.completions.try_recv().ok()
     }
 
     #[cfg(test)]
-    pub(super) fn poll(&self) -> impl Iterator<Item = Completion> + '_ {
-        self.completions.try_iter()
+    pub(super) fn poll(&mut self) -> impl Iterator<Item = Completion> + '_ {
+        std::iter::from_fn(|| self.completions.try_recv().ok())
     }
 }
 
 impl Drop for NetworkService {
     fn drop(&mut self) {
-        // Tasks also own senders. Shutdown prevents those senders from keeping
-        // a runtime alive after the backend that created it has gone away.
+        // Stop the supervisor and abort its HTTP tasks when the backend leaves.
         let _ = self.sender.send(NetworkJob::Shutdown);
     }
 }
@@ -156,61 +171,45 @@ fn network_runtime() -> Result<tokio::runtime::Runtime, BackendError> {
 async fn run_worker(
     client: reqwest::Client,
     mut receiver: UnboundedReceiver<NetworkJob>,
-    commands: UnboundedSender<NetworkJob>,
-    completions: mpsc::Sender<Completion>,
+    completions: tokio::sync::mpsc::Sender<Completion>,
     wake: WakeCallback,
 ) {
+    // Chunk size and both event queues are bounded. Awaiting downstream space
+    // applies backpressure to response.chunk(), including HTTP/2 flow control.
+    let (events, mut incoming) = tokio::sync::mpsc::channel::<Completion>(32);
     let mut active: HashMap<u64, tokio::task::AbortHandle> = HashMap::new();
-    while let Some(job) = receiver.recv().await {
-        match job {
-            NetworkJob::Submit { id, request } => {
-                if active.contains_key(&id) {
-                    // A malformed caller cannot replace an uncancelled task.
-                    // Abort and retire it before reporting the protocol error.
-                    active.remove(&id).unwrap().abort();
-                    if completions
-                        .send(Completion {
-                            id,
-                            result: Err(String::from("duplicate active resource request ID")),
-                        })
-                        .is_ok()
-                    {
-                        wake();
+    loop {
+        tokio::select! {
+            job = receiver.recv() => match job {
+                Some(NetworkJob::Submit { id, request }) => {
+                    if active.contains_key(&id) {
+                        active.remove(&id).unwrap().abort();
+                        if completions.send(Completion { id, result: Err(String::from("duplicate active resource request ID")) }).await.is_ok() { wake(); }
+                        continue;
                     }
-                    continue;
+                    let client = client.clone();
+                    let events = events.clone();
+                    let task = tokio::spawn(async move {
+                        let result = fetch(client, request, id, &events).await;
+                        let result = result.map(|()| NetworkEvent::Finished);
+                        let _ = events.send(Completion { id, result }).await;
+                    });
+                    active.insert(id, task.abort_handle());
                 }
-                let client = client.clone();
-                let commands = commands.clone();
-                let task = tokio::spawn(async move {
-                    let result = fetch(client, request).await;
-                    // The owner serializes finish and cancel on one queue.
-                    // Tasks never publish completions independently.
-                    let _ = commands.send(NetworkJob::Finished(id, result));
-                });
-                active.insert(id, task.abort_handle());
-            }
-            NetworkJob::Cancel(id) => {
-                if let Some(task) = active.remove(&id) {
-                    task.abort();
-                    if completions
-                        .send(Completion {
-                            id,
-                            result: Err(String::from("resource request cancelled")),
-                        })
-                        .is_ok()
-                    {
-                        wake();
+                Some(NetworkJob::Cancel(id)) => {
+                    if let Some(task) = active.remove(&id) {
+                        task.abort();
+                        if completions.send(Completion { id, result: Err(String::from("resource request cancelled")) }).await.is_ok() { wake(); }
                     }
                 }
+                Some(NetworkJob::Shutdown) | None => break,
+            },
+            Some(event) = incoming.recv() => {
+                if !active.contains_key(&event.id) { continue; }
+                if event.is_terminal() { active.remove(&event.id); }
+                if completions.send(event).await.is_err() { break; }
+                wake();
             }
-            NetworkJob::Finished(id, result) => {
-                if active.remove(&id).is_some()
-                    && completions.send(Completion { id, result }).is_ok()
-                {
-                    wake();
-                }
-            }
-            NetworkJob::Shutdown => break,
         }
     }
     for task in active.into_values() {
@@ -218,7 +217,26 @@ async fn run_worker(
     }
 }
 
-async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchResponse, String> {
+async fn publish(
+    events: &tokio::sync::mpsc::Sender<Completion>,
+    id: u64,
+    event: NetworkEvent,
+) -> Result<(), String> {
+    events
+        .send(Completion {
+            id,
+            result: Ok(event),
+        })
+        .await
+        .map_err(|_| String::from("network consumer stopped"))
+}
+
+async fn fetch(
+    client: reqwest::Client,
+    request: Request,
+    id: u64,
+    events: &tokio::sync::mpsc::Sender<Completion>,
+) -> Result<(), String> {
     let url = Url::parse(&request.url).map_err(|error| format!("invalid resource URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("unsupported resource URL scheme: {}", url.scheme()));
@@ -296,34 +314,50 @@ async fn fetch(client: reqwest::Client, request: Request) -> Result<FetchRespons
             )
         })
         .collect();
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        append_body(&mut body, &chunk, MAX_BODY_BYTES)?;
-    }
-    let (headers, body) = if response_has_entity
-        && headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
-    {
-        // Brotli/gzip decoding is synchronous CPU work. Keep it off the HTTP
-        // executor so other responses and cancellation can advance meanwhile.
-        // Cancelling the enclosing future discards an already-running decode;
-        // it retains the same encoded and per-layer decoded byte bounds.
-        tokio::task::spawn_blocking(move || {
-            decode_entity(&headers, body, MAX_BODY_BYTES).map(|body| (headers, body))
-        })
-        .await
-        .map_err(|error| format!("decode HTTP entity worker: {error}"))??
-    } else {
-        (headers, body)
-    };
-    Ok(FetchResponse {
+    let encoded = response_has_entity
+        && headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-encoding")
+                && !value.trim().eq_ignore_ascii_case("identity")
+        });
+    let metadata = FetchResponse {
         final_url,
         status,
         status_text,
         headers,
-        body,
-    })
+        body: Vec::new(),
+    };
+    // Encoded documents still use the existing strict, bounded decoder. Media
+    // segments and ordinary identity responses can reach WebCore immediately.
+    if !encoded {
+        publish(events, id, NetworkEvent::Response(metadata)).await?;
+        let mut length = 0usize;
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            length = length
+                .checked_add(chunk.len())
+                .ok_or_else(body_limit_error)?;
+            if length > MAX_BODY_BYTES {
+                return Err(body_limit_error());
+            }
+            for bytes in chunk.chunks(64 * 1024) {
+                publish(events, id, NetworkEvent::Data(bytes.to_vec())).await?;
+            }
+        }
+    } else {
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            append_body(&mut body, &chunk, MAX_BODY_BYTES)?;
+        }
+        let headers = metadata.headers.clone();
+        let body =
+            tokio::task::spawn_blocking(move || decode_entity(&headers, body, MAX_BODY_BYTES))
+                .await
+                .map_err(|error| format!("decode HTTP entity worker: {error}"))??;
+        publish(events, id, NetworkEvent::Response(metadata)).await?;
+        for bytes in body.chunks(64 * 1024) {
+            publish(events, id, NetworkEvent::Data(bytes.to_vec())).await?;
+        }
+    }
+    Ok(())
 }
 
 fn profile_http_version(response: &reqwest::Response) {
@@ -587,9 +621,52 @@ mod tests {
         (service, wakes)
     }
 
-    fn complete(service: &NetworkService, wakes: &mpsc::Receiver<()>) -> Completion {
-        wakes.recv_timeout(Duration::from_secs(5)).unwrap();
-        service.try_recv().expect("wake follows completion enqueue")
+    struct TestCompletion {
+        id: u64,
+        result: Result<FetchResponse, String>,
+    }
+
+    fn next_event(service: &mut NetworkService, wakes: &mpsc::Receiver<()>) -> Completion {
+        loop {
+            if let Some(event) = service.try_recv() {
+                return event;
+            }
+            wakes.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    fn complete(service: &mut NetworkService, wakes: &mpsc::Receiver<()>) -> TestCompletion {
+        loop {
+            let event = next_event(service, wakes);
+            let id = event.id;
+            match event.result {
+                Ok(NetworkEvent::Response(response)) => {
+                    assert!(service.test_responses.insert(id, response).is_none());
+                }
+                Ok(NetworkEvent::Data(bytes)) => service
+                    .test_responses
+                    .get_mut(&id)
+                    .expect("headers before body")
+                    .body
+                    .extend_from_slice(&bytes),
+                Ok(NetworkEvent::Finished) => {
+                    return TestCompletion {
+                        id,
+                        result: Ok(service
+                            .test_responses
+                            .remove(&id)
+                            .expect("headers before finish")),
+                    };
+                }
+                Err(error) => {
+                    service.test_responses.remove(&id);
+                    return TestCompletion {
+                        id,
+                        result: Err(error),
+                    };
+                }
+            }
+        }
     }
 
     fn read_request(stream: &mut TcpStream) -> (String, Vec<String>, Vec<u8>) {
@@ -708,6 +785,111 @@ mod tests {
     }
 
     #[test]
+    fn headers_and_body_arrive_before_the_server_finishes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nfirst",
+                )
+                .unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream.write_all(b"later").unwrap();
+        });
+        let (mut service, wakes) = service();
+        service.submit(1, get(url));
+        assert!(matches!(
+            next_event(&mut service, &wakes).result,
+            Ok(NetworkEvent::Response(_))
+        ));
+        let mut body = Vec::new();
+        while body.len() < 5 {
+            match next_event(&mut service, &wakes).result {
+                Ok(NetworkEvent::Data(bytes)) => body.extend(bytes),
+                other => panic!("body must arrive before EOF: {other:?}"),
+            }
+        }
+        assert_eq!(body, b"first");
+        release.send(()).unwrap();
+        loop {
+            match next_event(&mut service, &wakes).result {
+                Ok(NetworkEvent::Data(bytes)) => body.extend(bytes),
+                Ok(NetworkEvent::Finished) => break,
+                other => panic!("unexpected stream event: {other:?}"),
+            }
+        }
+        assert_eq!(body, b"firstlater");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn truncated_stream_fails_after_delivering_its_prefix() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/broken", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nprefix",
+                )
+                .unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (mut service, wakes) = service();
+        service.submit(2, get(url));
+        assert!(matches!(
+            next_event(&mut service, &wakes).result,
+            Ok(NetworkEvent::Response(_))
+        ));
+        assert!(matches!(
+            next_event(&mut service, &wakes).result,
+            Ok(NetworkEvent::Data(_))
+        ));
+        release.send(()).unwrap();
+        assert!(next_event(&mut service, &wakes).result.is_err());
+        server.join().unwrap();
+        assert!(service.try_recv().is_none());
+    }
+
+    #[test]
+    fn cancellation_after_headers_terminates_the_stream_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cancel", listener.local_addr().unwrap());
+        let (release, released) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (mut service, wakes) = service();
+        service.submit(3, get(url));
+        assert!(matches!(
+            next_event(&mut service, &wakes).result,
+            Ok(NetworkEvent::Response(_))
+        ));
+        service.cancel(3);
+        assert!(
+            next_event(&mut service, &wakes)
+                .result
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(service.try_recv().is_none());
+    }
+
+    #[test]
     fn pending_http_response_does_not_hold_up_other_resources() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -731,15 +913,15 @@ mod tests {
             )
             .unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(1, get(format!("{origin}/slow")));
         arrived.recv_timeout(Duration::from_secs(5)).unwrap();
         service.submit(2, get(format!("{origin}/fast")));
-        let fast = complete(&service, &wakes);
+        let fast = complete(&mut service, &wakes);
         assert_eq!(fast.id, 2);
         assert_eq!(fast.result.unwrap().body, b"fast");
         release.send(()).unwrap();
-        let slow = complete(&service, &wakes);
+        let slow = complete(&mut service, &wakes);
         assert_eq!(slow.id, 1);
         assert_eq!(slow.result.unwrap().body, b"slow");
         server.join().unwrap();
@@ -761,9 +943,9 @@ mod tests {
             assert!(!headers.iter().any(|header| header.starts_with("cookie:")));
             stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing").unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(42, get(format!("{origin}/redirect")));
-        let completion = complete(&service, &wakes);
+        let completion = complete(&mut service, &wakes);
         assert_eq!(completion.id, 42);
         let response = completion.result.unwrap();
         assert_eq!(response.final_url, format!("{origin}/redirect"));
@@ -784,7 +966,7 @@ mod tests {
             2
         );
         service.submit(43, get(format!("{origin}/probe")));
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert_eq!(response.status, 404);
         assert_eq!(response.status_text, "Not Found");
         assert_eq!(response.body, b"missing");
@@ -824,7 +1006,7 @@ mod tests {
             stream.write_all(response).unwrap();
             framed
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(
             1,
             Request {
@@ -840,7 +1022,7 @@ mod tests {
                 body: Vec::new(),
             },
         );
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         let framed = server.join().unwrap();
         assert_eq!(
             response.status, 200,
@@ -886,7 +1068,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         for (id, method) in ["POST", "GET", "HEAD"].into_iter().enumerate() {
             service.submit(
                 id as u64,
@@ -901,7 +1083,7 @@ mod tests {
                     body: Vec::new(),
                 },
             );
-            assert_eq!(complete(&service, &wakes).result.unwrap().status, 200);
+            assert_eq!(complete(&mut service, &wakes).result.unwrap().status, 200);
         }
         server.join().unwrap();
     }
@@ -923,7 +1105,7 @@ mod tests {
             assert_eq!(body, [0, 255, b'&']);
             stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: text/html; charset=Shift_JIS\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\x82\xa0!").unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(
             7,
             Request {
@@ -936,7 +1118,7 @@ mod tests {
                 body: vec![0, 255, b'&'],
             },
         );
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert_eq!(response.status, 201);
         assert_eq!(response.body, [0x82, 0xa0, b'!']);
         assert!(response.headers.contains(&(
@@ -951,7 +1133,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         for (id, user_info, authorization) in [
             (1, "hidden:password", false),
             (2, "hidden:password", true),
@@ -966,7 +1148,7 @@ mod tests {
                 ));
             }
             service.submit(id, request);
-            let error = complete(&service, &wakes).result.unwrap_err();
+            let error = complete(&mut service, &wakes).result.unwrap_err();
             assert!(error.contains("URL user-info is unsupported"), "{error}");
             assert_eq!(
                 listener.accept().unwrap_err().kind(),
@@ -1001,7 +1183,7 @@ mod tests {
             String::from("Bearer explicit"),
         ));
         service.submit(5, request);
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.final_url, url);
         server.join().unwrap();
@@ -1033,13 +1215,13 @@ mod tests {
             assert!(found);
             stream.write_all(b"HTTP/1.1 200 OK\r\nX-Byte: \xff\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         let mut request = get(url.clone());
         request
             .headers
             .push((String::from("X-Byte"), String::from("ÿ")));
         service.submit(1, request);
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert!(
             response
                 .headers
@@ -1052,7 +1234,7 @@ mod tests {
             .headers
             .push((String::from("X-Byte"), String::from("苺")));
         service.submit(2, request);
-        let error = complete(&service, &wakes).result.unwrap_err();
+        let error = complete(&mut service, &wakes).result.unwrap_err();
         assert!(error.contains("outside Latin-1 byte range"), "{error}");
         listener.set_nonblocking(true).unwrap();
         assert_eq!(
@@ -1075,10 +1257,10 @@ mod tests {
             )
             .unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(1, get(url));
         assert!(
-            complete(&service, &wakes)
+            complete(&mut service, &wakes)
                 .result
                 .unwrap_err()
                 .contains("64 MiB")
@@ -1090,7 +1272,7 @@ mod tests {
         ] {
             service.submit(id, get(url));
             assert!(
-                complete(&service, &wakes)
+                complete(&mut service, &wakes)
                     .result
                     .unwrap_err()
                     .contains("unsupported")
@@ -1114,16 +1296,16 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlate",
             );
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         service.submit(9, get(url));
         arrived.recv_timeout(Duration::from_secs(5)).unwrap();
         service.cancel(9);
-        let completion = complete(&service, &wakes);
+        let completion = complete(&mut service, &wakes);
         assert_eq!(completion.id, 9);
         assert!(completion.result.unwrap_err().contains("cancelled"));
         release.send(()).unwrap();
         server.join().unwrap();
-        assert!(wakes.recv_timeout(Duration::from_millis(100)).is_err());
+        thread::sleep(Duration::from_millis(100));
         assert!(service.poll().next().is_none());
     }
 
@@ -1166,7 +1348,7 @@ mod tests {
                 }
             }
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         for id in 0..128 {
             service.submit(id, get(url.clone()));
             if id % 3 != 0 {
@@ -1176,7 +1358,7 @@ mod tests {
         }
         let mut seen = std::collections::HashSet::new();
         for _ in 0..128 {
-            let completion = complete(&service, &wakes);
+            let completion = complete(&mut service, &wakes);
             assert!(seen.insert(completion.id), "duplicate completion");
             match completion.result {
                 Ok(response) => assert_eq!(response.status, 204),
@@ -1187,7 +1369,7 @@ mod tests {
         for id in 0..128 {
             service.cancel(id);
         }
-        assert!(wakes.recv_timeout(Duration::from_millis(100)).is_err());
+        thread::sleep(Duration::from_millis(100));
         assert!(service.poll().next().is_none());
         stop.store(true, Ordering::Relaxed);
         drop(service);
@@ -1235,10 +1417,10 @@ mod tests {
                 stream.write_all(&body).unwrap();
             }
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         for (id, (headers, encoded_size)) in expected.into_iter().enumerate() {
             service.submit(id as u64, get(url.clone()));
-            let response = complete(&service, &wakes).result.unwrap();
+            let response = complete(&mut service, &wakes).result.unwrap();
             assert_eq!(response.body, ENCODED_HTML.as_bytes());
             assert_eq!(response.final_url, url);
             assert!(
@@ -1339,15 +1521,15 @@ mod tests {
             let _ = read_request(&mut stream);
             stream.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Encoding: br\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n").unwrap();
         });
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         let mut request = get(url.clone());
         request.method = String::from("HEAD");
         service.submit(1, request);
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert_eq!(response.status, 200);
         assert!(response.body.is_empty());
         service.submit(2, get(url));
-        let response = complete(&service, &wakes).result.unwrap();
+        let response = complete(&mut service, &wakes).result.unwrap();
         assert_eq!(response.status, 304);
         assert!(response.body.is_empty());
         server.join().unwrap();
@@ -1365,12 +1547,12 @@ mod tests {
 
     #[test]
     fn invalid_method_and_header_values_are_not_sent() {
-        let (service, wakes) = service();
+        let (mut service, wakes) = service();
         let mut request = get("http://127.0.0.1:9/");
         request.method = String::from("bad method");
         service.submit(1, request);
         assert!(
-            complete(&service, &wakes)
+            complete(&mut service, &wakes)
                 .result
                 .unwrap_err()
                 .contains("invalid HTTP method")
@@ -1382,7 +1564,7 @@ mod tests {
         ));
         service.submit(2, request);
         assert!(
-            complete(&service, &wakes)
+            complete(&mut service, &wakes)
                 .result
                 .unwrap_err()
                 .contains("invalid request header value")

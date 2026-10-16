@@ -375,6 +375,16 @@ unsafe extern "C" {
         view: *mut ScarletWebView,
         out_request: *mut Request,
     ) -> c_int;
+    pub fn scarlet_webview_start_response(
+        view: *mut ScarletWebView,
+        response: *const Response,
+    ) -> c_int;
+    pub fn scarlet_webview_append_response(
+        view: *mut ScarletWebView,
+        request_id: u64,
+        bytes: Bytes,
+        finished: u32,
+    ) -> c_int;
     pub fn scarlet_webview_complete_request(
         view: *mut ScarletWebView,
         response: *const Response,

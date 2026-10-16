@@ -363,13 +363,16 @@ impl WebKitBackend {
             let Some(completion) = self.network.try_recv() else {
                 break;
             };
-            if !self.in_flight.remove(&completion.id) {
+            if !self.in_flight.contains(&completion.id) {
                 continue;
             }
             changed = true;
+            if completion.is_terminal() {
+                self.in_flight.remove(&completion.id);
+            }
             match completion.result {
                 Err(error) => self.complete_error(completion.id, &error)?,
-                Ok(response) => {
+                Ok(network::NetworkEvent::Response(response)) => {
                     let headers: Vec<_> = response
                         .headers
                         .iter()
@@ -391,9 +394,8 @@ impl WebKitBackend {
                     // SAFETY: All spans refer to owned response data kept alive
                     // through this call. No network thread enters WebCore.
                     let started = self.profile_completions.then(Instant::now);
-                    let result = unsafe {
-                        ffi::scarlet_webview_complete_request(self.view.as_ptr(), &native)
-                    };
+                    let result =
+                        unsafe { ffi::scarlet_webview_start_response(self.view.as_ptr(), &native) };
                     if let Some(started) = started {
                         let elapsed = started.elapsed();
                         if elapsed >= Duration::from_millis(8) {
@@ -417,8 +419,34 @@ impl WebKitBackend {
                             );
                         }
                     }
-                    if result != ffi::STALE_REQUEST {
-                        check(result, "complete WebCore resource")?;
+                    if result == ffi::STALE_REQUEST {
+                        self.in_flight.remove(&completion.id);
+                        self.network.cancel(completion.id);
+                    } else {
+                        check(result, "start WebCore resource")?;
+                    }
+                }
+                Ok(event) => {
+                    let (body, finished) = match &event {
+                        network::NetworkEvent::Data(bytes) => (bytes.as_slice(), 0),
+                        network::NetworkEvent::Finished => (&[][..], 1),
+                        network::NetworkEvent::Response(_) => unreachable!(),
+                    };
+                    // SAFETY: The owner thread retains the chunk until the
+                    // synchronous append has copied it into WebCore storage.
+                    let result = unsafe {
+                        ffi::scarlet_webview_append_response(
+                            self.view.as_ptr(),
+                            completion.id,
+                            ffi::Bytes::from_slice(body),
+                            finished,
+                        )
+                    };
+                    if result == ffi::STALE_REQUEST {
+                        self.in_flight.remove(&completion.id);
+                        self.network.cancel(completion.id);
+                    } else {
+                        check(result, "append WebCore resource")?;
                     }
                 }
             }

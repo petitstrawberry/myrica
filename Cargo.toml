@@ -83,9 +83,11 @@ peniko = { version = "0.6.0", optional = true }
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "cookies", "rustls-tls-webpki-roots"], optional = true }
 skrifa = { version = "0.44.0", optional = true }
 swash = { version = "0.2.6", optional = true }
-tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 
 [dev-dependencies]
+brotli-decompressor = "5.0.3"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
