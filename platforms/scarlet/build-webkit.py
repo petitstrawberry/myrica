@@ -112,6 +112,8 @@ def main():
         "-DENABLE_C_LOOP=OFF",
         "-DENABLE_JIT=ON",
         "-DENABLE_DFG_JIT=ON",
+        "-DENABLE_FTL_JIT=ON",
+        "-DENABLE_SAMPLING_PROFILER=ON",
         f"-DSCARLET_BUILD_VULKAN_PROBE={'ON' if args.vulkan_probe else 'OFF'}",
         f"-DSCARLET_USE_SKIA_VULKAN={'ON' if args.vulkan_rendering else 'OFF'}",
         f"-DSCARLET_USE_COORDINATED_COMPOSITOR={'ON' if args.vulkan_rendering else 'OFF'}",
