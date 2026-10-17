@@ -129,6 +129,9 @@ advertised Vulkan heap. Each context applies its share on its own thread; live
 tiles, borrowed output images and uploads retain space outside that allowance.
 Coordinated layers share native-image backing stores by image identity, matching
 WebKit's LayerTreeHost, and release unused entries after owner-side layer updates.
+Video texture uploads submit and retire independently of page damage, with at
+most three outstanding uploads per compositor pump. An offscreen player cannot
+accumulate unsent Y/UV textures and staging buffers while composition is idle.
 
 The Scarlet WebKit profile uses WebKit storage namespaces for localStorage and
 sessionStorage, a shared native CookieJarDB for HTTP and document.cookie, and
