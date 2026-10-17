@@ -231,13 +231,14 @@ class SharedRegion {
   bool map_fd(int fd, uint32_t slot_count, uint32_t slot_size) {
     fd_ = fd;
     owned_fd_ = false;
+    const size_t needed = WVH_SHM_HEADER_BYTES + static_cast<size_t>(slot_count) * slot_size;
+    // Scarlet's Linux ABI does not report a size for a shared memory descriptor,
+    // so the caller-provided layout is authoritative here; a mismatch shows up
+    // as a mapping fault. Record whatever the descriptor does report.
     struct stat info;
     if (fstat(fd, &info) != 0) {
-      std::cerr << "fstat shm fd failed" << std::endl;
-      return false;
-    }
-    const size_t needed = WVH_SHM_HEADER_BYTES + static_cast<size_t>(slot_count) * slot_size;
-    if (static_cast<size_t>(info.st_size) < needed) {
+      log_line("fstat on the shared memory descriptor failed; using the requested layout");
+    } else if (info.st_size > 0 && static_cast<size_t>(info.st_size) < needed) {
       std::cerr << "shm region is smaller than the requested layout" << std::endl;
       return false;
     }
