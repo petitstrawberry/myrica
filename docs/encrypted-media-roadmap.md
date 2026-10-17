@@ -119,6 +119,8 @@ W0 実施記録 (2026-10-16):
 - 制御チャネルはネイティブの socketpair (syscall 905) または pipe を同じ HandleMapping で渡せる。したがって「不可ならソケットコピーで開始」というフォールバックは不要で、最初から共有メモリと fd 渡しで設計できる。target は 1024 未満かつ未使用の番号 (3, 4, ...) を選ぶ。
 - 障害時: ホストの異常終了を myrica が検知したらセッションを失効させる (再生はエラーで終了)。CDM の状態はホスト内に閉じているので、ホストを起動し直せば作り直せる。
 - installer の位置付け: 調達と fixup の自動化であり、アーキテクチャの一部ではない。ホストプロセスが読む .so を正しい場所 (/var/lib/widevine/WidevineCdm/<version>/_platform_specific/linux_arm64/libwidevinecdm.so) に用意する役割で、プローブはこのパスを既定で探す。
+- W1 実装 (2026-10-17, 最初のスライス完了): tools/widevine-host に CDM ホストプロセスを追加した。16 バイトヘッダの制御プロトコル (HELLO / INIT / CREATE_SESSION / UPDATE_SESSION / CLOSE_SESSION / REMOVE_SESSION / DECRYPT / RELEASE / SHUTDOWN と READY / RESULT / SESSION / MESSAGE / KEYS / EXPIRATION / SESSION_CLOSED)、4096 バイトヘッダ + 4 x 1 MiB スロットの共有領域、スロット経由のライセンス要求配送を aarch64 Debian コンテナで実測した (READY → INIT status=0 → EV_SESSION → EV_MESSAGE slot=0 size=1676 → CLIENT_OK)。CDM 呼び出しはホスト内の要求ループで直列化し、イベントは専用スレッドからソケットへ書く。イベントは非同期なので、クライアントは固定の応答順ではなくイベント種別で処理する必要がある (実測で EV_SESSION / EV_MESSAGE が RESULT より先に届く)。
+- W1 の残り: Scarlet ネイティブ側のクライアント (SharedMemory と socketpair を spawn の handle map で渡し、--shm-fd / --fd でホストを起動)、プロビジョニングとライセンス往復 (ネットワーク)、鍵ありの DECRYPT 経路 (現状は鍵なしで WVH_NO_KEY を返す)。
 
 W0 (規模: 小) Linux ビューでの実証。Debian glibc ビューで libwidevinecdm.so を dlopen し、CDM の初期化とライセンス往復 (テスト用ライセンスサーバ) の可否を確認する。Linux ABI のギャップ (epoll スタブ、fcntl の F_DUPFD 欠落、シグナル簡易実装、auxv/TLS 整合) をここで洗い出す。最大の未知はここ。
 W1 (規模: 中) ヘルパープロセスと CDM ホストの実装。license request / response と鍵取得まで通す。
