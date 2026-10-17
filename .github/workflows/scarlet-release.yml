@@ -66,6 +66,12 @@ jobs:
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'scarlet-dev' }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: actions/cache/restore@v4
+        if: steps.inputs.outputs.exists != 'true'
+        id: build-cache
+        with:
+          path: target
+          key: myrica-aarch64-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'platforms/scarlet/**', 'crates/myrica-webkit-sys/**') }}
       - name: Build Myrica and probe
         if: steps.inputs.outputs.exists != 'true'
         run: |
@@ -77,6 +83,11 @@ jobs:
           printf '%s\n' "$SCARLET_RUST_TOOLCHAIN" > "$RUNNER_TEMP/myrica-toolchain"
           printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}" > "$RUNNER_TEMP/myrica-cargo-home"
           BUILD
+      - uses: actions/cache/save@v4
+        if: steps.inputs.outputs.exists != 'true' && steps.build-cache.outputs.cache-hit != 'true'
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
       - name: Package corresponding sources and notices
         if: steps.inputs.outputs.exists != 'true'
         run: |
@@ -92,13 +103,14 @@ jobs:
           (cd "$task_native/_deps"; tar --exclude=.git -cf - -- ./*-src) | tar -xf - -C dist/sources/native
           task_sdk=$(nix eval --impure --raw --expr '(builtins.getFlake ("git+file://" + toString ./.)).inputs.scarlet-sdk.outPath')
           cp -R "$task_sdk/scarlet-libc" dist/sources/scarlet-libc
+          chmod -R u+w dist/sources/scarlet-libc
           cp "$task_sdk/LICENSE" dist/sources/scarlet-libc/LICENSE-SDK
           cp -R "$(cat "$RUNNER_TEMP/myrica-native-runtime")/share/licenses" dist/staging/share/licenses/myrica/native-runtime
           task_toolchain=$(cat "$RUNNER_TEMP/myrica-toolchain")
           cp -R "$task_toolchain/lib/rustlib/src/rust/library" dist/sources/rust-library
           task_rust_revision=$(sed -n 's/^rust_commit = "\(.*\)"/\1/p' "$task_toolchain/manifest.toml")
           test -n "$task_rust_revision"
-          chmod u+w dist/sources/rust-library
+          chmod -R u+w dist/sources/rust-library
           for task_notice in LICENSE-MIT LICENSE-APACHE COPYRIGHT; do
             curl --fail --location --retry 3 "https://raw.githubusercontent.com/petitstrawberry/rust/$task_rust_revision/$task_notice" \
               -o "dist/sources/rust-library/$task_notice"
