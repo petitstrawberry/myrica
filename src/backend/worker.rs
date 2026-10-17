@@ -158,6 +158,7 @@ impl BrowserWorker {
             load_state: LoadState::Loading,
             can_go_back: false,
             can_go_forward: false,
+            fullscreen: Default::default(),
             text_input: None,
         };
         let shared = Arc::new(Shared {
@@ -774,6 +775,7 @@ mod tests {
                     load_state: LoadState::Idle,
                     can_go_back: false,
                     can_go_forward: false,
+                    fullscreen: Default::default(),
                     text_input: None,
                 },
             }))
@@ -965,6 +967,7 @@ mod tests {
                     load_state: LoadState::Idle,
                     can_go_back: false,
                     can_go_forward: false,
+                    fullscreen: Default::default(),
                     text_input: None,
                 },
                 pending: Some(pending_rx),
@@ -1056,6 +1059,7 @@ mod tests {
                     load_state: LoadState::Ready,
                     can_go_back: false,
                     can_go_forward: false,
+                    fullscreen: Default::default(),
                     text_input: None,
                 }
             }
@@ -1230,6 +1234,7 @@ mod tests {
                 load_state: LoadState::Ready,
                 can_go_back: false,
                 can_go_forward: false,
+                fullscreen: Default::default(),
                 text_input: None,
             }
         }

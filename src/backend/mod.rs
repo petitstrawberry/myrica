@@ -113,6 +113,14 @@ impl LoadState {
     }
 }
 
+/// Native fullscreen transition requested by the document owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowserFullscreen {
+    pub request_id: u64,
+    pub requested: bool,
+    pub active: bool,
+}
+
 /// Browser state exposed to chrome without leaking engine-specific types.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowserSnapshot {
@@ -130,6 +138,7 @@ pub struct BrowserSnapshot {
     pub can_go_forward: bool,
     /// IME state of the page's focused editable control, in viewport CSS pixels.
     pub text_input: Option<BrowserTextInput>,
+    pub fullscreen: BrowserFullscreen,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,6 +224,12 @@ pub enum BrowserInput {
     },
     ImeCommit(String),
     FocusLost,
+    /// Window-server acknowledgement. Zero identifies a forced platform exit.
+    FullscreenChanged {
+        request_id: u64,
+        fullscreen: bool,
+    },
+    ExitFullscreen,
 }
 
 /// Error returned when a browser backend rejects an operation.

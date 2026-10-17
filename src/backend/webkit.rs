@@ -93,6 +93,7 @@ impl WebKitBackend {
                 load_state: LoadState::Idle,
                 can_go_back: false,
                 can_go_forward: false,
+                fullscreen: Default::default(),
                 text_input: None,
             },
             in_flight: HashSet::new(),
@@ -489,6 +490,25 @@ impl WebKitBackend {
         };
         self.snapshot.can_go_back = state.can_go_back != 0;
         self.snapshot.can_go_forward = state.can_go_forward != 0;
+        let mut fullscreen = ffi::FullscreenState::default();
+        // SAFETY: POD output is copied on this native view's owner thread.
+        check(
+            unsafe { ffi::scarlet_webview_fullscreen_state(self.view.as_ptr(), &mut fullscreen) },
+            "read WebCore fullscreen state",
+        )?;
+        self.snapshot.fullscreen = super::BrowserFullscreen {
+            request_id: fullscreen.request_id,
+            requested: fullscreen.requested != 0,
+            active: fullscreen.active != 0,
+        };
+        if self.profile_completions && self.snapshot.fullscreen != before.fullscreen {
+            eprintln!(
+                "MYRICA_FULLSCREEN request={} requested={} active={}",
+                self.snapshot.fullscreen.request_id,
+                self.snapshot.fullscreen.requested,
+                self.snapshot.fullscreen.active
+            );
+        }
         Ok(changed || self.snapshot != before)
     }
 
@@ -958,6 +978,33 @@ impl BrowserBackend for WebKitBackend {
                 Ok(consumed)
             }
             BrowserInput::ImePreedit { .. } => Ok(false),
+            BrowserInput::FullscreenChanged {
+                request_id,
+                fullscreen,
+            } => {
+                // SAFETY: only this worker owns WebCore and resolves its callbacks.
+                let status = unsafe {
+                    ffi::scarlet_webview_fullscreen_changed(
+                        self.view.as_ptr(),
+                        request_id,
+                        fullscreen as u32,
+                    )
+                };
+                if status != ffi::STALE_REQUEST {
+                    check(status, "complete WebCore fullscreen transition")?;
+                }
+                self.refresh_state()?;
+                Ok(true)
+            }
+            BrowserInput::ExitFullscreen => {
+                // SAFETY: exit enters WebCore's normal fullscreen algorithm on its owner.
+                check(
+                    unsafe { ffi::scarlet_webview_exit_fullscreen(self.view.as_ptr()) },
+                    "exit WebCore fullscreen",
+                )?;
+                self.refresh_state()?;
+                Ok(true)
+            }
             BrowserInput::FocusLost => {
                 self.modifiers = 0;
                 self.pressed_keys.clear();

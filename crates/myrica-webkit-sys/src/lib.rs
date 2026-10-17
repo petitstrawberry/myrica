@@ -196,6 +196,27 @@ pub struct State {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct FullscreenState {
+    pub request_id: u64,
+    pub requested: u32,
+    pub active: u32,
+}
+
+unsafe extern "C" {
+    pub fn scarlet_webview_fullscreen_state(
+        view: *mut ScarletWebView,
+        out: *mut FullscreenState,
+    ) -> c_int;
+    pub fn scarlet_webview_fullscreen_changed(
+        view: *mut ScarletWebView,
+        request_id: u64,
+        fullscreen: u32,
+    ) -> c_int;
+    pub fn scarlet_webview_exit_fullscreen(view: *mut ScarletWebView) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct MouseEvent {
     pub kind: u32,
     pub button: u32,

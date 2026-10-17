@@ -43,6 +43,8 @@ pub struct MyricaApp {
     last_webview_focused: Rc<Cell<bool>>,
     last_backend_url: Rc<RefCell<String>>,
     browser_shortcut_keys: Rc<RefCell<Vec<KeyCode>>>,
+    fullscreen: State<bool>,
+    last_fullscreen_request: Rc<Cell<u64>>,
     surface_damage: State<Option<scarlet_ui::Rect>>,
     staged_damage: Rc<RefCell<Option<Option<scarlet_ui::Rect>>>>,
 }
@@ -88,6 +90,8 @@ impl MyricaApp {
             last_webview_focused: Rc::new(Cell::new(false)),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
             browser_shortcut_keys: Rc::new(RefCell::new(Vec::new())),
+            fullscreen: State::new(generate_state_id(), false),
+            last_fullscreen_request: Rc::new(Cell::new(0)),
             surface_damage: State::new(generate_state_id(), None),
             staged_damage: Rc::new(RefCell::new(None)),
         })
@@ -173,12 +177,22 @@ impl MyricaApp {
 
         let shortcut_backend = Rc::clone(&self.backend);
         let shortcut_keys = Rc::clone(&self.browser_shortcut_keys);
-        let content = vstack! {
-            header,
-            canvas.background(Color::rgb(247, 245, 242)),
-            status,
-        }
-        .frame(f32::INFINITY, f32::INFINITY);
+        let content = if self.fullscreen.get() {
+            Either::A(
+                canvas
+                    .background(Color::BLACK)
+                    .frame(f32::INFINITY, f32::INFINITY),
+            )
+        } else {
+            Either::B(
+                vstack! {
+                    header,
+                    canvas.background(Color::rgb(247, 245, 242)),
+                    status,
+                }
+                .frame(f32::INFINITY, f32::INFINITY),
+            )
+        };
         content.on_event_capture(move |event: &Event| {
             dispatch_browser_shortcut(&shortcut_backend, &shortcut_keys, event)
         })
@@ -285,6 +299,7 @@ impl View for MyricaApp {
             &self.webview_size,
             &self.webview_focused,
             &self.gpu_surface,
+            &self.fullscreen,
         ]
     }
 
@@ -303,11 +318,53 @@ impl Application for MyricaApp {
         };
         Window::new(window_title, self.content())
             .app_id("org.scarlet-os.myrica")
+            .decorated(!self.fullscreen.get())
             .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
     }
 
     fn on_idle(&mut self) {
         self.synchronize_backend_state();
+    }
+
+    fn on_window_sync(
+        &mut self,
+        _: &scarlet_ui::WindowContext,
+        window: &mut dyn scarlet_ui::platform::PlatformWindow,
+    ) {
+        let request = self.backend.borrow().snapshot().fullscreen;
+        if request.request_id == self.last_fullscreen_request.get() {
+            return;
+        }
+        self.last_fullscreen_request.set(request.request_id);
+        let result = window.set_fullscreen(request.requested);
+        if result.is_err() || request.requested == self.fullscreen.get() {
+            self.backend
+                .borrow()
+                .handle_input(BrowserInput::FullscreenChanged {
+                    request_id: request.request_id,
+                    fullscreen: self.fullscreen.get(),
+                });
+        }
+        if let Err(error) = result {
+            eprintln!("myrica: fullscreen transition failed: {error}");
+        }
+    }
+
+    fn on_window_fullscreen_changed(&mut self, _: &scarlet_ui::WindowContext, fullscreen: bool) {
+        self.fullscreen.set(fullscreen);
+        let requested = self.backend.borrow().snapshot().fullscreen;
+        self.backend
+            .borrow()
+            .handle_input(BrowserInput::FullscreenChanged {
+                request_id: if requested.requested == fullscreen {
+                    requested.request_id
+                } else {
+                    0
+                },
+                fullscreen,
+            });
+        // The complete output is the page viewport while browser chrome is hidden.
+        self.webview_focused.set(true);
     }
 
     fn on_frame_presented(&mut self, _: &scarlet_ui::WindowContext) {
@@ -386,6 +443,14 @@ fn dispatch_browser_shortcut(
             let keycode = normalize_key(*keycode, *modifiers);
             let mut backend = backend.borrow_mut();
             match keycode {
+                KeyCode::Escape
+                    if {
+                        let fullscreen = backend.snapshot().fullscreen;
+                        fullscreen.requested || fullscreen.active
+                    } =>
+                {
+                    backend.handle_input(BrowserInput::ExitFullscreen);
+                }
                 KeyCode::Char('r' | 'R')
                     if modifiers.control
                         && !modifiers.shift
@@ -1062,6 +1127,40 @@ mod tests {
             "UI state changed on the engine thread"
         );
         assert_eq!(server.join().unwrap(), ["/first", "/address", "/linked"]);
+    }
+
+    #[test]
+    fn fullscreen_hides_address_chrome_and_restores_the_page_viewport() {
+        fn fields(element: &dyn Element) -> usize {
+            usize::from(element.render_object().is_some_and(|render| {
+                render
+                    .as_any()
+                    .is::<scarlet_ui::views::TextFieldRenderObject>()
+            })) + element
+                .children()
+                .iter()
+                .map(|child| fields(child.as_ref()))
+                .sum::<usize>()
+        }
+        let app = MyricaApp::new("about:blank").unwrap();
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let normal = app.webview_size.get();
+        assert_eq!(fields(tree.root().unwrap()), 1);
+
+        app.fullscreen.set(true);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(fields(tree.root().unwrap()), 0);
+        assert_eq!(app.webview_size.get(), Size::new(900.0, 500.0));
+
+        app.fullscreen.set(false);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(fields(tree.root().unwrap()), 1);
+        assert_eq!(app.webview_size.get(), normal);
+        app.shutdown();
     }
 
     #[test]
