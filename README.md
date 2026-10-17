@@ -107,8 +107,9 @@ myrica --backend webkit https://ichigo.dev/
 
 To include both engines, build with the default features plus `backend-webkit`.
 Select `--backend blitz` or `--backend webkit` at startup. Omitting `--backend`
-keeps Blitz when it is available. WebKit uses JavaScriptCore's native C-loop
-interpreter; Myrica's `javascript` feature controls the Blitz/Boa engine only.
+keeps Blitz when it is available. The native WebKit build enables JavaScriptCore's
+baseline, DFG and FTL JIT tiers, with AArch64 LLInt for cold code. Myrica's
+`javascript` feature controls the Blitz/Boa engine only.
 
 WebCore performs navigation, redirects, resource policy, HTML/CSS layout,
 JavaScript, editing, and history. Myrica provides verified HTTP(S) transport.
@@ -116,6 +117,16 @@ The Vulkan profile presents shared GPU images; the CPU profile uploads
 WebCore's Cairo framebuffer into its SGFX canvas. The font configuration
 defaults to `/etc/fonts/fonts.conf`; `MYRICA_WEBKIT_FONT_CONFIG` can select another
 installed configuration. Install its referenced fonts in the guest.
+
+The WebKit profile supports the document Fullscreen API. A site's fullscreen
+control enters native window fullscreen and hides browser chrome. Escape exits
+through WebCore and restores the window. Platform state changes and declined
+requests are acknowledged on the engine owner, keeping DOM fullscreen state and
+the window transition synchronized.
+
+Ganesh contexts share a device-wide resource-cache allowance derived from the
+advertised Vulkan heap. Each context applies its share on its own thread; live
+tiles, borrowed output images and uploads retain space outside that allowance.
 
 The Scarlet WebKit profile uses WebKit storage namespaces for localStorage and
 sessionStorage, a shared native CookieJarDB for HTTP and document.cookie, and
