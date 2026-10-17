@@ -87,7 +87,7 @@ jobs:
           task_native=$(dirname "$task_native")
           task_webkit_revision=$(git -C "$task_native/_deps/webkit-src" rev-parse HEAD)
           (cd "$task_native/_deps"; tar --exclude=.git -cf - -- ./*-src) | tar -xf - -C dist/sources/native
-          task_sdk=$(nix eval --impure --raw --expr '(builtins.getFlake (toString ./.)).inputs.scarlet-sdk.outPath')
+          task_sdk=$(nix eval --impure --raw --expr '(builtins.getFlake ("git+file://" + toString ./.)).inputs.scarlet-sdk.outPath')
           cp -R "$task_sdk/scarlet-libc" dist/sources/scarlet-libc
           cp "$task_sdk/LICENSE" dist/sources/scarlet-libc/LICENSE-SDK
           cp -R "$(cat "$RUNNER_TEMP/myrica-native-runtime")/share/licenses" dist/staging/share/licenses/myrica/native-runtime
