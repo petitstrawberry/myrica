@@ -64,8 +64,8 @@ The experimental backend uses the Scarlet branch of the
 Scarlet's AArch64 desktop bundle consumes the browser and probe from the
 `Scarlet prebuilt` Actions workflow. Releases are tagged
 `scarlet-<full-myrica-commit>` and include a checksum-pinned `bundle.toml`.
-Myrica owns the WebKit integration; Scarlet's flake provides common compilers
-and the SDK runtime, not application source pins or engine packages.
+Myrica owns the WebKit integration. Its own flake supplies the compilers and
+SDK runtime used by the build.
 
 The release includes `myrica-sources.tar.gz` with the matching Myrica source,
 cached Rust crates and native dependency sources (including the modified
@@ -101,11 +101,11 @@ Rust dependency, alongside its embedding adapter. No nested Cargo build or
 Scarlet source checkout is required.
 
 All engine build files, downloaded sources and installed archives remain in
-Cargo's build directory. The standard Scarlet development shell provides the
-common SDK runtime and raw compilers. `MYRICA_WEBKIT_LINK_MANIFEST` can explicitly
+Cargo's build directory. Myrica's development shell provides the SDK runtime
+and raw compilers. `MYRICA_WEBKIT_LINK_MANIFEST` can explicitly
 select a prebuilt installation; otherwise Cargo builds and uses its own link
-manifest. The SGFX userspace Cargo configuration supplies ordinary native
-loader link flags. `backend-webkit` selects the CPU Cairo profile;
+manifest. `build.rs` supplies the native loader link flags for Scarlet
+executables. `backend-webkit` selects the CPU Cairo profile;
 `backend-webkit-vulkan` selects WebCore Skia painting through the native Vulkan
 loader, SGFX ICD and VirGL backend. Both profiles build in release mode.
 
