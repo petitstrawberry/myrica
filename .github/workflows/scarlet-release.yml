@@ -104,7 +104,7 @@ jobs:
           (
             cd dist/sources
             find . -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*notice*' \
-              -o -iname '*copyright*' -o -iname 'authors*' -o -iname 'ftl.txt' \) -print0 \
+              -o -iname '*copyright*' -o -iname 'authors*' -o -iname 'ftl.txt' -o -iname 'readme.ijg' \) -print0 \
               | tar --null -T - -cf -
           ) | tar -xf - -C dist/staging/share/licenses/myrica/third-party
           cat > dist/staging/share/licenses/myrica/SOURCES.txt <<SOURCES
@@ -112,6 +112,10 @@ jobs:
           General Public License, and other third-party software. Their notices
           and license texts are retained in third-party/ and native-runtime/.
           Myrica's independent code remains MIT licensed.
+
+          FreeType is used under the FreeType License (FTL).
+          This software is based in part on the work of the FreeType Team.
+          This software is based in part on the work of the Independent JPEG Group.
 
           Corresponding source, native dependencies, vendored Rust dependencies,
           and rebuild instructions for this binary are available in this release:
