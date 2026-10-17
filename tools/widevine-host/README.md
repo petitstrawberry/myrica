@@ -75,6 +75,27 @@ CLIENT_OK
 
 That is the CDM's licence request arriving through shared memory.
 
+## Verify the licence round trip
+
+The test client can POST the licence request to a relay that terminates TLS,
+apply the response with UPDATE_SESSION, and report the key statuses.
+
+    python3 test/license-relay.py 8788
+
+Then run the container with the PSSH from the Shaka Sintel Widevine asset
+(https://storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd):
+
+    /wvh/test-client --socket ... --shm ... --pssh-hex <167-byte pssh>       --license-relay http://host.docker.internal:8788/
+
+Expected: LICENSE_RESPONSE_BYTES, five KEY lines with status=0 (usable),
+UPDATE_SESSION status=0 and KEYS_REPORTED. Verified 2026-10-18: a 167-byte
+Sintel PSSH produced a 1797-byte licence request, the Shaka test proxy
+returned 1229 bytes, and the CDM reported five usable keys.
+
+In the browser integration the page's own fetch() performs the licence POST,
+so the browser needs no licence networking of its own; the relay exists only
+so the container client can stay TLS-free.
+
 ## Status
 
 - Working: CDM load and initialize, session creation, licence request delivery
