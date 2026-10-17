@@ -885,8 +885,32 @@ void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
   input.num_subsamples = static_cast<uint32_t>(subsamples.size());
   input.timestamp = timestamp;
 
+  if (options.verbose) {
+    static const char* digits = "0123456789abcdef";
+    std::string key_hex;
+    for (uint8_t byte : key_id) {
+      key_hex.push_back(digits[byte >> 4]);
+      key_hex.push_back(digits[byte & 15]);
+    }
+    std::string iv_hex;
+    for (uint8_t byte : iv) {
+      iv_hex.push_back(digits[byte >> 4]);
+      iv_hex.push_back(digits[byte & 15]);
+    }
+    std::string subsample_text;
+    for (const cdm::SubsampleEntry& entry : subsamples) {
+      subsample_text += std::to_string(entry.clear_bytes) + ":" +
+                        std::to_string(entry.cipher_bytes) + " ";
+    }
+    log_line("decrypt request key_id=" + key_hex + " iv=" + iv_hex +
+             " scheme=" + std::to_string(scheme) + " bytes=" + std::to_string(request.size) +
+             " subsamples=" + std::to_string(subsamples.size()) + " [" + subsample_text + "]");
+  }
   HostDecryptedBlock block;
   const cdm::Status status = host.cdm()->Decrypt(input, &block);
+  if (options.verbose) {
+    log_line("decrypt status=" + std::to_string(static_cast<uint32_t>(status)));
+  }
   if (status == cdm::kSuccess && block.DecryptedBuffer() != nullptr) {
     const int out_slot = slots.take();
     const uint32_t out_size = block.DecryptedBuffer()->Size();
