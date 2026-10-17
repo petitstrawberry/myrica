@@ -12,8 +12,9 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     scarlet-rust-toolchain.url = "github:petitstrawberry/scarlet-rust-nix";
     scarlet-sdk = {
-      url = "github:petitstrawberry/scarlet-sdk";
-      flake = false;
+      url = "github:petitstrawberry/scarlet-sdk/a071222231e8bbd96c1d54f38d99d1b27ec90805";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.scarlet-rust-toolchain.follows = "scarlet-rust-toolchain";
     };
   };
 
@@ -101,8 +102,33 @@
               pkgs.git
               pkgs.pkg-config
               pkgs.curl
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.meson
+              pkgs.python3
+              pkgs.perl
+              pkgs.ruby
+              pkgs.bison
+              pkgs.flex
+              pkgs.gperf
+              pkgs.unifdef
+              pkgs.gnumake
+              pkgs.autoconf
+              pkgs.automake
+              pkgs.libtool
+              pkgs.llvmPackages_21.clang-unwrapped
+              pkgs.llvmPackages_21.llvm
+              pkgs.llvmPackages_21.lld
             ]
             ++ imageTools;
+
+            SCARLET_NATIVE_RUNTIME = "${scarlet-sdk.packages.${system}.scarlet-native-runtime}";
+            TARGET_CC = "${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang";
+            SCARLET_NATIVE_CC = "${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang";
+            SCARLET_NATIVE_CXX = "${pkgs.llvmPackages_21.clang-unwrapped}/bin/clang++";
+            SCARLET_NATIVE_AR = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ar";
+            SCARLET_NATIVE_RANLIB = "${pkgs.llvmPackages_21.llvm}/bin/llvm-ranlib";
+            LIBCLANG_PATH = "${pkgs.llvmPackages_21.libclang.lib}/lib";
 
             shellHook = ''
               export CARGO_NET_GIT_FETCH_WITH_CLI=true
