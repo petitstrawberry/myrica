@@ -68,7 +68,7 @@ Myrica owns the WebKit integration; Scarlet's flake provides common compilers
 and the SDK runtime, not application source pins or engine packages.
 
 The release includes `myrica-sources.tar.gz` with the matching Myrica source,
-vendored Rust crates and native dependency sources (including the modified
+cached Rust crates and native dependency sources (including the modified
 WebKit). License texts, copyright notices and source locations are installed
 under `/share/licenses/myrica` alongside the executables. Third-party code
 retains its own licenses; Myrica's independent code remains MIT licensed.
@@ -79,7 +79,7 @@ To rebuild from that archive:
 tar -xf myrica-sources.tar.gz
 cd myrica
 nix develop
-cargo build --locked --offline --release --target aarch64-unknown-scarlet \
+CARGO_HOME="$(cd ../cargo-home && pwd)" cargo build --locked --offline --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit-vulkan,webkit-vulkan-probe \
   --bin myrica --bin webkit-vulkan-probe
 ```

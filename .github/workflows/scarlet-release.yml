@@ -75,14 +75,16 @@ jobs:
             --bin myrica --bin webkit-vulkan-probe
           printf '%s\n' "$SCARLET_NATIVE_RUNTIME" > "$RUNNER_TEMP/myrica-native-runtime"
           printf '%s\n' "$SCARLET_RUST_TOOLCHAIN" > "$RUNNER_TEMP/myrica-toolchain"
+          printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}" > "$RUNNER_TEMP/myrica-cargo-home"
           BUILD
       - name: Package corresponding sources and notices
         if: steps.inputs.outputs.exists != 'true'
         run: |
           mkdir -p dist/sources/myrica dist/sources/native dist/staging/share/licenses/myrica/third-party
           git archive HEAD | tar -xf - -C dist/sources/myrica
-          nix develop --command cargo vendor --locked --versioned-dirs dist/sources/myrica/vendor > dist/vendor-config.toml
-          sed 's|directory = ".*"|directory = "vendor"|' dist/vendor-config.toml >> dist/sources/myrica/.cargo/config.toml
+          task_cargo_home=$(cat "$RUNNER_TEMP/myrica-cargo-home")
+          mkdir -p dist/sources/cargo-home
+          cp -a "$task_cargo_home/registry" "$task_cargo_home/git" dist/sources/cargo-home/
           task_native=$(find target/aarch64-unknown-scarlet/release/build -path '*/out/sources/webkit.path' -print -quit)
           test -n "$task_native"
           task_native=$(dirname "$task_native")
@@ -117,7 +119,7 @@ jobs:
           This software is based in part on the work of the FreeType Team.
           This software is based in part on the work of the Independent JPEG Group.
 
-          Corresponding source, native dependencies, vendored Rust dependencies,
+          Corresponding source, native dependencies, cached Rust dependencies,
           and rebuild instructions for this binary are available in this release:
           https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/myrica-sources.tar.gz
 
