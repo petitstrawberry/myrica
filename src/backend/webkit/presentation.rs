@@ -185,7 +185,7 @@ impl BrowserFrameSource for FrameSource {
         frame.damage = Some(damage);
         if !self.logged {
             eprintln!(
-                "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none compositor=threaded"
+                "[myrica:webkit] page renderer=skia-vulkan presentation=shared-bgra8 cpu-framebuffer=none compositor=threaded scrolling=async"
             );
             self.logged = true;
         }
