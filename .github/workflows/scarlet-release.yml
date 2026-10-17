@@ -18,6 +18,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SCARLET_REVISION: 53fa8c76a38b8a38f2feb1eed0fc39adf1155414
+
 concurrency:
   group: scarlet-prebuilt-${{ github.sha }}
   cancel-in-progress: false
@@ -36,7 +39,6 @@ jobs:
       - name: Select pinned build environment
         id: inputs
         run: |
-          echo "scarlet=$(python3 -c 'import json; print(json.load(open("platforms/scarlet/release.json"))["scarlet_revision"])')" >> "$GITHUB_OUTPUT"
           echo "tag=scarlet-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           if gh release view "scarlet-$GITHUB_SHA" --json isDraft --jq '.isDraft' | grep -qx false; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
@@ -56,7 +58,7 @@ jobs:
         if: steps.inputs.outputs.exists != 'true'
         with:
           repository: petitstrawberry/Scarlet
-          ref: ${{ steps.inputs.outputs.scarlet }}
+          ref: ${{ env.SCARLET_REVISION }}
           path: .release/scarlet
       - uses: cachix/install-nix-action@v31
         if: steps.inputs.outputs.exists != 'true'
@@ -74,7 +76,71 @@ jobs:
       - name: Build browser and probe with the normal Scarlet recipes
         if: steps.inputs.outputs.exists != 'true'
         working-directory: .release/scarlet
-        run: nix develop --command python3 ../../platforms/scarlet/build-release.py --scarlet-source .
+        run: |
+          nix develop --command bash -euo pipefail <<'BUILD'
+          task_root=$(realpath ../..)
+          task_project="$RUNNER_TEMP/myrica-build"
+          task_output="$task_root/dist/scarlet"
+          mkdir -p "$task_project/bsp/.cargo" "$task_output"
+          printf '[build]\ntarget = "aarch64-unknown-none-elf"\n' > "$task_project/bsp/.cargo/config.toml"
+          cat > "$task_project/scarlet.toml" <<PROJECT
+          schema_version = 2
+          [project]
+          name = "myrica-release"
+          [bsp]
+          path = "bsp"
+          package = "scarlet"
+          [bsp.kernel]
+          source = { path = "$PWD/kernel" }
+          [userspace]
+          cargo-config = ".scarlet/sgfx/userspace.toml"
+          [images.runtime]
+          format = "newc"
+          output = ".scarlet/images/runtime.cpio"
+          [[images.runtime.layers]]
+          kind = "bundle"
+          path = "$PWD/bundles/sgfx-native/bundle.toml"
+          [[images.runtime.layers]]
+          kind = "cargo"
+          source = "$task_root"
+          package = "myrica"
+          bin = "myrica"
+          features = ["backend-webkit-vulkan"]
+          default-features = false
+          to = "/bin/myrica"
+          [[images.runtime.layers]]
+          kind = "cargo"
+          source = "$task_root"
+          package = "myrica"
+          bin = "webkit-vulkan-probe"
+          features = ["webkit-vulkan-probe", "backend-webkit-vulkan"]
+          default-features = false
+          to = "/bin/myrica-vulkan-probe"
+          PROJECT
+          # The image has only userspace layers; none consumes the kernel ELF.
+          cargo scarlet image --project "$task_project" --image runtime --release --no-build --kernel-elf /dev/null
+          git -C "$task_root" diff --exit-code -- Cargo.lock
+          task_staging="$task_project/.scarlet/staging/runtime"
+          python3 tools/elf_audit.py --scarlet --machine aarch64 --require-interpreter /bin/scarlet-ld \
+            "$task_staging/bin/myrica" "$task_staging/bin/myrica-vulkan-probe" > "$task_output/elf-audit.json"
+          task_asset=myrica-aarch64-unknown-scarlet.tar.gz
+          tar --owner=0 --group=0 --mtime=@0 -czf "$task_output/$task_asset" \
+            -C "$task_staging" bin/myrica bin/myrica-vulkan-probe \
+            -C "$task_root" --transform='s,^LICENSE$,share/licenses/myrica/LICENSE,' LICENSE
+          cp "$task_project/scarlet.lock" "$task_output/scarlet.lock"
+          cd "$task_output"
+          sha256sum "$task_asset" > SHA256SUMS
+          task_digest=$(cut -d ' ' -f 1 SHA256SUMS)
+          cat > bundle.toml <<BUNDLE
+          [[layers]]
+          kind = "archive"
+          url = "https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/$task_asset"
+          sha256 = "$task_digest"
+          format = "tar-gz"
+          to = "/"
+          BUNDLE
+          printf '{"source_revision":"%s","scarlet_revision":"%s"}\n' "$GITHUB_SHA" "$SCARLET_REVISION" > release.json
+          BUILD
       - uses: actions/upload-artifact@v4
         if: steps.inputs.outputs.exists != 'true'
         with:
