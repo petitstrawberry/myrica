@@ -11,6 +11,12 @@ fn main() {
     // The native WebKit link inputs include non-PIC C/C++ archives. Rust's
     // Scarlet target otherwise requests PIE, which cannot link those archives.
     println!("cargo:rustc-link-arg=--no-pie");
+    // The resident Scarlet interpreter supplies dlopen/dlsym/dlerror. A
+    // standalone Myrica build needs the same imports as a bundled build.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("scarlet") {
+        println!("cargo:rustc-link-arg=--dynamic-linker=/bin/scarlet-ld");
+        println!("cargo:rustc-link-arg=--unresolved-symbols=ignore-all");
+    }
     println!(
         "cargo:rerun-if-changed={}",
         std::path::Path::new(&manifest).display()
