@@ -123,7 +123,10 @@ W0 実施記録 (2026-10-16):
 - Scarlet 実機での W1 実測 (2026-10-18 完了): ネイティブの tools/widevine-host-client が SharedMemory (4096 + 4 x 1 MiB) と socketpair を作り、spawn_with_abi の handle map で stdio を 0/1/2、socket を 3、共有メモリを 4 に渡して widevine-host を起動した。ホストは Linux ビューで CDM 4.10.2662.3 をロードして初期化し、セッションを作成、license-request 1677 bytes をスロット 0 に書いた。クライアントはマップ済み領域から先頭バイト (8,1,18,239) を読み、WVHC_OK で終了。ホストは status=0 で終了した。
 - 実測で判明した Linux ABI の注意: SharedMemory の fd に対する fstat は失敗するため、ホストは呼び出し側が渡すレイアウトを正とする。spawn では標準入出力も明示的に map しないと子の出力が届かない (handle map に 0/1/2 を入れる)。
 - ライセンス往復の実測 (2026-10-18 完了): Shaka の Sintel Widevine アセット (storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd) から取り出した 167 バイトの PSSH で、CDM は 1797 バイトのライセンス要求を生成した。コンテナのクライアントは TLS を持たないため、ホスト側の license-relay.py が HTTPS 終端として cwip-shaka-proxy.appspot.com/no_auth に転送し、1229 バイトの応答を返した。UPDATE_SESSION は status=0、CDM は 5 つの鍵を usable (status=0) として報告した。実際のブラウザ統合ではページの fetch() がライセンス POST を行うため、ブラウザ側にライセンス用のネットワーク実装は不要になる。
-- W1 の残り: 鍵ありの DECRYPT 経路 (実際の暗号化サンプルと senc/tenc の解析が必要)、永続セッション。
+- 実データでの復号 (2026-10-18 完了): Axinom の v7-MultiDRM-SingleKey テストベクタ (dash.js のサンプルが公開している X-AxDRM-Message トークンを使用) で、テンポラリセッションに鍵が 1 つ usable として入り、音声サンプル (341 バイト、サブサンプルなし) が kSuccess で復号された。映像サンプルでは、単一の暗号化領域を指定したときに先頭 NAL 長 (755 バイト) がバイト一致で復元された。誤った鍵 ID では kNoKey が返るため、成功は鍵に基づいている。
+- 重要な制約: この CDM ビルドは、サブサンプルマップが 2 件以上ある Decrypt 要求に kNoKey を返す。複数 NAL の映像サンプルは Decrypt では復号できないため、映像は DecryptAndDecode (VideoDecoder / VideoFrame コールバック) 経由にする必要がある。Chromium が音声に Decrypt、映像に DecryptAndDecode を使う分担と一致し、W3 の前提がこれで確定した。
+- CENC 解析の知見 (scarlet-codecs に持ち込む): stsd は 8 バイト、encv は 78 バイト、enca は 28 バイトのヘッダの後に子ボックスが並ぶ。tenc にはパターン用バイトを含む 24 バイトのレイアウト (Shaka Packager など) と含まない旧レイアウトがあり、ボックスサイズで判別できる。senc は IV (tenc の default_Per_Sample_IV_Size、通常 8 バイト) とサブサンプル対 (clear, cipher) を持ち、サンプル位置は trun の data_offset から求まる。参照実装は tools/widevine-host/test/extract-sample.py。
+- W1 の残り: 永続セッション、映像の DecryptAndDecode 経路。
 
 W0 (規模: 小) Linux ビューでの実証。Debian glibc ビューで libwidevinecdm.so を dlopen し、CDM の初期化とライセンス往復 (テスト用ライセンスサーバ) の可否を確認する。Linux ABI のギャップ (epoll スタブ、fcntl の F_DUPFD 欠落、シグナル簡易実装、auxv/TLS 整合) をここで洗い出す。最大の未知はここ。
 W1 (規模: 中) ヘルパープロセスと CDM ホストの実装。license request / response と鍵取得まで通す。

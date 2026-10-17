@@ -5,13 +5,18 @@
 # request to this relay over plain HTTP; the relay forwards the bytes to the
 # Widevine test proxy over HTTPS and returns the response verbatim.
 #
-# usage: license-relay.py [PORT] [LICENSE_URL]
+# usage: license-relay.py [PORT] [LICENSE_URL] [HEADER]
+#
+# HEADER is an optional "Name: value" pair forwarded with every request, which
+# is what Axinom's test licensing expects (X-AxDRM-Message carries the
+# published test entitlement token).
 
 import http.server
 import sys
 import urllib.request
 
 LICENSE_URL = "https://cwip-shaka-proxy.appspot.com/no_auth"
+EXTRA_HEADERS = {}
 
 
 class Relay(http.server.BaseHTTPRequestHandler):
@@ -20,6 +25,8 @@ class Relay(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         request = urllib.request.Request(LICENSE_URL, data=body, method="POST")
         request.add_header("Content-Type", "application/octet-stream")
+        for name, value in EXTRA_HEADERS.items():
+            request.add_header(name, value)
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 data = response.read()
@@ -44,6 +51,10 @@ def main():
     global LICENSE_URL
     if len(sys.argv) > 2:
         LICENSE_URL = sys.argv[2]
+    if len(sys.argv) > 3:
+        name, _, value = sys.argv[3].partition(":")
+        EXTRA_HEADERS[name.strip()] = value.strip()
+        print(f"[relay] forwarding header {name.strip()}", flush=True)
     print(f"[relay] listening on {port}, upstream {LICENSE_URL}", flush=True)
     http.server.ThreadingHTTPServer(("0.0.0.0", port), Relay).serve_forever()
 

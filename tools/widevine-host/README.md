@@ -96,6 +96,33 @@ In the browser integration the page's own fetch() performs the licence POST,
 so the browser needs no licence networking of its own; the relay exists only
 so the container client can stay TLS-free.
 
+## Verify decryption with real content
+
+extract-sample.py pulls one encrypted sample, its IV and its subsample map out
+of a fragmented CENC segment pair:
+
+    python3 test/extract-sample.py --init init.mp4 --media 0001.m4s --out-dir out
+
+The test client decrypts that sample once the licence has been applied:
+
+    /wvh/test-client ... --license-relay http://host.docker.internal:8790/       --decrypt-sample /wvh/ax/sample.bin --decrypt-iv <iv>       --decrypt-key-id <kid> --decrypt-subsamples 5:754,5:6263
+
+Verified 2026-10-18 with the Axinom v7-MultiDRM-SingleKey test vector
+(https://media.axprod.net/TestVectors/v7-MultiDRM-SingleKey/Manifest.mpd and
+https://drm-widevine-licensing.axtest.net/AcquireLicense with the published
+X-AxDRM-Message test entitlement):
+
+- the licence response carried one usable key (status=0),
+- the audio sample (341 bytes, no subsample map) decrypted with kSuccess,
+- the video sample came back with a byte-exact first NAL length (755) when the
+  request carried a single cipher region,
+- a wrong key id returns kNoKey, so the success path is key driven.
+
+Known limit: this CDM build returns kNoKey when Decrypt carries a subsample map
+with more than one entry, so a multi-NAL video sample cannot be decrypted
+through Decrypt. Video has to go through DecryptAndDecode, which is the same
+split Chromium uses (Decrypt serves audio, the decoder callbacks serve video).
+
 ## Status
 
 - Working: CDM load and initialize, session creation, licence request delivery

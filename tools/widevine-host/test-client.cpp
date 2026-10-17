@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <netdb.h>
+#include <fstream>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -390,12 +391,50 @@ bool http_post(const std::string& url, const std::vector<uint8_t>& body,
   return true;
 }
 
+bool read_file_bytes(const std::string& path, std::vector<uint8_t>* out) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    return false;
+  }
+  out->assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  return true;
+}
+
+bool parse_subsamples(const std::string& text, std::vector<std::pair<uint32_t, uint32_t>>* out) {
+  out->clear();
+  if (text.empty()) {
+    return true;
+  }
+  size_t position = 0;
+  while (position < text.size()) {
+    const size_t comma = text.find(',', position);
+    const std::string entry = text.substr(position, comma == std::string::npos ? std::string::npos
+                                                                             : comma - position);
+    const size_t colon = entry.find(':');
+    if (colon == std::string::npos) {
+      return false;
+    }
+    const uint32_t clear = static_cast<uint32_t>(std::stoul(entry.substr(0, colon)));
+    const uint32_t cipher = static_cast<uint32_t>(std::stoul(entry.substr(colon + 1)));
+    out->push_back({clear, cipher});
+    if (comma == std::string::npos) {
+      break;
+    }
+    position = comma + 1;
+  }
+  return !out->empty();
+}
+
 int main(int argc, char** argv) {
   std::string socket_path;
   std::string shm_path;
   std::string kid_hex = "00112233445566778899aabbccddeeff";
   std::string pssh_hex;
   std::string license_relay;
+  std::string decrypt_sample;
+  std::string decrypt_iv;
+  std::string decrypt_key_id;
+  std::string decrypt_subsamples;
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
     if (index + 1 >= argc) {
@@ -411,6 +450,14 @@ int main(int argc, char** argv) {
       pssh_hex = argv[++index];
     } else if (argument == "--license-relay") {
       license_relay = argv[++index];
+    } else if (argument == "--decrypt-sample") {
+      decrypt_sample = argv[++index];
+    } else if (argument == "--decrypt-iv") {
+      decrypt_iv = argv[++index];
+    } else if (argument == "--decrypt-key-id") {
+      decrypt_key_id = argv[++index];
+    } else if (argument == "--decrypt-subsamples") {
+      decrypt_subsamples = argv[++index];
     }
   }
   if (socket_path.empty() || shm_path.empty()) {
@@ -577,6 +624,85 @@ int main(int argc, char** argv) {
       } else {
         std::cerr << "key status event missing" << std::endl;
       }
+    }
+  }
+
+  if (!decrypt_sample.empty()) {
+    std::vector<uint8_t> sample;
+    std::vector<uint8_t> iv;
+    std::vector<uint8_t> key_id;
+    std::vector<std::pair<uint32_t, uint32_t>> subsamples;
+    if (!read_file_bytes(decrypt_sample, &sample) || sample.empty()) {
+      std::cerr << "cannot read " << decrypt_sample << std::endl;
+      return 1;
+    }
+    if (!decode_hex(decrypt_iv, &iv) || !decode_hex(decrypt_key_id, &key_id)) {
+      std::cerr << "invalid IV or key id" << std::endl;
+      return 1;
+    }
+    if (!parse_subsamples(decrypt_subsamples, &subsamples)) {
+      std::cerr << "invalid subsample list" << std::endl;
+      return 1;
+    }
+    if (sample.size() > slot_size) {
+      std::cerr << "sample larger than a slot" << std::endl;
+      return 1;
+    }
+
+    // Reuse the slot the licence request occupied: the client has copied the
+    // message out of shared memory and released it above. A future revision
+    // allocates slots through the protocol instead.
+    uint8_t* input_slot = static_cast<uint8_t*>(region) + WVH_SHM_HEADER_BYTES;
+    memcpy(input_slot, sample.data(), sample.size());
+
+    std::vector<uint8_t> decrypt;
+    append_u32(&decrypt, 3);
+    append_u32(&decrypt, 0);
+    append_u32(&decrypt, 0);
+    append_u32(&decrypt, static_cast<uint32_t>(sample.size()));
+    append_u32(&decrypt, static_cast<uint32_t>(key_id.size()));
+    append_bytes(&decrypt, key_id.data(), key_id.size());
+    append_u32(&decrypt, static_cast<uint32_t>(iv.size()));
+    append_bytes(&decrypt, iv.data(), iv.size());
+    append_u32(&decrypt, static_cast<uint32_t>(subsamples.size()));
+    for (const auto& entry : subsamples) {
+      append_u32(&decrypt, entry.first);
+      append_u32(&decrypt, entry.second);
+    }
+    append_u32(&decrypt, WVH_SCHEME_CENC);
+    for (int index = 0; index < 8; ++index) {
+      decrypt.push_back(0);
+    }
+    if (!send_frame(fd, WVH_CMD_DECRYPT, decrypt)) {
+      std::cerr << "DECRYPT send failed" << std::endl;
+      return 1;
+    }
+    uint32_t out_slot = 0;
+    uint32_t out_size = 0;
+    if (!wait_result(fd, 3, &status, &out_slot, &out_size, &collected)) {
+      std::cerr << "DECRYPT reply missing" << std::endl;
+      return 1;
+    }
+    std::cout << "DECRYPT status=" << status << " slot=" << out_slot << " size=" << out_size
+              << std::endl;
+    if (status == WVH_OK && out_size > 0) {
+      const uint8_t* plain =
+          static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
+          static_cast<size_t>(out_slot) * slot_size;
+      const uint32_t first_length = (static_cast<uint32_t>(plain[0]) << 24) |
+                                    (static_cast<uint32_t>(plain[1]) << 16) |
+                                    (static_cast<uint32_t>(plain[2]) << 8) |
+                                    static_cast<uint32_t>(plain[3]);
+      std::cout << "PLAINTEXT first_bytes=" << std::hex << static_cast<int>(plain[0]) << " "
+                << static_cast<int>(plain[1]) << " " << static_cast<int>(plain[2]) << " "
+                << static_cast<int>(plain[3]) << std::dec
+                << " first_nal_length=" << first_length
+                << " plausible=" << ((first_length > 0 && first_length + 4 <= out_size) ? "true"
+                                                                                        : "false")
+                << std::endl;
+      std::vector<uint8_t> release_out;
+      append_u32(&release_out, out_slot);
+      send_frame(fd, WVH_CMD_RELEASE, release_out);
     }
   }
 
