@@ -69,9 +69,51 @@ jobs:
       - name: Build Myrica and probe
         if: steps.inputs.outputs.exists != 'true'
         run: |
-          nix develop --command cargo build --locked --release --target aarch64-unknown-scarlet \
+          nix develop --command bash -euo pipefail <<'BUILD'
+          cargo build --locked --release --target aarch64-unknown-scarlet \
             --no-default-features --features backend-webkit-vulkan,webkit-vulkan-probe \
             --bin myrica --bin webkit-vulkan-probe
+          printf '%s\n' "$SCARLET_NATIVE_RUNTIME" > "$RUNNER_TEMP/myrica-native-runtime"
+          BUILD
+      - name: Package corresponding sources and notices
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
+          mkdir -p dist/sources/myrica dist/sources/native dist/staging/share/licenses/myrica/third-party
+          git archive HEAD | tar -xf - -C dist/sources/myrica
+          nix develop --command cargo vendor --locked --versioned-dirs dist/sources/myrica/vendor > dist/vendor-config.toml
+          sed 's|directory = ".*"|directory = "vendor"|' dist/vendor-config.toml >> dist/sources/myrica/.cargo/config.toml
+          task_native=$(find target/aarch64-unknown-scarlet/release/build -path '*/out/sources/webkit.path' -print -quit)
+          test -n "$task_native"
+          task_native=$(dirname "$task_native")
+          task_webkit_revision=$(git -C "$task_native/_deps/webkit-src" rev-parse HEAD)
+          (cd "$task_native/_deps"; tar --exclude=.git -cf - *-src) | tar -xf - -C dist/sources/native
+          task_sdk=$(nix eval --impure --raw --expr '(builtins.getFlake (toString ./.)).inputs.scarlet-sdk.outPath')
+          cp -R "$task_sdk/scarlet-libc" dist/sources/scarlet-libc
+          cp "$task_sdk/LICENSE" dist/sources/scarlet-libc/LICENSE-SDK
+          cp -R "$(cat "$RUNNER_TEMP/myrica-native-runtime")/share/licenses" dist/staging/share/licenses/myrica/native-runtime
+          (
+            cd dist/sources
+            find . -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*notice*' \
+              -o -iname '*copyright*' -o -iname 'authors*' -o -iname 'ftl.txt' \) -print0 \
+              | tar --null -T - -cf -
+          ) | tar -xf - -C dist/staging/share/licenses/myrica/third-party
+          cat > dist/staging/share/licenses/myrica/SOURCES.txt <<SOURCES
+          Myrica uses WebKit, including components under the GNU Library/Lesser
+          General Public License, and other third-party software. Their notices
+          and license texts are retained in third-party/ and native-runtime/.
+          Myrica's independent code remains MIT licensed.
+
+          Corresponding source, native dependencies, vendored Rust dependencies,
+          and rebuild instructions for this binary are available in this release:
+          https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/myrica-sources.tar.gz
+
+          Myrica: https://github.com/petitstrawberry/myrica/tree/$GITHUB_SHA
+          Modified WebKit: https://github.com/petitstrawberry/WebKit/tree/$task_webkit_revision
+          Rebuild instructions: myrica/README.md in the source archive.
+          Copyright notices in individual source files are retained in that archive.
+          SOURCES
+          cp dist/staging/share/licenses/myrica/SOURCES.txt dist/sources/SOURCES.txt
+          tar --owner=0 --group=0 --mtime=@0 -czf dist/myrica-sources.tar.gz -C dist/sources .
       - name: Package release
         if: steps.inputs.outputs.exists != 'true'
         run: |
@@ -82,8 +124,8 @@ jobs:
           task_asset=myrica-aarch64-unknown-scarlet.tar.gz
           tar --owner=0 --group=0 --mtime=@0 -czf "dist/$task_asset" -C dist/staging .
           cd dist
-          sha256sum "$task_asset" > SHA256SUMS
-          task_digest=$(cut -d ' ' -f 1 SHA256SUMS)
+          sha256sum "$task_asset" myrica-sources.tar.gz > SHA256SUMS
+          task_digest=$(sha256sum "$task_asset" | cut -d ' ' -f 1)
           cat > bundle.toml <<BUNDLE
           [[layers]]
           kind = "archive"

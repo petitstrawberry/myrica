@@ -67,6 +67,31 @@ Scarlet's AArch64 desktop bundle consumes the browser and probe from the
 Myrica owns the WebKit integration; Scarlet's flake provides common compilers
 and the SDK runtime, not application source pins or engine packages.
 
+The release includes `myrica-sources.tar.gz` with the matching Myrica source,
+vendored Rust crates and native dependency sources (including the modified
+WebKit). License texts, copyright notices and source locations are installed
+under `/share/licenses/myrica` alongside the executables. Third-party code
+retains its own licenses; Myrica's independent code remains MIT licensed.
+
+To rebuild from that archive:
+
+```sh
+tar -xf myrica-sources.tar.gz
+cd myrica
+nix develop
+cargo build --locked --offline --release --target aarch64-unknown-scarlet \
+  --no-default-features --features backend-webkit-vulkan,webkit-vulkan-probe \
+  --bin myrica --bin webkit-vulkan-probe
+```
+
+Nix and CMake may fetch the pinned build environment and native sources. To
+rebuild with a modified WebKit, first run the ordinary build above, then edit
+the checkout named by
+`target/aarch64-unknown-scarlet/release/build/myrica-webkit-sys-*/out/sources/webkit.path`.
+The matching source is also supplied in `native/webkit-src` in the archive.
+Touch `crates/myrica-webkit-sys/build.rs` and repeat the Cargo command to run
+the native incremental build and relink both executables with your changes.
+
 `myrica-webkit-sys` prepares the native installation from its Cargo build script
 when `backend-webkit` is enabled. CMake FetchContent retrieves the pinned WebKit
 fork and upstream font sources inside `OUT_DIR`. The WebKit fork's dependency
