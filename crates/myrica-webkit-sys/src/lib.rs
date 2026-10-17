@@ -36,7 +36,7 @@ pub struct ScarletWebView {
     _opaque: [u8; 0],
 }
 
-/// Independently owned, thread-safe completed-frame mailbox; contains no Page.
+/// Independently owned, thread-safe frame mailbox and wheel routing endpoint.
 #[repr(C)]
 pub struct CompositorOutput {
     _opaque: [u8; 0],

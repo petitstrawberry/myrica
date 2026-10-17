@@ -303,10 +303,11 @@ impl BrowserWorker {
         let generation = mailbox.generation;
         // Navigation and geometry are checked again by the native endpoint;
         // input cannot slip into an old document while its owner is busy.
-        if !mailbox
-            .commands
-            .iter()
-            .any(|(_, command)| !matches!(command, Command::Input(_)))
+        if (!matches!(input, BrowserInput::Wheel { .. })
+            || !mailbox
+                .commands
+                .iter()
+                .any(|(_, command)| !matches!(command, Command::Input(_))))
             && self
                 .shared
                 .input_sink

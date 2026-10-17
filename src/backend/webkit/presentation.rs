@@ -1,5 +1,5 @@
-//! UI-side endpoint for completed native compositor images. No Page pointer is
-//! retained, and none of these operations execute JS, paint, or wait for a fence.
+//! UI-side endpoints for completed compositor images and asynchronous wheel
+//! routing. These operations never execute JS, paint, or wait for a GPU fence.
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
