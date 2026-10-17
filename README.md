@@ -127,6 +127,8 @@ the window transition synchronized.
 Ganesh contexts share a device-wide resource-cache allowance derived from the
 advertised Vulkan heap. Each context applies its share on its own thread; live
 tiles, borrowed output images and uploads retain space outside that allowance.
+Coordinated layers share native-image backing stores by image identity, matching
+WebKit's LayerTreeHost, and release unused entries after owner-side layer updates.
 
 The Scarlet WebKit profile uses WebKit storage namespaces for localStorage and
 sessionStorage, a shared native CookieJarDB for HTTP and document.cookie, and
