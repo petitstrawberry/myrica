@@ -1,0 +1,114 @@
+name: Scarlet prebuilt
+
+on:
+  push:
+    branches: [main, master, feature/webkit-backend]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - src/**
+      - crates/**
+      - platforms/scarlet/**
+      - .cargo/**
+      - LICENSE
+      - .github/workflows/scarlet-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scarlet-prebuilt-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      tag: ${{ steps.inputs.outputs.tag }}
+      exists: ${{ steps.inputs.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release packaging contract
+        run: python3 -B -m unittest discover -s tests -p test_scarlet_release.py
+      - name: Select pinned build environment
+        id: inputs
+        run: |
+          echo "scarlet=$(python3 -c 'import json; print(json.load(open("platforms/scarlet/release.json"))["scarlet_revision"])')" >> "$GITHUB_OUTPUT"
+          echo "tag=scarlet-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if gh release view "scarlet-$GITHUB_SHA" --json isDraft --jq '.isDraft' | grep -qx false; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk space for WebKit
+        if: steps.inputs.outputs.exists != 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - uses: actions/checkout@v4
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          repository: petitstrawberry/Scarlet
+          ref: ${{ steps.inputs.outputs.scarlet }}
+          path: .release/scarlet
+      - uses: cachix/install-nix-action@v31
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - uses: cachix/cachix-action@v17
+        if: steps.inputs.outputs.exists != 'true' && vars.CACHIX_CACHE_NAME != ''
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - name: Build browser and probe with the normal Scarlet recipes
+        if: steps.inputs.outputs.exists != 'true'
+        working-directory: .release/scarlet
+        run: nix develop --command python3 ../../platforms/scarlet/build-release.py --scarlet-source .
+      - uses: actions/upload-artifact@v4
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          name: scarlet-prebuilt
+          path: dist/scarlet/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: needs.build.outputs.exists != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scarlet-prebuilt
+          path: dist
+      - name: Publish complete release without replacing a published asset
+        run: |
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx false; then
+            echo 'Release already published.'
+            exit 0
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" --title "Scarlet $GITHUB_SHA" --notes "AArch64 WebKit/Vulkan browser and diagnostic probe. Build inputs and ELF audit are recorded in release.json and scarlet.lock."
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --latest=false

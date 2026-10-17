@@ -61,9 +61,25 @@ The experimental backend uses the Scarlet branch of the
 [WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
 `ScarletWebView` C ABI with JavaScriptCore.
 
-Scarlet's desktop bundle selects the Myrica Cargo package. Myrica owns the
-WebKit integration; Scarlet's flake provides common compilers and the SDK
-runtime, not application source pins or engine packages.
+Scarlet's desktop bundle can consume the AArch64 browser and probe from the
+`Scarlet prebuilt` Actions workflow. Releases are tagged
+`scarlet-<full-myrica-commit>` and include an archive, a checksum-pinned
+`bundle.toml`, build provenance and ELF audits. The build environment is pinned
+in `platforms/scarlet/release.json`; it uses Scarlet's ordinary SDK/SGFX recipes.
+RISC-V continues to build the Blitz backend from source.
+
+For local AArch64 development, append this source bundle in the image's
+`scarlet.local.toml` (adjust the path for your checkout layout):
+
+```toml
+[[images.rootfs.layers]]
+kind = "bundle"
+path = "../../../myrica/platforms/scarlet/bundle-source.toml"
+```
+
+It builds and overwrites both installed executables from the local checkout.
+Myrica owns the WebKit integration; Scarlet's flake provides common compilers
+and the SDK runtime, not application source pins or engine packages.
 
 `myrica-webkit-sys` prepares the native installation from its Cargo build script
 when `backend-webkit` is enabled. CMake FetchContent retrieves the pinned WebKit

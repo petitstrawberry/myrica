@@ -1,0 +1,24 @@
+# Append this bundle from scarlet.local.toml for local browser development.
+# replace suppresses an earlier Cargo recipe during the bootstrap period.
+# After prebuilt adoption these layers overwrite the archive's executables.
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "myrica"
+bin = "myrica"
+features = ["backend-webkit-vulkan"]
+default-features = false
+architectures = ["aarch64"]
+replace = true
+to = "/bin/myrica"
+
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "myrica"
+bin = "webkit-vulkan-probe"
+features = ["webkit-vulkan-probe", "backend-webkit-vulkan"]
+default-features = false
+architectures = ["aarch64"]
+replace = true
+to = "/bin/myrica-vulkan-probe"
