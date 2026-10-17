@@ -102,7 +102,8 @@ W0 実施記録 (2026-10-16):
 - ブロッカーと対処: 未修正の CDM は glibc 2.36 以降で DT_RELR without GLIBC_ABI_DT_RELR dependency により dlopen に失敗し、さらに libgcc が公開しない __aarch64_ldadd4_acq_rel / __aarch64_swp4_acq_rel を参照する。Asahi Linux の widevine_fixup.py (MIT) が両方を注入する。4 KiB ページでは RELRO / W^X を壊さない (Scarlet の aarch64 MMU もコンテナも 4 KiB)。fixup 後の修正版も再配布は不可。
 - プローブ実装: myrica の tools/widevine-probe に Chromium CDM ABI の Host_10 実装を追加した (dlopen → InitializeCdmModule_4 → CreateCdmInstance → Initialize → CreateSessionAndGenerateRequest → メッセージ取得、鍵ステータス表示、更新応答の投入、ダンプ、タイムアウト、終了コード)。
 - ドライラン結果: 修正済み CDM に対し Debian Trixie (glibc 2.41) aarch64 の Docker で、dlopen → initialize ok → license-request 1676 bytes の生成まで成功 (PROBE_RESULT ok)。ライセンス要求には platform_name ChromeOS、model_name ChromeCDM、widevine_cdm_version 4.10.2662.3 などが含まれる。
-- 次の実測: Scarlet の linux-aarch64 ビューで abi-run により同じプローブを実行し、Linux ABI のギャップ (epoll スタブ等) を洗い出す。その後に W1 (ヘルパープロセス化とライセンス往復) へ。
+- Scarlet 実機での実測 (2026-10-17 完了): full プロジェクト (projects/aarch64-limine-full, SCARLET_QEMU_DISPLAY=none) の linux-aarch64 ビューで、ホストの HTTP サーバ (10.0.2.2:8777) からプローブと修正済み CDM を /shared に取得して abi-run で実行した。dlopen → InitializeCdmModule_4 → CreateCdmInstance (GetCdmHostFunc version=10) → Initialize success=true → セッション作成 → license-request 1677 bytes の生成まで成功し、終了コード 0。uname は Linux 6.1.0-scarlet_linux_abi_module、AT_HWCAP=0x2007fb (AES/PMULL/SHA 系を含む)、AT_HWCAP2=0x0。CDM は Scarlet の Linux ABI 上で初期化とライセンス要求生成まで動作した。
+- 実測手順の注意: Debian フルのイメージには .shrc が無く LD_LIBRARY_PATH は未設定 (echo など単純なバイナリは動作)。libnspr4 はゲストの apt で導入した (ゲストの外向きネットワークは slirp 経由で動作)。シリアルコンソールのシェルは長いコマンド行が途中で切れるため、ホストから短い名前で配るスクリプトを curl -so /shared/w http://10.0.2.2:8777/w → sh /shared/w の形で実行するのが確実。ゲストからホストへは 10.0.2.2 で到達可能。
 
 ### W1 設計: Widevine ホストプロセス + IPC / 共有メモリ
 
