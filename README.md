@@ -258,3 +258,8 @@ within 30 seconds produces an explicit failed process exit.
 ## License
 
 Myrica is licensed under the [MIT License](LICENSE).
+
+Scarlet Vulkan builds use WebKit’s standard threaded scrolling tree. Wheel input
+can reach that tree from the UI while the document owner is busy. WebKit retains
+blocking wheel-listener dispatch, with navigation and viewport checks before
+accepting independent input.

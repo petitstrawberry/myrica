@@ -2,7 +2,7 @@
 //! retained, and none of these operations execute JS, paint, or wait for a fence.
 
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use myrica_webkit_sys as ffi;
 
@@ -24,6 +24,64 @@ impl Drop for Output {
     }
 }
 
+pub(super) struct InputSink {
+    output: Arc<Output>,
+    modifiers: Mutex<u32>,
+}
+
+impl super::super::BrowserInputSink for InputSink {
+    fn dispatch(
+        &self,
+        input: &super::super::BrowserInput,
+        generation: u64,
+        viewport: BrowserViewport,
+    ) -> bool {
+        use super::super::BrowserInput;
+        let mut modifiers = self.modifiers.lock().unwrap();
+        match input {
+            BrowserInput::Key {
+                modifiers: current, ..
+            } => {
+                *modifiers = super::map_modifiers(*current);
+                false
+            }
+            BrowserInput::FocusLost => {
+                *modifiers = 0;
+                false
+            }
+            BrowserInput::Wheel {
+                delta_x,
+                delta_y,
+                x,
+                y,
+            } => {
+                let event = ffi::WheelEvent {
+                    modifiers: *modifiers,
+                    x: f64::from(*x),
+                    y: f64::from(*y),
+                    delta_x: *delta_x,
+                    delta_y: *delta_y,
+                    global_x: f64::from(*x),
+                    global_y: f64::from(*y),
+                };
+                // SAFETY: The native endpoint accepts foreign-thread events,
+                // retains its scrolling state and rejects obsolete viewports.
+                unsafe {
+                    ffi::scarlet_webview_output_wheel(
+                        self.output.0.as_ptr(),
+                        &event,
+                        generation,
+                        viewport.width,
+                        viewport.height,
+                        f64::from(viewport.scale),
+                    ) == ffi::OK
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
 pub(super) struct FrameSource {
     output: Arc<Output>,
     renderer: FrameRenderer,
@@ -32,6 +90,12 @@ pub(super) struct FrameSource {
 }
 
 impl FrameSource {
+    pub(super) fn input_sink(&self) -> Arc<dyn super::super::BrowserInputSink> {
+        Arc::new(InputSink {
+            output: Arc::clone(&self.output),
+            modifiers: Mutex::new(0),
+        })
+    }
     pub(super) fn new(view: NonNull<ffi::ScarletWebView>) -> Result<Self, BackendError> {
         let mut maximum_dimension = 0;
         // SAFETY: The immutable embedding/GPU limit is read on the Page owner.

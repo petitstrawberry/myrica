@@ -37,6 +37,8 @@ pub struct WebKitBackend {
     gpu_logged: bool,
     #[cfg(feature = "backend-webkit-vulkan")]
     independent_output: bool,
+    #[cfg(feature = "backend-webkit-vulkan")]
+    input_sink: Option<Arc<dyn super::BrowserInputSink>>,
     last_click: Option<(BrowserMouseButton, f32, f32, Instant, u32)>,
     pressed_keys: Vec<BrowserKey>,
     suppress_next_text: bool,
@@ -108,6 +110,8 @@ impl WebKitBackend {
             gpu_logged: false,
             #[cfg(feature = "backend-webkit-vulkan")]
             independent_output: false,
+            #[cfg(feature = "backend-webkit-vulkan")]
+            input_sink: None,
             last_click: None,
             pressed_keys: Vec::new(),
             suppress_next_text: false,
@@ -598,6 +602,17 @@ impl WebKitBackend {
 }
 
 impl BrowserBackend for WebKitBackend {
+    fn take_input_sink(&mut self) -> Option<Arc<dyn super::BrowserInputSink>> {
+        #[cfg(feature = "backend-webkit-vulkan")]
+        {
+            return self.input_sink.take();
+        }
+        #[cfg(not(feature = "backend-webkit-vulkan"))]
+        {
+            None
+        }
+    }
+
     fn shutdown_callback(&self) -> Option<WakeCallback> {
         Some(Arc::new(|| {
             // SAFETY: This API alone is explicitly concurrent-safe. It raises
@@ -668,6 +683,7 @@ impl BrowserBackend for WebKitBackend {
         }
         match presentation::FrameSource::new(self.view) {
             Ok(source) => {
+                self.input_sink = Some(source.input_sink());
                 self.independent_output = true;
                 Some(Box::new(source))
             }

@@ -115,6 +115,8 @@ def main():
         "-DENABLE_FTL_JIT=ON",
         "-DENABLE_SAMPLING_PROFILER=ON",
         "-DENABLE_FULLSCREEN_API=ON",
+        f"-DENABLE_ASYNC_SCROLLING={'ON' if args.vulkan_rendering else 'OFF'}",
+        f"-DENABLE_WHEEL_EVENT_REGIONS={'ON' if args.vulkan_rendering else 'OFF'}",
         "-DENABLE_WEBASSEMBLY=ON",
         "-DENABLE_WEBASSEMBLY_BBQJIT=OFF",
         "-DENABLE_WEBASSEMBLY_OMGJIT=OFF",

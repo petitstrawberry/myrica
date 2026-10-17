@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     BackendError, BackendKind, BrowserBackend, BrowserFrame, BrowserFrameSource, BrowserInput,
-    BrowserSnapshot, LoadState, WakeCallback, create_backend, create_backend_selected,
+    BrowserInputSink, BrowserSnapshot, LoadState, WakeCallback, create_backend,
+    create_backend_selected,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -87,6 +88,7 @@ struct Shared {
     mailbox: Mutex<Mailbox>,
     ready: Condvar,
     frame_source: Mutex<Option<Box<dyn BrowserFrameSource>>>,
+    input_sink: Mutex<Option<Arc<dyn BrowserInputSink>>>,
 }
 
 /// UI-side proxy. No document, JS runtime, or layout code runs in these methods.
@@ -174,6 +176,7 @@ impl BrowserWorker {
             }),
             ready: Condvar::new(),
             frame_source: Mutex::new(None),
+            input_sink: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let failure_snapshot = snapshot.clone();
@@ -192,6 +195,7 @@ impl BrowserWorker {
                 match factory(wake_engine) {
                     Ok(mut backend) => {
                         *worker_shared.frame_source.lock().unwrap() = backend.take_frame_source();
+                        *worker_shared.input_sink.lock().unwrap() = backend.take_input_sink();
                         let weak = Arc::downgrade(&worker_shared);
                         backend.set_frame_releaser(Arc::new(move |token| {
                             if let Some(shared) = weak.upgrade() {
@@ -297,6 +301,22 @@ impl BrowserWorker {
         }
         let mut mailbox = self.shared.mailbox.lock().unwrap();
         let generation = mailbox.generation;
+        // Navigation and geometry are checked again by the native endpoint;
+        // input cannot slip into an old document while its owner is busy.
+        if !mailbox
+            .commands
+            .iter()
+            .any(|(_, command)| !matches!(command, Command::Input(_)))
+            && self
+                .shared
+                .input_sink
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|sink| sink.dispatch(&input, generation, mailbox.viewport))
+        {
+            return true;
+        }
         enqueue_input(&mut mailbox.commands, generation, input);
         self.shared.ready.notify_one();
         true
@@ -792,6 +812,66 @@ mod tests {
         }
     }
 
+    struct ScrollSink(mpsc::Sender<(u64, BrowserViewport)>);
+    impl BrowserInputSink for ScrollSink {
+        fn dispatch(
+            &self,
+            input: &BrowserInput,
+            generation: u64,
+            viewport: BrowserViewport,
+        ) -> bool {
+            if matches!(input, BrowserInput::Wheel { .. }) && viewport == VIEWPORT {
+                self.0.send((generation, viewport)).unwrap();
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn scrolling_bypasses_busy_engine_and_rejected_events_keep_owner_order() {
+        let (mut worker, entered, release, dropped) = gated_worker(Stage::Tick);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (send, receive) = mpsc::channel();
+        *worker.shared.input_sink.lock().unwrap() = Some(Arc::new(ScrollSink(send)));
+        let wheel = BrowserInput::Wheel {
+            delta_x: 0.0,
+            delta_y: -40.0,
+            x: 20.0,
+            y: 30.0,
+        };
+        worker.handle_input(wheel.clone());
+        assert_eq!(receive.try_recv().unwrap(), (1, VIEWPORT));
+        assert!(worker.shared.mailbox.lock().unwrap().commands.is_empty());
+        worker.handle_input(BrowserInput::Text('a'));
+        assert!(matches!(
+            worker.shared.mailbox.lock().unwrap().commands.back(),
+            Some((1, Command::Input(BrowserInput::Text('a'))))
+        ));
+        worker.resize(BrowserViewport {
+            width: 777,
+            ..VIEWPORT
+        });
+        worker.handle_input(wheel.clone());
+        assert!(receive.try_recv().is_err());
+        assert!(matches!(
+            worker.shared.mailbox.lock().unwrap().commands.back(),
+            Some((1, Command::Input(BrowserInput::Wheel { .. })))
+        ));
+        worker.resize(VIEWPORT);
+        worker.navigate("second").unwrap();
+        worker.handle_input(wheel);
+        assert!(receive.try_recv().is_err());
+        assert!(matches!(
+            worker.shared.mailbox.lock().unwrap().commands.back(),
+            Some((2, Command::Input(BrowserInput::Wheel { .. })))
+        ));
+        drop(worker);
+        release.send(()).unwrap();
+        dropped.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+
     #[test]
     fn independent_compositor_keeps_presenting_while_engine_tick_is_blocked() {
         let (mut worker, entered, release, dropped) = gated_worker(Stage::Tick);
@@ -1078,6 +1158,7 @@ mod tests {
             }),
             ready: Condvar::new(),
             frame_source: Mutex::new(None),
+            input_sink: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::spawn(move || {
@@ -1272,6 +1353,7 @@ mod tests {
             }),
             ready: Condvar::new(),
             frame_source: Mutex::new(None),
+            input_sink: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::spawn(move || {

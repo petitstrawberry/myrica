@@ -268,8 +268,18 @@ pub trait BrowserFrameSource: Send {
     fn poll(&mut self) -> Result<Option<PresentedFrame>, BackendError>;
 }
 
+/// Optional input routing independent of the document owner. An accepted event
+/// must not also be enqueued on the owner. False preserves the ordinary path.
+pub trait BrowserInputSink: Send + Sync {
+    fn dispatch(&self, input: &BrowserInput, generation: u64, viewport: BrowserViewport) -> bool;
+}
+
 /// Narrow WebView-like interface implemented by each embedded browser engine.
 pub trait BrowserBackend {
+    fn take_input_sink(&mut self) -> Option<Arc<dyn BrowserInputSink>> {
+        None
+    }
+
     fn take_frame_source(&mut self) -> Option<Box<dyn BrowserFrameSource>> {
         None
     }

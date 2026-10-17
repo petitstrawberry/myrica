@@ -348,6 +348,16 @@ unsafe extern "C" {
         out: *mut *mut CompositorOutput,
     ) -> c_int;
     pub fn scarlet_webview_output_destroy(output: *mut CompositorOutput);
+    /// Any-thread wheel routing through WebKit's scrolling tree. Coordinates
+    /// are CSS pixels. STALE_REQUEST leaves the event for the owner queue.
+    pub fn scarlet_webview_output_wheel(
+        output: *mut CompositorOutput,
+        event: *const WheelEvent,
+        epoch: u64,
+        width: u32,
+        height: u32,
+        scale: f64,
+    ) -> c_int;
     pub fn scarlet_webview_output_damage(
         output: *mut CompositorOutput,
         generation: u64,
