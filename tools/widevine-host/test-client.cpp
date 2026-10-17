@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <netdb.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -184,6 +185,8 @@ std::vector<uint8_t> make_widevine_pssh(const std::vector<uint8_t>& key_id) {
 
 struct Collected {
   std::string session_id;
+  bool keys_reported = false;
+  std::vector<std::string> keys;
   bool has_message = false;
   uint32_t message_type = 0;
   uint32_t slot = 0;
@@ -209,7 +212,30 @@ void handle_event(const Frame& frame, Collected* collected) {
     std::cout << "EV_MESSAGE type=" << collected->message_type
               << " slot=" << collected->slot << " size=" << collected->size << std::endl;
   } else if (frame.kind == WVH_EV_KEYS) {
-    std::cout << "EV_KEYS" << std::endl;
+    std::string session;
+    take_string(frame.payload, &offset, &session);
+    uint32_t count = 0;
+    take_u32(frame.payload, &offset, &count);
+    collected->keys_reported = true;
+    for (uint32_t index = 0; index < count; ++index) {
+      uint32_t key_size = 0;
+      take_u32(frame.payload, &offset, &key_size);
+      std::string key_id;
+      if (offset + key_size <= frame.payload.size()) {
+        key_id.assign(reinterpret_cast<const char*>(frame.payload.data() + offset), key_size);
+        offset += key_size;
+      }
+      uint32_t key_status = 0;
+      take_u32(frame.payload, &offset, &key_status);
+      std::string hex;
+      for (unsigned char byte : key_id) {
+        static const char* digits = "0123456789abcdef";
+        hex.push_back(digits[byte >> 4]);
+        hex.push_back(digits[byte & 15]);
+      }
+      collected->keys.push_back(hex + " status=" + std::to_string(key_status));
+      std::cout << "KEY " << hex << " status=" << key_status << std::endl;
+    }
   } else if (frame.kind == WVH_EV_EXPIRATION) {
     std::cout << "EV_EXPIRATION" << std::endl;
   } else if (frame.kind == WVH_EV_SESSION_CLOSED) {
@@ -246,6 +272,20 @@ bool wait_result(int fd, uint32_t request_id, int32_t* status, uint32_t* value0,
   }
 }
 
+bool wait_keys(int fd, Collected* collected) {
+  while (!collected->keys_reported) {
+    Frame frame;
+    if (!read_frame(fd, &frame)) {
+      return false;
+    }
+    if (frame.kind == WVH_EV_RESULT) {
+      continue;
+    }
+    handle_event(frame, collected);
+  }
+  return true;
+}
+
 bool wait_message(int fd, Collected* collected) {
   while (!collected->has_message) {
     Frame frame;
@@ -260,10 +300,102 @@ bool wait_message(int fd, Collected* collected) {
   return true;
 }
 
+bool http_post(const std::string& url, const std::vector<uint8_t>& body,
+                std::vector<uint8_t>* response) {
+  const std::string crlf = std::string(1, char(13)) + std::string(1, char(10));
+  const std::string prefix = "http://";
+  if (url.compare(0, prefix.size(), prefix) != 0) {
+    std::cerr << "only plain http:// relay URLs are supported" << std::endl;
+    return false;
+  }
+  const std::string rest = url.substr(prefix.size());
+  std::string authority = rest;
+  std::string path = "/";
+  const size_t slash = rest.find('/');
+  if (slash != std::string::npos) {
+    authority = rest.substr(0, slash);
+    path = rest.substr(slash);
+  }
+  std::string host = authority;
+  std::string port = "80";
+  const size_t colon = authority.find(':');
+  if (colon != std::string::npos) {
+    host = authority.substr(0, colon);
+    port = authority.substr(colon + 1);
+  }
+
+  addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* addresses = nullptr;
+  if (getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+    std::cerr << "cannot resolve " << host << std::endl;
+    return false;
+  }
+  int relay_fd = -1;
+  for (addrinfo* entry = addresses; entry != nullptr; entry = entry->ai_next) {
+    relay_fd = socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
+    if (relay_fd < 0) {
+      continue;
+    }
+    if (connect(relay_fd, entry->ai_addr, entry->ai_addrlen) == 0) {
+      break;
+    }
+    close(relay_fd);
+    relay_fd = -1;
+  }
+  freeaddrinfo(addresses);
+  if (relay_fd < 0) {
+    std::cerr << "cannot connect to " << host << ":" << port << std::endl;
+    return false;
+  }
+
+  std::string request = "POST " + path + " HTTP/1.1" + crlf + "Host: " + host + ":" + port +
+                        crlf + "Content-Type: application/octet-stream" + crlf +
+                        "Content-Length: " + std::to_string(body.size()) + crlf +
+                        "Connection: close" + crlf + crlf;
+  if (!write_full(relay_fd, request.data(), request.size())) {
+    close(relay_fd);
+    return false;
+  }
+  if (!body.empty() && !write_full(relay_fd, body.data(), body.size())) {
+    close(relay_fd);
+    return false;
+  }
+
+  std::vector<uint8_t> raw;
+  uint8_t chunk[4096];
+  for (;;) {
+    const ssize_t got = read(relay_fd, chunk, sizeof(chunk));
+    if (got <= 0) {
+      break;
+    }
+    raw.insert(raw.end(), chunk, chunk + got);
+  }
+  close(relay_fd);
+
+  const std::string text(raw.begin(), raw.end());
+  const size_t header_end = text.find(crlf + crlf);
+  if (header_end == std::string::npos) {
+    std::cerr << "malformed relay response" << std::endl;
+    return false;
+  }
+  const std::string status_line = text.substr(0, text.find(crlf));
+  if (status_line.find(" 200") == std::string::npos) {
+    std::cerr << "relay returned: " << status_line << std::endl;
+    return false;
+  }
+  response->assign(raw.begin() + header_end + 4, raw.end());
+  return true;
+}
+
 int main(int argc, char** argv) {
   std::string socket_path;
   std::string shm_path;
   std::string kid_hex = "00112233445566778899aabbccddeeff";
+  std::string pssh_hex;
+  std::string license_relay;
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
     if (index + 1 >= argc) {
@@ -275,6 +407,10 @@ int main(int argc, char** argv) {
       shm_path = argv[++index];
     } else if (argument == "--kid-hex") {
       kid_hex = argv[++index];
+    } else if (argument == "--pssh-hex") {
+      pssh_hex = argv[++index];
+    } else if (argument == "--license-relay") {
+      license_relay = argv[++index];
     }
   }
   if (socket_path.empty() || shm_path.empty()) {
@@ -365,12 +501,21 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::vector<uint8_t> kid;
-  if (!decode_hex(kid_hex, &kid) || kid.size() != 16) {
-    std::cerr << "invalid --kid-hex" << std::endl;
-    return 1;
+  std::vector<uint8_t> init_data;
+  if (!pssh_hex.empty()) {
+    if (!decode_hex(pssh_hex, &init_data)) {
+      std::cerr << "invalid --pssh-hex" << std::endl;
+      return 1;
+    }
+  } else {
+    std::vector<uint8_t> kid;
+    if (!decode_hex(kid_hex, &kid) || kid.size() != 16) {
+      std::cerr << "invalid --kid-hex" << std::endl;
+      return 1;
+    }
+    init_data = make_widevine_pssh(kid);
   }
-  const std::vector<uint8_t> init_data = make_widevine_pssh(kid);
+  std::cout << "INIT_DATA_BYTES " << init_data.size() << std::endl;
   std::vector<uint8_t> create;
   append_u32(&create, 1);
   append_u32(&create, WVH_SESSION_TEMPORARY);
@@ -401,6 +546,39 @@ int main(int argc, char** argv) {
             << static_cast<int>(message[1]) << " " << static_cast<int>(message[2])
             << " " << static_cast<int>(message[3]) << " size=" << collected.size
             << std::endl;
+
+  if (!license_relay.empty()) {
+    const std::vector<uint8_t> license_request(message, message + collected.size);
+    std::vector<uint8_t> license_response;
+    if (!http_post(license_relay, license_request, &license_response)) {
+      std::cerr << "license request failed" << std::endl;
+      return 1;
+    }
+    std::cout << "LICENSE_RESPONSE_BYTES " << license_response.size() << std::endl;
+    std::vector<uint8_t> update;
+    append_u32(&update, 2);
+    append_string(&update, collected.session_id);
+    append_u32(&update, static_cast<uint32_t>(license_response.size()));
+    append_bytes(&update, license_response.data(), license_response.size());
+    if (!send_frame(fd, WVH_CMD_UPDATE_SESSION, update)) {
+      std::cerr << "UPDATE_SESSION send failed" << std::endl;
+      return 1;
+    }
+    uint32_t update_value0 = 0;
+    uint32_t update_value1 = 0;
+    if (!wait_result(fd, 2, &status, &update_value0, &update_value1, &collected)) {
+      std::cerr << "UPDATE_SESSION reply missing" << std::endl;
+      return 1;
+    }
+    std::cout << "UPDATE_SESSION status=" << status << std::endl;
+    if (status == WVH_OK) {
+      if (wait_keys(fd, &collected)) {
+        std::cout << "KEYS_REPORTED" << std::endl;
+      } else {
+        std::cerr << "key status event missing" << std::endl;
+      }
+    }
+  }
 
   std::vector<uint8_t> release;
   append_u32(&release, collected.slot);
