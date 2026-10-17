@@ -78,7 +78,7 @@
             buildAndTestSubdir = "cargo-scarlet";
             cargoLock.lockFile = "${scarlet-sdk}/Cargo.lock";
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            nativeCheckInputs = imageTools ++ [ pkgs.curl ];
+            nativeCheckInputs = imageTools ++ [ pkgs.curl pkgs.git ];
             postInstall = ''
               wrapProgram "$out/bin/cargo-scarlet" \
                 --prefix PATH : ${pkgs.lib.makeBinPath cargoScarletRuntimeTools} \
