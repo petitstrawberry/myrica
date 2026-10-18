@@ -687,3 +687,12 @@ owner join まで合格した。Prime の低解像度映像での影響は次の
 参照: [Chromium TrackRunIterator の IV 正規化テスト](https://chromium.googlesource.com/chromium/src/+/45ec87b29fb536932d3c26d6cf236128a872a14b/media/formats/mp4/track_run_iterator_unittest.cc)、
 [DecryptConfig](https://chromium.googlesource.com/chromium/src/media/+/refs/heads/main/base/decrypt_config.h)、
 [ToCdmInputBuffer](https://chromium.googlesource.com/chromium/src/+/HEAD/media/cdm/cdm_type_conversion.cc)。
+
+IV 正規化後の Prime 再試験でも、ユーザー操作では映像が出なかった。
+host の実際の IV 長は 16、H.264 は 960x540、最初の映像サンプルは
+141052 バイト (clear prefix 49 バイト) だった。
+matching_sessions=1 / internal_error=1 / system_code=5 の鍵で NoKey が続く一方、
+圧縮音声サンプルは 384 件まで復号が進んだ。後続の別鍵には
+output-restricted / system_code=49 も出た。IV の差は修正できたが、
+Prime の映像再生失敗は継続している。低解像度を選ぶだけでは改善しなかった。
+この再試験範囲には SGFX の受付上限超過 / device lost の記録はない。
