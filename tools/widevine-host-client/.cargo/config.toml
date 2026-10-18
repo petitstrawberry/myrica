@@ -1,0 +1,8 @@
+[target.aarch64-unknown-scarlet]
+linker = "rust-lld"
+
+[target.'cfg(target_os = "scarlet")']
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]
+
+[unstable]
+unstable-options = true
