@@ -377,5 +377,21 @@ Linux 側に誤配置した追加ファイルは共有の検証用パス
 `/shared/myrica-eme-4552796` へ移動した。転送サーバーと fixture サーバーは
 検証終了後に停止し、公開済みの WebKit / Symphonia 一時 checkout も削除した。
 操作中の検証 VM とその使用中ディスクは保持している。
-通常バンドルは実装コミット `4552796` を参照する。以降の作業記録だけの変更は
-実行コードや WebKit pin を変えない。
+通常バンドルは実装コミット `4552796` を参照する。直後の作業記録コミット `348b46c` は
+実行コードや WebKit pin を変えていない。
+
+
+### ログイン画面のクリック調査
+
+WebKit `821a50fb35f60d794a45e384e224e9f6ae10db95` では
+`SCARLET_WEBVIEW_INPUT_TRACE=1` を指定した時だけ、mouse down / up の
+到達先タグ、子フレームかどうか、関連 listener の有無を出す。
+フォーム値、node id、URL、DOM テキストは記録しない。
+通常時は追加の hit test を行わない。C++ syntax check と Myrica の Scarlet
+Release ビルドが成功し、native `/bin/myrica` へ HTTP 転送・rename して配置した。
+
+Amazon のパズルがクリックに反応しない件をユーザー操作で調査している。
+通常ログでは当該操作時の新しい JS 例外はなかった。読み込み時には
+`PublicKeyCredential.getClientCapabilities` の未対応警告と analytics endpoint の
+CORS エラーがあるが、パズルの原因との対応は未確認。診断版の新しい Amazon
+ウィンドウでの操作ログを待ち、実際のクリック経路を調べる。
