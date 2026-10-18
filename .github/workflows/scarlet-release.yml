@@ -149,6 +149,7 @@ jobs:
           install -m755 target/aarch64-unknown-scarlet/release/myrica dist/staging/bin/myrica
           install -m755 target/aarch64-unknown-scarlet/release/webkit-vulkan-probe dist/staging/bin/myrica-vulkan-probe
           install -Dm644 LICENSE dist/staging/share/licenses/myrica/LICENSE
+          chmod -R u+rwX dist/staging
           task_asset=myrica-aarch64-unknown-scarlet.tar.gz
           tar --owner=0 --group=0 --mtime=@0 -czf "dist/$task_asset" -C dist/staging .
           cd dist
