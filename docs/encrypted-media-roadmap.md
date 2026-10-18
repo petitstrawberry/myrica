@@ -460,8 +460,11 @@ WebKit `55677b5184c7af6b7c723c2a50d3a11c67d69b7b` を使う Scarlet Release 版�
 ため、EME 要求ログの不在から EME 未到達を推論しない。
 WebKit `55677b51` は `SCARLET_EME_TRACE=1` 単独で capability 要求と
 key-system / configuration の受理・拒否を記録できる。
-フォーム値・ライセンス・鍵は記録しない。新しい process の cookie は既存 process
-と共有されないため、ログイン中のウィンドウを保持して次の診断を行う。
+フォーム値・ライセンス・鍵は記録しない。ログイン中のウィンドウを保持して次の診断を行う。
+Cookie の永続化は WebCore の ScarletStorage / CookieJarDB が担当し、
+HOME 以下の .local/share/myrica/cookies.sqlite を使う。ディレクトリ作成に失敗すると
+メモリに退避する。Blitz 側の in-memory jar を根拠に、新しい WebKit process は
+常に再ログインが必要と説明した点は誤りだった。
 
 
 ### Prime Video: EME 前のプレイヤー起動拒否
@@ -485,3 +488,31 @@ WebKit `0e3aa321` は明示的な `SCARLET_WEBVIEW_USER_AGENT` override を追�
 空文字・不正 UTF-8・1024 文字超・改行を含む値は採用しない。
 互換 token は desktop 用 UI を選ばせるための試験設定で、EME capability の
 応答を変えたり、CDM の security level を追加したりする変更はない。
+
+
+最初の desktop WebKit 互換指定では、ユーザー操作で黒いプレイヤー画面へ
+遷移するようになったが、20 秒でタイムアウトして視聴不可を表示した。
+SDK の公開コードを確認したところ、`Safari` / `AppleWebKit` 判定では
+MediaKeyFactoryWebkit (supportedKeySystems は com.apple.fps のみ) を選んでいた。
+Chrome 判定では W3C EME の Widevine factory を選ぶ。
+単に desktop に分類される UA だけでは、この DRM 分岐の相違が残る。
+既定 UA を変更せず、明示的な Chrome/Linux 互換指定で切り分けを継続する。
+
+
+Chrome/Linux 互換指定で再起動し、Prime Video の W3C EME 要求と
+`SW_SECURE_CRYPTO` / 空 robustness の構成受理を確認した。
+この段階で CDM host が `dlopen failed: libnspr4.so` と終了していた。
+再起動後の検証 VM に CDM と NSPR を /shared/widevine 以下へ復元していたが、
+MYRICA_WIDEVINE_LD_PATH を指定していなかったため探索対象外だった。
+Linux ビューの /usr/lib/aarch64-linux-gnu/libnspr4.so が未配置であることを確認し、
+手元の検証用依存ライブラリを HTTP 転送して SHA-256 を照合した。
+CDM 本体の改変や能力応答の追加は行っていない。
+私有 CDM / NSPR の検証用配置は起動中 VM の snapshot 内だけである。
+別の VM では NSPR を通常の Linux runtime に導入するか、
+MYRICA_WIDEVINE_LD_PATH で同梱ディレクトリを明示する。
+
+途中の 1 回は Myrica が SWS surface 作成の失敗で終了した。
+SWS は WINDOW_CREATED 送信後に window 作成を記録し、直後に client が切断した。
+ScarletUI main `332caaf0` は元の sws-client エラー種別を出力する。
+この版の Release ビルドと転送後の再起動は成功し、GUI / WebKit の起動完了を確認した。
+同じ surface エラーは再現せず、原因修正済みとは扱わない。
