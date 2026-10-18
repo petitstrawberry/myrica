@@ -819,7 +819,7 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    if (decode_mode == "decrypt" && !decode_out.empty()) {
+    if ((decode_mode == "decrypt" || decode_mode == "decrypt-full") && !decode_out.empty()) {
       std::ofstream truncate(decode_out, std::ios::binary | std::ios::trunc);
     }
 
@@ -855,11 +855,12 @@ int main(int argc, char** argv) {
         std::cerr << "bad sample line" << std::endl;
         return 1;
       }
-      if (decode_mode == "decrypt") {
+      if (decode_mode == "decrypt" || decode_mode == "decrypt-full") {
         std::vector<uint8_t> plaintext(size);
         size_t position = 0;
         std::vector<std::pair<uint32_t, uint32_t>> chunks = subsamples;
-        if (chunks.empty()) {
+        if (decode_mode == "decrypt-full" || chunks.empty()) {
+          chunks.clear();
           chunks.push_back({0, static_cast<uint32_t>(size)});
         }
         bool failed = false;
@@ -908,6 +909,35 @@ int main(int argc, char** argv) {
             }
             const uint8_t* chunk_out = static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
                                        static_cast<size_t>(out_slot) * slot_size;
+            bool all_zero = true;
+            for (uint32_t scan = 0; scan < chunk_size; ++scan) {
+              if (chunk_out[scan] != 0) {
+                all_zero = false;
+                break;
+              }
+            }
+            if (all_zero) {
+              // Some samples come back as a zero-filled success. Retry once;
+              // the CDM fills the buffer on the second call.
+              std::cout << "CHUNK_ZERO index=" << index << " size=" << chunk_size << std::endl;
+              std::vector<uint8_t> release_zero;
+              append_u32(&release_zero, out_slot);
+              send_frame(fd, WVH_CMD_RELEASE, release_zero);
+              if (!send_frame(fd, WVH_CMD_DECRYPT, request)) {
+                failed = true;
+                break;
+              }
+              if (!wait_result(fd, 6, &status, &out_slot, &out_size, &collected)) {
+                failed = true;
+                break;
+              }
+              if (status != WVH_OK || out_size != chunk_size) {
+                failed = true;
+                break;
+              }
+              chunk_out = static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
+                          static_cast<size_t>(out_slot) * slot_size;
+            }
             memcpy(plaintext.data() + position, chunk_out, chunk_size);
             std::vector<uint8_t> release_chunk;
             append_u32(&release_chunk, out_slot);
@@ -923,6 +953,20 @@ int main(int argc, char** argv) {
           }
           ++index;
           continue;
+        }
+        if (decode_mode == "decrypt-full") {
+          // The packager leaves the clear regions untouched; a single call
+          // decrypts the whole buffer with one keystream, so put the original
+          // clear bytes back where the real map says they belong.
+          size_t restore = 0;
+          for (const auto& entry : subsamples) {
+            for (uint32_t offset_in = 0; offset_in < entry.first; ++offset_in) {
+              if (restore + offset_in < plaintext.size()) {
+                plaintext[restore + offset_in] = media[offset + restore + offset_in];
+              }
+            }
+            restore += entry.first + entry.second;
+          }
         }
         if (!decode_out.empty()) {
           std::ofstream output(decode_out, std::ios::binary | std::ios::app);
@@ -1000,7 +1044,7 @@ int main(int argc, char** argv) {
         break;
       }
     }
-    if (decode_mode == "decrypt") {
+    if (decode_mode == "decrypt" || decode_mode == "decrypt-full") {
       std::cout << "DECRYPTED_SAMPLES " << index << std::endl;
     } else if (!got_frame) {
       std::cerr << "no decoded frame after " << index << " samples" << std::endl;
