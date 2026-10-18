@@ -462,3 +462,26 @@ WebKit `55677b51` は `SCARLET_EME_TRACE=1` 単独で capability 要求と
 key-system / configuration の受理・拒否を記録できる。
 フォーム値・ライセンス・鍵は記録しない。新しい process の cookie は既存 process
 と共有されないため、ログイン中のウィンドウを保持して次の診断を行う。
+
+
+### Prime Video: EME 前のプレイヤー起動拒否
+
+`SCARLET_EME_TRACE=1` の修正版でもユーザー操作で再現した。
+同ウィンドウは `DVWebNode_deeplink` の `Unhandled Playback` を記録し、
+`launchTypeToApply` は `NONE`。EME 要求は記録されず、別途 player が
+20 秒後も `Unloaded` という timeout を出した。
+
+認証情報を含まない公開 storefront をホストから取得して比較したところ、
+標準の Myrica UA では JSON の `playbackLaunchType` が `NONE`、
+Linux Chrome UA と desktop WebKit UA では `EMBEDDED` だった。
+さらに `Mozilla/5.0 (X11; Scarlet aarch64) AppleWebKit/605.1.15 (KHTML, like Gecko) Myrica/0.1`
+でも `EMBEDDED` を確認した。公開 client の device 分類は `X11` token を
+Linux desktop と判定し、既存の Scarlet UA は Other へ分類する。
+クリック handler は `EMBEDDED` の場合に onPlay を呼ぶが、`NONE` では
+上記 Unhandled Playback を記録する。この結果はライセンス・復号の検証とは別である。
+
+WebKit `0e3aa321` は明示的な `SCARLET_WEBVIEW_USER_AGENT` override を追加した。
+標準 UA は保持し、navigator と WebCore HTTP request の双方に同じ指定を使う。
+空文字・不正 UTF-8・1024 文字超・改行を含む値は採用しない。
+互換 token は desktop 用 UI を選ばせるための試験設定で、EME capability の
+応答を変えたり、CDM の security level を追加したりする変更はない。
