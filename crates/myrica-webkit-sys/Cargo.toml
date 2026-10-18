@@ -11,7 +11,7 @@ build = "build.rs"
 vulkan-probe = []
 vulkan-rendering = []
 media = ["dep:scarlet-codecs", "dep:sas-client", "dep:scarlet-video-client"]
-encrypted-media = ["dep:cdm-host"]
+encrypted-media = ["media", "vulkan-rendering", "dep:cdm-host"]
 
 [dependencies]
 scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7ea687d9139bf64d8676bad41257ba897d623bce", optional = true, default-features = false, features = ["media-container-aac"] }

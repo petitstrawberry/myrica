@@ -1,47 +1,33 @@
 # widevine-host-client
 
-Scarlet-native side of the Widevine split. The crate ships two targets:
+Scarlet-native diagnostic CLI for the reusable client in
+[`crates/cdm-host`](../../crates/cdm-host). The same library is used by the
+WebKit EME bridge; this CLI does not contain a second IPC implementation.
+The CDM runs in `widevine-host` in the Linux ABI view.
 
-- `cdm_host` (library): owns the widevine-host process for myrica's WebKit EME
-  integration. The browser never loads the CDM itself.
-- `widevine-host-client` (binary): command line driver used for bring-up runs
-  against a real CDM (licence exchange, sample extraction, decode checks).
+Build from Myrica's development shell:
 
-## Library
+```sh
+cargo build --release --target aarch64-unknown-scarlet \
+  --manifest-path tools/widevine-host-client/Cargo.toml
+```
 
-`CdmHost::spawn` creates the SharedMemory region and the socket pair, spawns
-widevine-host inside the linux-aarch64 view with stdio and both objects mapped
-to descriptors 0 to 4, and completes the HELLO/READY handshake. The rest of the
-surface is `initialize`, `create_session` (init data in, session id and the
-CDM's licence request out), `update_session` (licence response in, key statuses
-out), `close_session`, `decrypt` and `shutdown`, plus `HostEvent` for
-asynchronous notifications.
+Run in Scarlet with a user-provided CDM:
 
-`decrypt` splits a sample into its subsample regions and calls the CDM once per
-region with the sample IV, because the CDM refuses a subsample map with more
-than one entry; a zero-filled success is retried once.
+```sh
+widevine-host-client --host /shared/widevine/widevine-host \
+  --cdm /shared/widevine/libwidevinecdm.so \
+  --host-ld-path /shared/widevine --sessions 6
+```
 
-The library targets aarch64-unknown-scarlet and links only scarlet-os and
-scarlet-sys:
+Options are `--host`, `--cdm`, `--host-ld-path`, `--kid-hex` (16-byte hex
+KID), `--slots`, `--slot-size` and `--sessions` (default 1, maximum 100).
+Each session must produce exactly one initial message, then close successfully.
+`WVHC_OK sessions=6` verifies reuse beyond the default four shared slots.
 
-    nix develop /path/to/Scarlet -c cargo build --release --target aarch64-unknown-scarlet --lib
-
-## Command line driver
-
-    widevine-host-client --host /shared/wv/widevine-host --cdm /shared/wv/c \
-      [--host-ld-path /shared/wv/nspr] [--pssh-hex HEX] [--license-relay URL] \
-      [--decrypt-sample FILE --decrypt-iv HEX --decrypt-key-id HEX --decrypt-subsamples a:b,...] \
-      [--decode-media FILE --decode-samples FILE --decode-mode decrypt|decrypt-full|decode]
-
-The driver was used for the W1 measurements on Scarlet: probe licence request
-delivery through shared memory, apply a licence from a test license server via
-a host-side TLS relay, and decrypt or decode real Axinom test-vector samples.
-
-## Wiring into WebKit (planned)
-
-The fork-side EME implementation calls this library through the ScarletWebView
-C ABI. Planned entry points: create/destroy a host handle, initialize,
-create_session, update_session, close_session, decrypt and take_event. The
-fork implements CDMFactoryScarlet, CDMPrivateScarlet, CDMInstanceScarlet and
-CDMInstanceSessionScarlet on top; init data comes from InitDataRegistry and the
-licence POST stays in the page's fetch().
+The library provides initialize / create_session / update_session /
+close_session / decrypt / shutdown. The Linux C++ test client in
+[`tools/widevine-host`](../widevine-host) has the licence-relay and sample-decrypt
+options. Browser-level licence validation uses `tests/eme-widevine.html` and
+`webkit-smoke URL --eme-only`; see the
+[roadmap](../../docs/encrypted-media-roadmap.md).

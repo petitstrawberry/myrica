@@ -3,9 +3,11 @@
 //! The CDM itself runs inside a Linux ABI view; the fork-side CDM
 //! implementation (CDMFactoryScarlet and friends) calls these functions from
 //! the Scarlet-native browser process.
+//! Calls on a handle must be serialized on the CDM WorkQueue. Returned buffer
+//! ownership may move to the Page owner for delivery and release.
 //!
 //! Conventions:
-//! - Status is 0 on success. Negative values follow the host protocol:
+//! - Status is 0 on success. Negative values are bridge-level errors:
 //!   -1 generic, -2 no key, -3 protocol, -4 spawn failure.
 //! - Buffers written through CdmBuffer pointers are owned by Rust until the
 //!   caller releases them with cdm_host_buffer_free.
@@ -206,13 +208,15 @@ pub extern "C" fn cdm_host_initialize(
 
 /// Create a session. out_session_id receives the MediaKeySession id, and
 /// out_message receives the first message the CDM produced (a licence request,
-/// or an individualization request during provisioning).
+/// or an individualization request during provisioning). out_message_type
+/// receives its CDM message type; that message is consumed from the event queue.
 #[unsafe(no_mangle)]
 pub extern "C" fn cdm_host_create_session(
     handle: *mut CdmHandle,
     init_data: Bytes,
     session_type: u32,
     init_data_type: u32,
+    out_message_type: *mut u32,
     out_session_id: *mut CdmBuffer,
     out_message: *mut CdmBuffer,
 ) -> i32 {
@@ -227,11 +231,33 @@ pub extern "C" fn cdm_host_create_session(
         .create_session(&init_data, session_type, init_data_type, &mut events)
     {
         Ok((session_id, message)) => {
+            // The first message is returned through the requestLicense callback;
+            // queueing it as well would send the licence request twice.
+            let mut returned_message = false;
             for event in &events {
+                if !returned_message {
+                    if let HostEvent::Message {
+                        session_id: id,
+                        message_type,
+                        data,
+                    } = event
+                    {
+                        if id == &session_id && message.as_ref() == Some(data) {
+                            if !out_message_type.is_null() {
+                                unsafe { *out_message_type = *message_type };
+                            }
+                            returned_message = true;
+                            continue;
+                        }
+                    }
+                }
                 let encoded = encode_event(event);
                 if encoded.0 != 0 {
                     state.events.push_back(encoded);
                 }
+            }
+            if !returned_message {
+                return STATUS_PROTOCOL;
             }
             if !out_session_id.is_null() {
                 // SAFETY: the out pointer is valid for one write.
@@ -264,7 +290,10 @@ pub extern "C" fn cdm_host_update_session(
     // SAFETY: same contract as above.
     let response = unsafe { view(response) };
     let mut events = Vec::new();
-    match state.host.update_session(&session_id, &response, &mut events) {
+    match state
+        .host
+        .update_session(&session_id, &response, &mut events)
+    {
         Ok(keys) => {
             let mut packed = Vec::new();
             pack_u32(&mut packed, keys.len() as u32);
@@ -364,10 +393,7 @@ pub extern "C" fn cdm_host_decrypt(
 /// 0 when the queue is empty, and a negative status on failure. The packed
 /// event is kind, then the payload described in cdm_bridge's module comment.
 #[unsafe(no_mangle)]
-pub extern "C" fn cdm_host_take_event(
-    handle: *mut CdmHandle,
-    out_event: *mut CdmBuffer,
-) -> i32 {
+pub extern "C" fn cdm_host_take_event(handle: *mut CdmHandle, out_event: *mut CdmBuffer) -> i32 {
     let Some(state) = (unsafe { handle.as_mut() }) else {
         return STATUS_ERROR;
     };

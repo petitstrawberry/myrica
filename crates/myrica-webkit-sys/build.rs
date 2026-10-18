@@ -73,6 +73,9 @@ fn prepare() -> PathBuf {
     if env::var_os("CARGO_FEATURE_MEDIA").is_some() {
         engine.arg("--media");
     }
+    if env::var_os("CARGO_FEATURE_ENCRYPTED_MEDIA").is_some() {
+        engine.arg("--eme");
+    }
     engine
         .arg("--webkit-source")
         .arg(webkit)

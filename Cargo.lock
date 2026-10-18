@@ -655,6 +655,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cdm-host"
+version = "0.1.0"
+dependencies = [
+ "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
+ "scarlet-sys 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2469,6 +2477,7 @@ dependencies = [
 name = "myrica-webkit-sys"
 version = "0.1.0"
 dependencies = [
+ "cdm-host",
  "sas-client",
  "scarlet-codecs",
  "scarlet-os 1.0.0 (git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064)",

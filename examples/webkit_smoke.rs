@@ -311,6 +311,45 @@ fn engine_probe(
                 .ok_or("missing native interruption hook")?,
         ))
         .map_err(|error| error.to_string())?;
+    if std::env::args().any(|argument| argument == "--eme-only") {
+        engine.navigate(base).map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut progress = Instant::now();
+        loop {
+            engine.tick();
+            let snapshot = engine.snapshot();
+            if snapshot.title == "eme-pass" || snapshot.title == "eme-fail" {
+                let state = engine
+                    .text_content("eme-state")
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                if snapshot.title != "eme-pass" {
+                    return Err(format!("Widevine EME failed: {state}"));
+                }
+                println!("MYRICA_WEBKIT_SMOKE_PASS stage=widevine-eme state={state}");
+                drop(engine);
+                return Ok(());
+            }
+            if progress.elapsed() >= Duration::from_secs(5) {
+                eprintln!(
+                    "MYRICA_WEBKIT_EME_WAIT title={} state={:?}",
+                    snapshot.title,
+                    engine.text_content("eme-state")
+                );
+                sender
+                    .send(OwnerMessage::PageProgress)
+                    .map_err(|error| error.to_string())?;
+                progress = Instant::now();
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Widevine EME timed out: {:?}",
+                    engine.text_content("eme-state")
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
     if painting_workers_only {
         painting_workers_probe(&mut engine, base)?;
         drop(engine);

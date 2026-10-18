@@ -11,9 +11,9 @@
 use std::io::{Read, Write};
 
 use scarlet_os::environment::{Environment, HandleMapping};
-use scarlet_os::handle::capability::memory_mapping::{flags as map_flags, prot};
+use scarlet_os::handle::capability::memory_mapping::{flags as map_flags, munmap, prot};
 use scarlet_os::handle::{Handle, HandleError, HandleResult};
-use scarlet_os::ipc::{permissions, SharedMemory};
+use scarlet_os::ipc::{SharedMemory, permissions};
 use scarlet_os::socket::Socket;
 use scarlet_sys::{Syscall, syscall1};
 
@@ -184,8 +184,20 @@ pub struct DecryptRequest<'a> {
 }
 
 /// The CDM host process plus the control channel and shared region it uses.
+struct MappingGuard {
+    base: usize,
+    size: usize,
+}
+impl Drop for MappingGuard {
+    fn drop(&mut self) {
+        // The region is private to this client and no sample borrow escapes IPC.
+        let _ = unsafe { munmap(self.base, self.size) };
+    }
+}
+
 pub struct CdmHost {
     socket: Socket,
+    _mapping: MappingGuard,
     #[allow(dead_code)]
     memory: SharedMemory,
     base: usize,
@@ -199,6 +211,13 @@ impl CdmHost {
     /// linux-aarch64 view, and run the HELLO/READY handshake.
     pub fn spawn(options: &CdmHostOptions) -> Result<Self> {
         let region_size = options.region_size();
+        if options.slot_count < 2
+            || options.slot_count > 64
+            || options.slot_size == 0
+            || region_size > 64 * 1024 * 1024
+        {
+            return Err(CdmHostError::Protocol("invalid shared region layout"));
+        }
         let memory = SharedMemory::create(region_size, permissions::READ_WRITE)
             .map_err(|_| CdmHostError::Protocol("shared memory create failed"))?;
         let base = unsafe {
@@ -216,6 +235,10 @@ impl CdmHost {
                 .map_err(|_| CdmHostError::Protocol("shared memory mmap failed"))?
         };
 
+        let mapping = MappingGuard {
+            base,
+            size: region_size,
+        };
         let (client_socket, host_socket) =
             Socket::pair().map_err(|_| CdmHostError::Protocol("socketpair failed"))?;
 
@@ -287,6 +310,7 @@ impl CdmHost {
 
         let mut host = Self {
             socket: client_socket,
+            _mapping: mapping,
             memory,
             base,
             slot_size: options.slot_size,
@@ -301,8 +325,20 @@ impl CdmHost {
         let hello = frame(CMD_HELLO, &WVH_VERSION.to_le_bytes());
         self.socket.write_all(&hello)?;
         let (kind, payload) = read_frame(&mut self.socket)?;
-        if kind != EV_READY || payload.len() < 16 {
+        if kind != EV_READY || payload.len() != 16 {
             return Err(CdmHostError::Protocol("unexpected READY frame"));
+        }
+        let mut offset = 0;
+        let version = take_u32(&payload, &mut offset).unwrap();
+        let header = take_u32(&payload, &mut offset).unwrap();
+        let slots = take_u32(&payload, &mut offset).unwrap();
+        let slot_size = take_u32(&payload, &mut offset).unwrap();
+        if version != WVH_VERSION
+            || header != SHM_HEADER_BYTES as u32
+            || slot_size != self.slot_size
+            || SHM_HEADER_BYTES + slots as usize * slot_size as usize != self.region_size
+        {
+            return Err(CdmHostError::Protocol("host shared region layout mismatch"));
         }
         Ok(())
     }
@@ -343,27 +379,35 @@ impl CdmHost {
         push_u32(&mut payload, init_data_type);
         push_u32(&mut payload, init_data.len() as u32);
         payload.extend_from_slice(init_data);
-        self.socket.write_all(&frame(CMD_CREATE_SESSION, &payload))?;
+        self.socket
+            .write_all(&frame(CMD_CREATE_SESSION, &payload))?;
 
         let mut session_id = String::new();
-        let mut message: Option<Vec<u8>> = None;
-        let (status, _, _) =
-            self.wait_result(request_id, Some(&mut |event: HostEvent| {
+        let (status, _, _) = self.wait_result(
+            request_id,
+            Some(&mut |event: HostEvent| {
                 match &event {
-                    HostEvent::Session {
-                        session_id: id, ..
-                    } => session_id = id.clone(),
-                    HostEvent::Message { data, .. } => {
-                        if message.is_none() {
-                            message = Some(data.clone());
-                        }
-                    }
+                    HostEvent::Session { session_id: id, .. } => session_id = id.clone(),
                     _ => {}
                 }
                 events.push(event);
-            }))?;
+            }),
+        )?;
         if status != STATUS_OK {
             return Err(CdmHostError::Status(status));
+        }
+        let message = events.iter().find_map(|event| match event {
+            HostEvent::Message {
+                session_id: id,
+                data,
+                ..
+            } if id == &session_id => Some(data.clone()),
+            _ => None,
+        });
+        if session_id.is_empty() || message.is_none() {
+            return Err(CdmHostError::Protocol(
+                "session result omitted its initial message",
+            ));
         }
         Ok((session_id, message))
     }
@@ -382,16 +426,19 @@ impl CdmHost {
         push_string(&mut payload, session_id);
         push_u32(&mut payload, response.len() as u32);
         payload.extend_from_slice(response);
-        self.socket.write_all(&frame(CMD_UPDATE_SESSION, &payload))?;
+        self.socket
+            .write_all(&frame(CMD_UPDATE_SESSION, &payload))?;
 
         let mut keys = Vec::new();
-        let (status, _, _) =
-            self.wait_result(request_id, Some(&mut |event: HostEvent| {
+        let (status, _, _) = self.wait_result(
+            request_id,
+            Some(&mut |event: HostEvent| {
                 if let HostEvent::Keys { keys: found, .. } = &event {
                     keys = found.clone();
                 }
                 events.push(event);
-            }))?;
+            }),
+        )?;
         if status != STATUS_OK {
             return Err(CdmHostError::Status(status));
         }
@@ -472,13 +519,16 @@ impl CdmHost {
         push_u32(&mut payload, request.scheme);
         payload.extend_from_slice(&request.timestamp.to_le_bytes());
 
-        self.write_slot(0, chunk);
+        self.write_slot(0, chunk)?;
         self.socket.write_all(&frame(CMD_DECRYPT, &payload))?;
         let (status, slot, size) = self.wait_result(request_id, None)?;
         if status != STATUS_OK {
             return Err(CdmHostError::Status(status));
         }
-        let out = self.read_slot_vec(slot, size as usize);
+        let out = self.read_slot_vec(slot, size as usize)?;
+        if out.len() != chunk.len() {
+            return Err(CdmHostError::Protocol("decrypted sample size changed"));
+        }
         let mut release = Vec::new();
         push_u32(&mut release, slot);
         let _ = self.socket.write_all(&frame(CMD_RELEASE, &release));
@@ -486,8 +536,8 @@ impl CdmHost {
     }
 
     /// Stop the host process.
-    pub fn shutdown(mut self) {
-        let _ = self.socket.write_all(&frame(CMD_SHUTDOWN, &[]));
+    pub fn shutdown(self) {
+        drop(self);
     }
 
     fn take_request_id(&mut self) -> u32 {
@@ -495,24 +545,29 @@ impl CdmHost {
         self.next_request_id
     }
 
-    fn write_slot(&self, slot: u32, data: &[u8]) {
-        let start = self.base + SHM_HEADER_BYTES + slot as usize * self.slot_size as usize;
+    fn slot_start(&self, slot: u32, size: usize) -> Result<usize> {
+        let count = (self.region_size - SHM_HEADER_BYTES) / self.slot_size as usize;
+        if slot as usize >= count || size > self.slot_size as usize {
+            return Err(CdmHostError::Protocol("shared slot range exceeds region"));
+        }
+        Ok(self.base + SHM_HEADER_BYTES + slot as usize * self.slot_size as usize)
+    }
+
+    fn write_slot(&self, slot: u32, data: &[u8]) -> Result<()> {
+        let start = self.slot_start(slot, data.len())?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), start as *mut u8, data.len());
         }
+        Ok(())
     }
 
-    fn read_slot(&self, slot: u32, out: &mut [u8]) {
-        let start = self.base + SHM_HEADER_BYTES + slot as usize * self.slot_size as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(start as *const u8, out.as_mut_ptr(), out.len());
-        }
-    }
-
-    fn read_slot_vec(&self, slot: u32, size: usize) -> Vec<u8> {
+    fn read_slot_vec(&self, slot: u32, size: usize) -> Result<Vec<u8>> {
+        let start = self.slot_start(slot, size)?;
         let mut out = vec![0u8; size];
-        self.read_slot(slot, &mut out);
-        out
+        unsafe {
+            std::ptr::copy_nonoverlapping(start as *const u8, out.as_mut_ptr(), size);
+        }
+        Ok(out)
     }
 
     /// Read frames until the result for the request arrives, handing every
@@ -526,41 +581,55 @@ impl CdmHost {
             let (kind, payload) = read_frame(&mut self.socket)?;
             if kind == EV_RESULT {
                 let mut offset = 0usize;
-                let id = take_u32(&payload, &mut offset).unwrap_or(0);
-                let status = take_u32(&payload, &mut offset).unwrap_or(0) as i32;
-                let value0 = take_u32(&payload, &mut offset).unwrap_or(0);
-                let value1 = take_u32(&payload, &mut offset).unwrap_or(0);
+                let id = take_u32(&payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated result"))?;
+                let status = take_u32(&payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated result"))?
+                    as i32;
+                let value0 = take_u32(&payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated result"))?;
+                let value1 = take_u32(&payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated result"))?;
                 if id == request_id {
                     return Ok((status, value0, value1));
                 }
                 continue;
             }
-            let event = self.decode_event(kind, &payload);
+            let event = self.decode_event(kind, &payload)?;
             if let Some(callback) = observer.as_deref_mut() {
                 callback(event);
             }
         }
     }
 
-    fn decode_event(&self, kind: u32, payload: &[u8]) -> HostEvent {
+    fn decode_event(&mut self, kind: u32, payload: &[u8]) -> Result<HostEvent> {
         let mut offset = 0usize;
-        match kind {
+        Ok(match kind {
             EV_SESSION => {
-                let request_id = take_u32(payload, &mut offset).unwrap_or(0);
-                let session_id = take_string(payload, &mut offset).unwrap_or_default();
+                let request_id = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                let session_id = take_string(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event string"))?;
                 HostEvent::Session {
                     request_id,
                     session_id,
                 }
             }
             EV_MESSAGE => {
-                let session_id = take_string(payload, &mut offset).unwrap_or_default();
-                let message_type = take_u32(payload, &mut offset).unwrap_or(0);
-                let slot = take_u32(payload, &mut offset).unwrap_or(0);
-                let message_offset = take_u32(payload, &mut offset).unwrap_or(0);
-                let size = take_u32(payload, &mut offset).unwrap_or(0);
-                let data = self.read_slot_vec(slot, message_offset as usize + size as usize);
+                let session_id = take_string(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event string"))?;
+                let message_type = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                let slot = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                let message_offset = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                let size = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                let data = self.read_slot_vec(slot, message_offset as usize + size as usize)?;
                 let data = data[message_offset as usize..].to_vec();
+                self.socket
+                    .write_all(&frame(CMD_RELEASE, &slot.to_le_bytes()))?;
                 HostEvent::Message {
                     session_id,
                     message_type,
@@ -568,56 +637,78 @@ impl CdmHost {
                 }
             }
             EV_KEYS => {
-                let session_id = take_string(payload, &mut offset).unwrap_or_default();
-                let count = take_u32(payload, &mut offset).unwrap_or(0);
+                let session_id = take_string(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event string"))?;
+                let count = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                if count as usize > (payload.len() - offset) / 8 {
+                    return Err(CdmHostError::Protocol("invalid key status count"));
+                }
                 let mut keys = Vec::new();
                 for _ in 0..count {
-                    let size = take_u32(payload, &mut offset).unwrap_or(0) as usize;
+                    let size = take_u32(payload, &mut offset)
+                        .ok_or(CdmHostError::Protocol("truncated event integer"))?
+                        as usize;
                     if offset + size > payload.len() {
-                        break;
+                        return Err(CdmHostError::Protocol("truncated key id"));
                     }
                     let key_id = payload[offset..offset + size].to_vec();
                     offset += size;
-                    let status = take_u32(payload, &mut offset).unwrap_or(0);
+                    let status = take_u32(payload, &mut offset)
+                        .ok_or(CdmHostError::Protocol("truncated event integer"))?;
                     keys.push(KeyStatus { key_id, status });
                 }
                 HostEvent::Keys { session_id, keys }
             }
             EV_EXPIRATION => {
-                let session_id = take_string(payload, &mut offset).unwrap_or_default();
+                let session_id = take_string(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event string"))?;
                 let mut raw = [0u8; 8];
-                if offset + 8 <= payload.len() {
-                    raw.copy_from_slice(&payload[offset..offset + 8]);
+                if offset + 8 > payload.len() {
+                    return Err(CdmHostError::Protocol("truncated event timestamp"));
                 }
+                raw.copy_from_slice(&payload[offset..offset + 8]);
                 HostEvent::Expiration {
                     session_id,
                     expiry: f64::from_bits(u64::from_le_bytes(raw)),
                 }
             }
             EV_SESSION_CLOSED => HostEvent::SessionClosed {
-                session_id: take_string(payload, &mut offset).unwrap_or_default(),
+                session_id: take_string(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event string"))?,
             },
             EV_FRAME => {
                 let mut info = FrameInfo::default();
-                info.format = take_u32(payload, &mut offset).unwrap_or(0);
-                info.width = take_u32(payload, &mut offset).unwrap_or(0);
-                info.height = take_u32(payload, &mut offset).unwrap_or(0);
-                info.slot = take_u32(payload, &mut offset).unwrap_or(0);
-                info.size = take_u32(payload, &mut offset).unwrap_or(0);
-                info.stride_y = take_u32(payload, &mut offset).unwrap_or(0);
-                info.stride_u = take_u32(payload, &mut offset).unwrap_or(0);
-                info.stride_v = take_u32(payload, &mut offset).unwrap_or(0);
-                info.offset_u = take_u32(payload, &mut offset).unwrap_or(0);
-                info.offset_v = take_u32(payload, &mut offset).unwrap_or(0);
+                info.format = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.width = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.height = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.slot = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.size = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.stride_y = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.stride_u = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.stride_v = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.offset_u = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
+                info.offset_v = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated event integer"))?;
                 let mut raw = [0u8; 8];
-                if offset + 8 <= payload.len() {
-                    raw.copy_from_slice(&payload[offset..offset + 8]);
+                if offset + 8 > payload.len() {
+                    return Err(CdmHostError::Protocol("truncated event timestamp"));
                 }
+                raw.copy_from_slice(&payload[offset..offset + 8]);
                 info.timestamp = i64::from_le_bytes(raw);
                 HostEvent::Frame(info)
             }
             other => HostEvent::Unknown(other),
-        }
+        })
     }
 
     pub fn slot_size(&self) -> u32 {
@@ -626,6 +717,12 @@ impl CdmHost {
 
     pub fn region_size(&self) -> usize {
         self.region_size
+    }
+}
+
+impl Drop for CdmHost {
+    fn drop(&mut self) {
+        let _ = self.socket.write_all(&frame(CMD_SHUTDOWN, &[]));
     }
 }
 
@@ -686,6 +783,9 @@ pub fn read_frame(socket: &mut Socket) -> Result<(u32, Vec<u8>)> {
     let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     let kind = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
     let length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    if length > 16 * 1024 * 1024 {
+        return Err(CdmHostError::Protocol("control frame too large"));
+    }
     if magic != WVH_MAGIC {
         return Err(CdmHostError::Protocol("bad frame magic"));
     }

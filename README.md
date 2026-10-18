@@ -172,6 +172,14 @@ profile is progressive 8-bit 4:2:0 AVC and AAC-LC mono/stereo; VP9, AV1, Opus,
 HE-AAC and `avc3` are rejected. Ordinary MP4 input must fit the media core's 8 MiB
 bound; MSE handles separate bounded initialization/media segments.
 
+The Vulkan profile also enables the experimental Widevine L3 EME bridge.
+CDM operations run on a serial worker and use a separate Linux-view host
+process over a control socket and shared memory. The user supplies the CDM;
+its binary is absent from Myrica releases. This W2 integration covers temporary
+sessions and licence/key-status negotiation. Encrypted sample delivery to the
+media decoder is the subsequent W3 stage. Setup and native validation are
+recorded in [the encrypted-media roadmap](docs/encrypted-media-roadmap.md).
+
 The native coordinated scene, Ganesh context, video-plane upload, final page
 images and submission fences run on a separate compositing run loop. The UI
 acquires completed shared BGRA images and returns their leases through an

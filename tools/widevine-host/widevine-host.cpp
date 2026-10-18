@@ -557,6 +557,11 @@ class CdmHost final : public cdm::Host_10 {
       log_line("no free slot for session message");
       return;
     }
+    if (message_size > options_.slot_size || (message_size && !message)) {
+      slots_.release(static_cast<uint32_t>(slot));
+      log_line("invalid session message size");
+      return;
+    }
     if (message != nullptr && message_size > 0) {
       memcpy(region_.slot(static_cast<uint32_t>(slot)), message, message_size);
     }
@@ -569,6 +574,11 @@ class CdmHost final : public cdm::Host_10 {
     append_u32(&payload, 0);
     append_u32(&payload, message_size);
     events_.push_event(WVH_EV_MESSAGE, payload);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      message_sessions_.insert(id);
+    }
+    state_cv_.notify_all();
   }
 
   void OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
@@ -601,7 +611,10 @@ class CdmHost final : public cdm::Host_10 {
     }
     std::vector<uint8_t> payload;
     append_string(&payload, id);
-    append_u64(&payload, static_cast<uint64_t>(new_expiry_time));
+    uint64_t expiry_bits;
+    static_assert(sizeof(expiry_bits) == sizeof(new_expiry_time));
+    std::memcpy(&expiry_bits, &new_expiry_time, sizeof(expiry_bits));
+    append_u64(&payload, expiry_bits);
     events_.push_event(WVH_EV_EXPIRATION, payload);
   }
 
@@ -669,7 +682,9 @@ class CdmHost final : public cdm::Host_10 {
     std::unique_lock<std::mutex> lock(state_mutex_);
     const bool ready = state_cv_.wait_for(
         lock, std::chrono::seconds(options_.wait_seconds), [this, request_id]() {
-          return sessions_.count(request_id) != 0 || rejected_.count(request_id) != 0;
+          auto session = sessions_.find(request_id);
+          return (session != sessions_.end() && message_sessions_.count(session->second))
+              || rejected_.count(request_id) != 0;
         });
     if (!ready || rejected_.count(request_id) != 0) {
       return false;
@@ -718,6 +733,7 @@ class CdmHost final : public cdm::Host_10 {
   bool init_success_ = false;
   std::map<uint32_t, std::string> sessions_;
   std::set<uint32_t> resolved_;
+  std::set<std::string> message_sessions_;
   std::map<uint32_t, std::string> rejected_;
 };
 

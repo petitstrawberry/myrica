@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "cdm-host"
+version = "0.1.0"
+dependencies = [
+ "scarlet-os",
+ "scarlet-sys",
+]
+
+[[package]]
 name = "scarlet-abi"
 version = "1.0.0"
 source = "git+https://github.com/petitstrawberry/Scarlet?rev=d3b1c05127d4df3616f988b81a99f616e8a88064#d3b1c05127d4df3616f988b81a99f616e8a88064"
@@ -28,6 +36,5 @@ dependencies = [
 name = "widevine-host-client"
 version = "0.1.0"
 dependencies = [
- "scarlet-os",
- "scarlet-sys",
+ "cdm-host",
 ]

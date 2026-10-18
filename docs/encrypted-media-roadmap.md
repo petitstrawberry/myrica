@@ -178,3 +178,78 @@ myrica:
 Scarlet:
 - user/lib/scarlet-codecs/src/media.rs, user/lib/scarlet-codecs/Cargo.toml
 - user/lib/sunset/Cargo.toml (aes / ctr の実績)
+
+## W2 統合作業 (2026-10-18)
+
+`feature/widevine-eme` の W0/W1 と Rust ブリッジを
+`feature/webkit-backend` へマージした。WebKit fork の未公開コミット
+`6a69964b` は `scarlet` に push し、その上に接続修正を積んだ。
+
+- `ENABLE_ENCRYPTED_MEDIA` を明示的に切り替え可能にし、Myrica の
+  `encrypted-media` feature → `build-webkit.py --eme` を接続。
+- `CDMFactory` / `CDMProxyFactory` の登録、`ImplementationType::Scarlet`、
+  Page の `MediaKeySystemClient` を追加。大文字のキーシステム名、
+  ハードウェア保護、永続セッション、cbcs の要求は対応対象から外す。
+- CDM の spawn / initialize / session / update / close は WebKit の
+  serial `WorkQueue` で実行し、EME completion を元の Page owner の
+  `RunLoop` へ戻す。ライセンス HTTP はページ自身の `fetch()` が担当する。
+- C++ の関数名を Rust が実際に export する `cdm_host_*` に統一。
+  `create_session` は初回メッセージ種別を返し、同じメッセージを
+  イベントキューに重ねて入れない。CDM ABI の persistent-license は 1。
+- ネイティブクライアントは要求メッセージをコピーした後に共有スロットを
+  `RELEASE`。ホストは session id と初回 message の両方が配送キューに
+  入ってから成功応答する。共有範囲・復号出力サイズを検証し、spawn 失敗や
+  client drop でもマッピングを解放する。
+- 既存 CLI が IPC 実装を重複して持っていたため `cdm-host` を使用する形に
+  揃えた。`--sessions N` でスロット数を超える連続作成・close を検証する。
+  間違って追跡されていた Cargo target / Python bytecode は管理対象から除外。
+
+W2 の実機テストは `tests/eme-widevine.html` と既存の
+`webkit-smoke URL --eme-only` を使う。ユーザーが用意した CDM とホストを
+所定のパスへ置き、必要なら `MYRICA_WIDEVINE_HOST` /
+`MYRICA_WIDEVINE_CDM` / `MYRICA_WIDEVINE_LD_PATH` を設定する。
+この fixture は secure context が必要。配信はホスト側の既存サーバーを使う:
+
+```sh
+# ホスト
+python3 tests/webkit_server.py --port 18769
+# QEMU ゲスト。HTTP の localhost をホストの fixture サーバーへルーティング。
+# HTTPS の MPD / ライセンス通信は通常の経路を使う。
+export http_proxy=http://10.0.2.2:18769
+webkit-smoke http://localhost:18769/eme-widevine.html --eme-only
+unset http_proxy
+```
+
+検証用 HTTP proxy はゲストの環境変数だけで指定し、製品コードの
+TLS 検証・secure context 判定には変更を加えない。サーバーは localhost に
+bind し、固定 fixture のみを返す。CDM バイナリは配信しない。
+Shaka Sintel の公開 MPD/PSSH とライセンスサービスを用い、拒否すべき設定、
+6 セッションの初回メッセージ 1 回・ライセンス更新・usable キー・close を検査する。
+CDM バイナリやライセンス応答をリポジトリ・配布物には含めない。
+
+ここまでの検証: Scarlet 向け C++ syntax check、`cdm-host` の
+`aarch64-unknown-scarlet` check、Linux aarch64 のホストビルドと実 CDM の
+初期要求配送、Myrica の回帰テスト 77 件が成功。
+EME 有効の全体 Release ビルドも成功。
+メディアの encrypted イベント / CENC メタデータ / 復号・デコーダ接続は W3。
+
+追加実測: HVF の通常 init / snapshot ディスク上で、ネイティブ CLI が
+`cdm-host` ライブラリを直接使用して `--sessions 6` を完走した。
+各要求の message は 1 件、1676〜1677 bytes、4 個の共有スロットを再利用。
+6 回とも close が成功し、ホストは status=0 で終了した。
+共有領域のレイアウト・制御フレーム長・イベントの欠損検証を加えた版でも
+同じ 6 回のテストが成功した。実行記録は `/tmp/myrica-eme-serial.log`。
+
+ブラウザ W2 の実測も成功 (WebKit pin `0e54210968a303fc1954c78333f2667dbc116c70`)。
+通常 init / HVF / native video 有効の QEMU で、ホスト配信した fixture が
+`secureContext=true`、6 回すべて `messages=1, usable=5` を返した。
+大文字キーシステム名・HW 保護・CDM 内デコード・永続ライセンス・cbcs の
+5 設定は `NotSupportedError`。`stage=widevine-eme` と
+`stage=owner-joined` の両方が PASS、子ホストも status=0 で終了。
+初期の localhost 検証ではゲスト内 fixture の配置漏れで 404 を見ていた。
+ホスト配信に統一して解消した。
+
+残る W3: MSE の暗号化メタデータと `encrypted` イベント、MediaKeys の
+プレイヤー接続、復号後の Scarlet デコーダ入力。更新応答外に発生する
+CDM の更新要求・期限・鍵状態変更も独立したイベント受信が必要。
+初回ライセンス往復の成功は、これらの動作を保証しない。
