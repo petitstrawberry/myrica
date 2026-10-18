@@ -124,13 +124,11 @@ W0 実施記録 (2026-10-16):
 - 実測で判明した Linux ABI の注意: SharedMemory の fd に対する fstat は失敗するため、ホストは呼び出し側が渡すレイアウトを正とする。spawn では標準入出力も明示的に map しないと子の出力が届かない (handle map に 0/1/2 を入れる)。
 - ライセンス往復の実測 (2026-10-18 完了): Shaka の Sintel Widevine アセット (storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd) から取り出した 167 バイトの PSSH で、CDM は 1797 バイトのライセンス要求を生成した。コンテナのクライアントは TLS を持たないため、ホスト側の license-relay.py が HTTPS 終端として cwip-shaka-proxy.appspot.com/no_auth に転送し、1229 バイトの応答を返した。UPDATE_SESSION は status=0、CDM は 5 つの鍵を usable (status=0) として報告した。実際のブラウザ統合ではページの fetch() がライセンス POST を行うため、ブラウザ側にライセンス用のネットワーク実装は不要になる。
 - 実データでの復号 (2026-10-18 完了): Axinom の v7-MultiDRM-SingleKey テストベクタ (dash.js のサンプルが公開している X-AxDRM-Message トークンを使用) で、テンポラリセッションに鍵が 1 つ usable として入り、音声サンプル (341 バイト、サブサンプルなし) が kSuccess で復号された。映像サンプルでは、単一の暗号化領域を指定したときに先頭 NAL 長 (755 バイト) がバイト一致で復元された。誤った鍵 ID では kNoKey が返るため、成功は鍵に基づいている。
-- 重要な制約: この CDM ビルドは、サブサンプルマップが 2 件以上ある Decrypt 要求に kNoKey を返す。複数 NAL の映像サンプルは Decrypt では復号できないため、映像は DecryptAndDecode (VideoDecoder / VideoFrame コールバック) 経由にする必要がある。Chromium が音声に Decrypt、映像に DecryptAndDecode を使う分担と一致し、W3 の前提がこれで確定した。
-- CENC 解析の知見 (scarlet-codecs に持ち込む): stsd は 8 バイト、encv は 78 バイト、enca は 28 バイトのヘッダの後に子ボックスが並ぶ。tenc にはパターン用バイトを含む 24 バイトのレイアウト (Shaka Packager など) と含まない旧レイアウトがあり、ボックスサイズで判別できる。senc は IV (tenc の default_Per_Sample_IV_Size、通常 8 バイト) とサブサンプル対 (clear, cipher) を持ち、サンプル位置は trun の data_offset から求まる。参照実装は tools/widevine-host/test/extract-sample.py。
-- 映像経路の実測 (2026-10-18, 途中): この CDM ビルドでは DecryptAndDecodeFrame がフレームを返さない。クリアな H.264 (avcC 付き、増加するタイムスタンプ、512x288 High) を DecryptAndDecodeFrame に流しても全サンプルが kNeedMoreData のままだった。Decrypt はサブサンプルマップが 2 件以上で kNoKey、1 件なら成功する。サブサンプルごとに 1 件ずつの Decrypt 要求に分割する方式は、2 番目の NAL を単独で復号して NAL 長 6264 が復元できたことから「各暗号化領域は同じ IV で独立に復号できる」という観測に基づいて実装した。96 サンプル中 80 件は成功したが 16 件が kNoKey (単独実行でも再現)。映像の復号検証 (ffmpeg による参照デコード) は未実施。
-- 映像復号の検証 (2026-10-18): サブサンプル単位に分割した Decrypt (各暗号化領域で同じ IV を使う) で Axinom セグメントの 96 サンプルを復号し、ffmpeg で再生したところ 2.0 秒地点のフレームが正しい絵 (Blender/Axinom のテスト映像、オーバーレイに H.264 High Profile 512x288 と表示) として復号できた。この方式の復号自体は正しい。ただしこの CDM は 96 サンプル中 16 件で不安定で、ある実行では kSuccess を返しながら出力をゼロで埋め、別の実行では同じサンプルに kNoKey を返す。DecryptAndDecodeFrame はクリアな H.264 でも一切フレームを返さない。
-- 映像経路の結論 (暫定): この ChromeOS 向け CDM ビルドは映像の復号・デコード経路が我々の環境では信頼できない。設計としては「サブサンプル単位の Decrypt + Scarlet 側デコーダ」が正しい形なので、次は別の CDM ビルド (Chrome for Linux arm64 など) で同じ経路を比較する。ClearKey 経路はこの影響を受けない。
-- 映像経路の選択肢: (a) 別の CDM ビルド (Chrome for Linux arm64 など) で同じ経路を試す、(b) サンプル全体が 1 つの暗号化領域であるストリームを対象にする (Decrypt がそのまま使える)、(c) 映像は ClearKey 経路に限定する。
-- W1/W2 の橋渡し (2026-10-18): tools/widevine-host-client をライブラリ (cdm_host) と CLI に分割し、aarch64-unknown-scarlet でのビルドを確認した。ライブラリは共有メモリと socketpair の作成、linux-aarch64 ビューのホスト起動 (stdio を 0..2、socket を 3、共有メモリを 4 に map)、HELLO/READY、initialize / create_session / update_session / close_session / decrypt / shutdown を提供する。decrypt はサブサンプル単位に分割して同じ IV で呼び、ゼロ埋めの成功は 1 回だけ再試行する。
+- W1 の初期診断の訂正 (2026-10-18): サブサンプルを同じ IV で個別に復号する方式を採用し、96 サンプル中 16 件の NoKey / ゼロ出力を CDM の不安定性と判断していた。この判断と「映像は DecryptAndDecode が必須」という結論を撤回する。Chromium CDM API は全暗号化領域を連結した一つのストリームとして扱い、クリア領域を復号入力から除外する契約である。単一フレームの参照表示だけでは、旧方式の正当性は確認できていなかった。
+- 現在の復号方式: 各暗号化領域を順に連結し、単一の `{clear=0, cipher=合計}` で CDM の Decrypt を一度呼ぶ。結果を元のサブサンプル位置へ戻し、クリア部分を保存する。IV はサンプルにつき一度使う。ゼロ出力の再試行は削除した。同じ CDM 4.10.2662.3 で、従来停止した Sintel の区間を Scarlet 実機で連続デコードできた。別ビルドの CDM への交換は不要だった。
+- DecryptAndDecodeFrame の単体試験は過去の診断であり、現在の映像経路には使わない。CDM は圧縮サンプルの復号、Scarlet `/dev/video0` が映像デコードを担当する。
+- コンテナ解析: Symphonia fork が `sinf` / `tenc` とフラグメント内 `senc` を読み、KID・IV・サブサンプル対を packet に対応させる。`stsd` のクリア用/暗号化用エントリはフラグメントの sample description index で選ぶ。`moov` 内の PSSH は一つの cenc init data にまとめる。
+- W1/W2 の橋渡し (2026-10-18): `crates/cdm-host` は共有メモリと socketpair、linux-aarch64 ホスト起動 (stdio 0..2、socket 3、共有メモリ 4)、初期化・セッション・復号・終了を提供する。制御応答の途中で届く非同期イベントを保持し、部分的なソケットフレームも次のポーリングへ引き継ぐ。
 - W2 の接続方針: WebKit 側の CDMPrivate / CDMInstance / CDMInstanceSession は、ScarletWebView C ABI に追加する関数 (create / destroy / initialize / create_session / update_session / close_session / decrypt / take_event) 経由でこのライブラリを呼ぶ。init data は InitDataRegistry、ライセンス POST はページの fetch() が担当するため、ブラウザ側にライセンス用ネットワークは不要。
 
 W0 (規模: 小) Linux ビューでの実証。Debian glibc ビューで libwidevinecdm.so を dlopen し、CDM の初期化とライセンス往復 (テスト用ライセンスサーバ) の可否を確認する。Linux ABI のギャップ (epoll スタブ、fcntl の F_DUPFD 欠落、シグナル簡易実装、auxv/TLS 整合) をここで洗い出す。最大の未知はここ。
@@ -253,3 +251,103 @@ EME 有効の全体 Release ビルドも成功。
 プレイヤー接続、復号後の Scarlet デコーダ入力。更新応答外に発生する
 CDM の更新要求・期限・鍵状態変更も独立したイベント受信が必要。
 初回ライセンス往復の成功は、これらの動作を保証しない。
+
+
+## W3 メディア接続と実測 (2026-10-18)
+
+WebKit `d92a622857607509cad2b6c9d0589c586610600d`、scarlet-codecs
+`13cc8cff3c3a1ce02c51daff75ff60959563bfab`、Symphonia
+`5865b5d0e5d170d1e0419684c04e8268847a9d2d` を使用。
+MSE の PSSH が WebCore の `encrypted` イベントへ届き、ページの fetch が
+ライセンスを取得する。MediaKeys の共有接続をメディアワーカーが保持し、
+CENC メタデータ付き圧縮 packet を CDM に渡す。復号後だけ既存の
+H.264/AAC デコーダへ渡す。WebCore の Page / compositor は CDM IPC を待たない。
+
+鍵未到着時は packet とキューのバイト予算を保持する。同じ鍵世代での
+復号再試行を止め、新しい鍵状態または MediaKeys の付け替えで再開する。
+再生クロックは未復号 packet の PTS で止めるため、それ以前のデコード済み
+フレームやクリアリードを再生できる。非同期の license message と鍵状態は
+CDM WorkQueue で受信し、Page owner の標準 WebKit コールバックへ戻す。
+通信エラー時はイベントポーリングを停止する。
+
+HVF、通常 init、Linux ABI view の同じ CDM 4.10.2662.3、native video 有効で
+ホスト配信した `tests/eme-widevine-playback.html` を Release ビルドで実行した。
+
+| 入力 | ライセンス | 再生位置 / デコードフレーム | 結果 |
+| --- | --- | --- | --- |
+| Sintel 12〜16 秒、暗号化フラグメントのみ | message 1、usable 5 | 15.790664 秒 / 94 | PASS |
+| Sintel 20〜24 秒、暗号化フラグメントのみ | message 1、usable 5 | 23.805997 秒 / 94 | PASS |
+| 0〜16 秒、12 秒のクリアリードから暗号化へ遷移 | message 1、usable 5 | 15.791012 秒 / 382 | PASS |
+
+暗号化フラグメントのみの試験は、クリアリードを再生して成功したと数える
+ことを避ける。合格条件は最後の 0.25 秒以内まで再生し、4 秒区間で 90 枚以上、
+16 秒区間で 378 枚以上をデコードすること。`?segment=20` と
+`?segment=clear-lead` で入力を選べる。自動試験は DOM の状態とデコーダの
+フレーム数を検査する。画面の画素比較と音声付き暗号化コンテンツは未検証。
+
+検証用 HTTP サーバーはホスト側で実行する。
+
+```sh
+python3 tests/webkit_server.py --port 18770 --log /tmp/myrica-eme-http.jsonl
+```
+
+ゲストは `http_proxy=http://10.0.2.2:18770` を設定し、
+`webkit-smoke http://localhost:18770/eme-widevine-playback.html --eme-only`
+を実行する。localhost の secure context を通常の HTTP proxy 経由で
+ホスト fixture に到達させる方式で、製品の TLS・origin 判定は変更しない。
+CDM の配置は既存の `MYRICA_WIDEVINE_HOST` / `MYRICA_WIDEVINE_CDM` /
+`MYRICA_WIDEVINE_LD_PATH` に従う。
+
+他の検証: scarlet-codecs の通常 MP4 テスト、実 CENC fixture の 257 バイトずつの
+増分入力 (clear 288 / encrypted 96 samples)、Symphonia の CENC / timeline
+テスト、media_bridge の 28 テストが成功。Myrica / Vulkan probe / smoke の
+Scarlet 向け Release ビルドが成功した。
+
+残作業: `seig` によるフラグメント内鍵切替、非フラグメント暗号化 MP4、
+`moov` 外 PSSH、暗号化音声との同期、再生中のシーク・鍵待ちの反復検証。
+`seig`、cbcs/pattern encryption、保護された非フラグメント MP4 は明示的に拒否する。
+非同期 expiry / spontaneous close の DOM 通知、ホスト異常終了のメディア通知、
+ホスト内タイマーの単一スレッド化も残る。現在のホストの SetTimer は別スレッドで
+TimerExpired を呼ぶため、要求ループ上の CDM 呼び出しとの競合を解消する必要がある。
+実サービスごとの VMP / 出力保護要件への適合はこの fixture 試験の対象外。
+
+
+### 公開 Shaka デモへの接続
+
+MediaCapabilities の暗号化設定と `keySystemAccess` を上流 WebKit の
+`NavigatorEME` へ接続した。Scarlet の codec 判定には既存の
+`MediaPlayer::supportsType` を使う。性能測定に基づかない `smooth` /
+`powerEfficient` の成功は返さない。Page 設定で MediaCapabilities を有効にした。
+Widevine の service certificate も CDM の serial WorkQueue へ渡す。
+
+実機の W2 fixture は clear / encrypted MediaCapabilities、未対応 robustness の
+拒否、公開 service certificate の適用、6 セッションすべての
+`messages=1, usable=5, close` と `owner-joined` を検査して PASS した。
+セッションの終了後、GC から空の session id を HashMap に渡す不具合も修正した。
+
+通常 Myrica で `https://shaka-project.github.io/shaka-player-release/demo/`
+を直接開き、公開 Sintel Widevine MPD と `cwip-shaka-proxy.appspot.com/no_auth`
+のライセンスを使用した。ライセンス要求 1 回、usable キー 5 個、
+12 秒以降の暗号化区間への遷移と native デコーダのフレーム進行を確認した。
+Shaka の正式な詳細設定で video / audio robustness を
+`SW_SECURE_CRYPTO` に指定する。Shaka の既定の映像要求
+`SW_SECURE_DECODE` は、この decrypt-only 経路の対応外である。
+
+上流の navigator.vendor が Apple のままだと、Shaka が Scarlet を
+WebKit TV/STB と判定して MediaCapabilities の別経路へ切り替えていた。
+Scarlet の vendor を `Scarlet` にした。設定変更前の `98df2c09` 版で
+上記再生を確認し、vendor 修正を含む `d92a6228` 版は Release ビルド済み。
+`SCARLET_WEBVIEW_PROFILE` 有効時には、実際に復号した圧縮サンプルの数と
+バイト数を最初の 1 回と 128 サンプルごとに表示する。
+鍵・ライセンス応答・映像データはログへ出さない。
+
+対話試験中のシーク・別アセット切替付近で、native video の
+RESOURCE_QUEUE エラーと古い CDM 制御接続の終了を観測した。
+操作と自動計測が重なったため、ABR 単独の障害とは判定していない。
+その後に選ばれた別の動画は、追加の Widevine 要求がなく、
+その再生結果は暗号化コンテンツの成功件数に含めない。
+Amazon Prime Video / Netflix など実サービスのライセンス条件は未検証。
+
+通常バンドルの `/bin/myrica` は、検証用 `/shared/myrica-eme-98df` と
+異なる旧 pin のまま起動した記録がある。二つの実行ファイルを混同して
+DRM 判定サイトの結果を評価しない。通常バンドルの更新は次の反映作業。

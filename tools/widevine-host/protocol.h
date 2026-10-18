@@ -26,6 +26,7 @@ enum {
   WVH_CMD_RELEASE = 9,
   WVH_CMD_CONFIGURE_VIDEO = 10,
   WVH_CMD_DECODE = 11,
+  WVH_CMD_SET_SERVER_CERTIFICATE = 12, /* request_id, certificate blob */
 };
 
 /* Host to client. */

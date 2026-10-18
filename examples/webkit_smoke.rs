@@ -1448,6 +1448,11 @@ fn video_page_probe_inner(
     engine.navigate(url).map_err(|error| error.to_string())?;
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut progress = Instant::now();
+    let minimum_play_seconds = std::env::var("MYRICA_VIDEO_MIN_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 10.0 && *value <= 90.0)
+        .unwrap_or(10.0);
     let mut gesture_sent = false;
     let mut start_time = None;
     let mut first_frame = None;
@@ -1487,7 +1492,7 @@ fn video_page_probe_inner(
                     }
                     gesture_sent = true;
                 }
-                if statistics.current_time >= start_time.unwrap_or(0.0) + 10.0
+                if statistics.current_time >= start_time.unwrap_or(0.0) + minimum_play_seconds
                     && statistics.decoded_frames >= 24
                     && statistics.presented_frames >= initial_presented + 8
                 {

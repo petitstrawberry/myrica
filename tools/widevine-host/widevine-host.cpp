@@ -1140,6 +1140,20 @@ void serve(int client_fd, const Options& options, CdmHost& host, EventSink& even
         push_result(events, 0, host.init_success() ? WVH_OK : WVH_ERROR, 0, 0);
         break;
       }
+      case WVH_CMD_SET_SERVER_CERTIFICATE: {
+        Reader body{payload.data(), payload.size(), 0};
+        uint32_t request_id = 0;
+        std::vector<uint8_t> certificate;
+        if (!body.u32(&request_id) || !body.blob(&certificate) || certificate.empty()) {
+          push_result(events, request_id, WVH_ERROR, 0, 0);
+          break;
+        }
+        cdm->SetServerCertificate(request_id, certificate.data(),
+                                  static_cast<uint32_t>(certificate.size()));
+        push_result(events, request_id,
+                    host.wait_promise(request_id) ? WVH_OK : WVH_ERROR, 0, 0);
+        break;
+      }
       case WVH_CMD_CREATE_SESSION: {
         Reader body{payload.data(), payload.size(), 0};
         wvh_create_session request;

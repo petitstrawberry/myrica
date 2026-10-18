@@ -31,11 +31,36 @@
             if (!rejected) throw new Error('Unsupported configuration accepted: ' + name);
             state.rejected.push(name); report();
         }
+        state.stage = 'media-capabilities'; report();
+        const decoding = {type: 'media-source', video: {
+            contentType: config.videoCapabilities[0].contentType,
+            width: 256, height: 110, bitrate: 100000, framerate: 24
+        }};
+        const keySystemConfiguration = {
+            keySystem: 'com.widevine.alpha', initDataType: 'cenc',
+            distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed', sessionTypes: ['temporary'],
+            video: {robustness: 'SW_SECURE_CRYPTO', encryptionScheme: 'cenc'}
+        };
+        const clearInfo = await navigator.mediaCapabilities.decodingInfo(decoding);
+        if (!clearInfo.supported || clearInfo.keySystemAccess !== null)
+            throw new Error('Clear MediaCapabilities mismatch');
+        const encryptedInfo = await navigator.mediaCapabilities.decodingInfo({...decoding, keySystemConfiguration});
+        if (!encryptedInfo.supported || encryptedInfo.keySystemAccess?.keySystem !== 'com.widevine.alpha')
+            throw new Error('Encrypted MediaCapabilities missing usable access');
+        const rejectedInfo = await navigator.mediaCapabilities.decodingInfo({...decoding,
+            keySystemConfiguration: {...keySystemConfiguration, video: {robustness: 'HW_SECURE_ALL'}}});
+        if (rejectedInfo.supported || rejectedInfo.keySystemAccess !== null)
+            throw new Error('Unsupported MediaCapabilities accepted');
+        state.mediaCapabilities = true; report();
         state.stage = 'request-access'; report();
         const access = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [config]);
         state.configuration = access.getConfiguration(); report();
         state.stage = 'create-keys'; report();
         const keys = await access.createMediaKeys();
+        const certificateResponse = await fetch('https://cwip-shaka-proxy.appspot.com/service-cert');
+        if (!certificateResponse.ok || !await keys.setServerCertificate(await certificateResponse.arrayBuffer()))
+            throw new Error('Widevine service certificate rejected');
+        state.serverCertificate = true; report();
         state.stage = 'manifest'; report();
         const manifest = await fetch('https://storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd');
         if (!manifest.ok) throw new Error('Manifest HTTP ' + manifest.status);

@@ -14,7 +14,7 @@ media = ["dep:scarlet-codecs", "dep:sas-client", "dep:scarlet-video-client"]
 encrypted-media = ["media", "vulkan-rendering", "dep:cdm-host"]
 
 [dependencies]
-scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7ea687d9139bf64d8676bad41257ba897d623bce", optional = true, default-features = false, features = ["media-container-aac"] }
+scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "13cc8cff3c3a1ce02c51daff75ff60959563bfab", optional = true, default-features = false, features = ["media-container-aac"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

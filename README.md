@@ -175,10 +175,13 @@ bound; MSE handles separate bounded initialization/media segments.
 The Vulkan profile also enables the experimental Widevine L3 EME bridge.
 CDM operations run on a serial worker and use a separate Linux-view host
 process over a control socket and shared memory. The user supplies the CDM;
-its binary is absent from Myrica releases. This W2 integration covers temporary
-sessions and licence/key-status negotiation. Encrypted sample delivery to the
-media decoder is the subsequent W3 stage. Setup and native validation are
-recorded in [the encrypted-media roadmap](docs/encrypted-media-roadmap.md).
+its binary is absent from Myrica releases. Temporary sessions, licence/key-status
+negotiation and fragmented CENC AVC playback are connected. Container PSSH and
+sample encryption metadata pass through WebCore; the media worker decrypts
+compressed packets through the host before Scarlet decoding. Missing keys retain
+the packet until MediaKeys supplies a new key revision. Setup, native validation
+and remaining format/session limits are recorded in
+[the encrypted-media roadmap](docs/encrypted-media-roadmap.md).
 
 The native coordinated scene, Ganesh context, video-plane upload, final page
 images and submission fences run on a separate compositing run loop. The UI

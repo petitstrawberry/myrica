@@ -3,8 +3,9 @@
 //! The CDM itself runs inside a Linux ABI view; the fork-side CDM
 //! implementation (CDMFactoryScarlet and friends) calls these functions from
 //! the Scarlet-native browser process.
-//! Calls on a handle must be serialized on the CDM WorkQueue. Returned buffer
-//! ownership may move to the Page owner for delivery and release.
+//! Control calls run on the CDM WorkQueue. Shared state serializes them with
+//! media-worker decryption; the media session retains that state independently
+//! of the C handle. Returned buffers may move to the Page owner for delivery.
 //!
 //! Conventions:
 //! - Status is 0 on success. Negative values are bridge-level errors:
@@ -14,6 +15,8 @@
 //! - Packed payloads use the layouts from tools/widevine-host/protocol.h.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cdm_host::{CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, Subsample};
 
@@ -52,8 +55,40 @@ impl CdmBuffer {
 
 /// One widevine-host process plus the events it produced.
 pub struct CdmHandle {
+    pub(crate) shared: Arc<CdmShared>,
+}
+
+pub(crate) struct CdmShared {
+    state: Mutex<CdmState>,
+    revision: AtomicU64,
+    poll_failed: AtomicBool,
+}
+struct CdmState {
     host: CdmHost,
     events: VecDeque<(u32, Vec<u8>)>,
+    decrypted_samples: u64,
+    decrypted_bytes: u64,
+}
+impl CdmShared {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    pub(crate) fn decrypt(&self, request: &DecryptRequest<'_>) -> Result<Vec<u8>, CdmHostError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let clear = state.host.decrypt(request)?;
+        state.decrypted_samples += 1;
+        state.decrypted_bytes += clear.len() as u64;
+        static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PROFILE.get_or_init(|| std::env::var_os("SCARLET_WEBVIEW_PROFILE").is_some())
+            && (state.decrypted_samples == 1 || state.decrypted_samples % 128 == 0)
+        {
+            eprintln!(
+                "SCARLET_CDM_DECRYPT samples={} compressed_bytes={} decoder=scarlet-native",
+                state.decrypted_samples, state.decrypted_bytes
+            );
+        }
+        Ok(clear)
+    }
 }
 
 fn status_of(error: CdmHostError) -> i32 {
@@ -166,8 +201,16 @@ pub extern "C" fn cdm_host_create(
 
     match CdmHost::spawn(&options) {
         Ok(host) => Box::into_raw(Box::new(CdmHandle {
-            host,
-            events: VecDeque::new(),
+            shared: Arc::new(CdmShared {
+                state: Mutex::new(CdmState {
+                    host,
+                    events: VecDeque::new(),
+                    decrypted_samples: 0,
+                    decrypted_bytes: 0,
+                }),
+                revision: AtomicU64::new(1),
+                poll_failed: AtomicBool::new(false),
+            }),
         })),
         Err(error) => {
             eprintln!("cdm_host_create failed: {error:?}");
@@ -182,8 +225,7 @@ pub extern "C" fn cdm_host_destroy(handle: *mut CdmHandle) {
         return;
     }
     // SAFETY: the pointer came from cdm_host_create and is consumed once.
-    let boxed = unsafe { Box::from_raw(handle) };
-    boxed.host.shutdown();
+    drop(unsafe { Box::from_raw(handle) });
 }
 
 #[unsafe(no_mangle)]
@@ -193,14 +235,43 @@ pub extern "C" fn cdm_host_initialize(
     allow_persistent_state: u32,
     use_hw_secure_codecs: u32,
 ) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match state.host.initialize(
         allow_distinctive_identifier != 0,
         allow_persistent_state != 0,
         use_hw_secure_codecs != 0,
     ) {
+        Ok(()) => STATUS_OK,
+        Err(error) => status_of(error),
+    }
+}
+
+/// Install a user-provided Widevine service certificate on the serial host.
+#[unsafe(no_mangle)]
+pub extern "C" fn cdm_host_set_server_certificate(
+    handle: *mut CdmHandle,
+    certificate: Bytes,
+) -> i32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return STATUS_ERROR;
+    };
+    if certificate.data.is_null() || certificate.length == 0 || certificate.length > 1024 * 1024 {
+        return STATUS_PROTOCOL;
+    }
+    let certificate = unsafe { view(certificate) };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match state.host.set_server_certificate(&certificate) {
         Ok(()) => STATUS_OK,
         Err(error) => status_of(error),
     }
@@ -220,9 +291,14 @@ pub extern "C" fn cdm_host_create_session(
     out_session_id: *mut CdmBuffer,
     out_message: *mut CdmBuffer,
 ) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SAFETY: native callers pass readable init data for the call.
     let init_data = unsafe { view(init_data) };
     let mut events = Vec::new();
@@ -282,9 +358,14 @@ pub extern "C" fn cdm_host_update_session(
     response: Bytes,
     out_keys: *mut CdmBuffer,
 ) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SAFETY: native callers pass readable buffers for the call.
     let session_id = String::from_utf8_lossy(&unsafe { view(session_id) }).into_owned();
     // SAFETY: same contract as above.
@@ -295,6 +376,7 @@ pub extern "C" fn cdm_host_update_session(
         .update_session(&session_id, &response, &mut events)
     {
         Ok(keys) => {
+            handle.shared.revision.fetch_add(1, Ordering::Release);
             let mut packed = Vec::new();
             pack_u32(&mut packed, keys.len() as u32);
             for key in &keys {
@@ -303,6 +385,9 @@ pub extern "C" fn cdm_host_update_session(
                 pack_u32(&mut packed, key.status);
             }
             for event in &events {
+                if matches!(event, HostEvent::Keys { session_id: id, .. } if id == &session_id) {
+                    continue;
+                }
                 let encoded = encode_event(event);
                 if encoded.0 != 0 {
                     state.events.push_back(encoded);
@@ -320,13 +405,21 @@ pub extern "C" fn cdm_host_update_session(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cdm_host_close_session(handle: *mut CdmHandle, session_id: Bytes) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SAFETY: native callers pass a readable session id for the call.
     let session_id = String::from_utf8_lossy(&unsafe { view(session_id) }).into_owned();
     match state.host.close_session(&session_id) {
-        Ok(()) => STATUS_OK,
+        Ok(()) => {
+            handle.shared.revision.fetch_add(1, Ordering::Release);
+            STATUS_OK
+        }
         Err(error) => status_of(error),
     }
 }
@@ -344,9 +437,14 @@ pub extern "C" fn cdm_host_decrypt(
     timestamp: i64,
     out_plaintext: *mut CdmBuffer,
 ) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     // SAFETY: native callers pass readable buffers for the call.
     let sample = unsafe { view(sample) };
     // SAFETY: same contract as above.
@@ -394,9 +492,39 @@ pub extern "C" fn cdm_host_decrypt(
 /// event is kind, then the payload described in cdm_bridge's module comment.
 #[unsafe(no_mangle)]
 pub extern "C" fn cdm_host_take_event(handle: *mut CdmHandle, out_event: *mut CdmBuffer) -> i32 {
-    let Some(state) = (unsafe { handle.as_mut() }) else {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
         return STATUS_ERROR;
     };
+    let mut state = handle
+        .shared
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if state.events.is_empty() {
+        if handle.shared.poll_failed.load(Ordering::Acquire) {
+            return STATUS_ERROR;
+        }
+        let events = match state.host.poll_events() {
+            Ok(events) => events,
+            Err(error) => {
+                handle.shared.poll_failed.store(true, Ordering::Release);
+                eprintln!("SCARLET_CDM_EVENT_ERROR error={error:?}");
+                return status_of(error);
+            }
+        };
+        for event in events {
+            if matches!(
+                &event,
+                HostEvent::Keys { .. } | HostEvent::SessionClosed { .. }
+            ) {
+                handle.shared.revision.fetch_add(1, Ordering::Release);
+            }
+            let encoded = encode_event(&event);
+            if encoded.0 != 0 {
+                state.events.push_back(encoded);
+            }
+        }
+    }
     let Some((kind, payload)) = state.events.pop_front() else {
         return 0;
     };

@@ -8,6 +8,7 @@
 //! myrica's WebKit EME integration uses this module from the Scarlet side: the
 //! browser never loads the CDM itself.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 
 use scarlet_os::environment::{Environment, HandleMapping};
@@ -31,6 +32,7 @@ pub const CMD_SHUTDOWN: u32 = 8;
 pub const CMD_RELEASE: u32 = 9;
 pub const CMD_CONFIGURE_VIDEO: u32 = 10;
 pub const CMD_DECODE: u32 = 11;
+pub const CMD_SET_SERVER_CERTIFICATE: u32 = 12;
 
 pub const EV_READY: u32 = 100;
 pub const EV_RESULT: u32 = 101;
@@ -196,6 +198,8 @@ impl Drop for MappingGuard {
 }
 
 pub struct CdmHost {
+    incoming: Vec<u8>,
+    deferred: VecDeque<HostEvent>,
     socket: Socket,
     _mapping: MappingGuard,
     #[allow(dead_code)]
@@ -309,6 +313,8 @@ impl CdmHost {
         drop(host_socket);
 
         let mut host = Self {
+            incoming: Vec::new(),
+            deferred: VecDeque::new(),
             socket: client_socket,
             _mapping: mapping,
             memory,
@@ -324,7 +330,9 @@ impl CdmHost {
     fn handshake(&mut self) -> Result<()> {
         let hello = frame(CMD_HELLO, &WVH_VERSION.to_le_bytes());
         self.socket.write_all(&hello)?;
-        let (kind, payload) = read_frame(&mut self.socket)?;
+        let (kind, payload) = self
+            .next_frame(true)?
+            .ok_or(CdmHostError::Protocol("missing control frame"))?;
         if kind != EV_READY || payload.len() != 16 {
             return Err(CdmHostError::Protocol("unexpected READY frame"));
         }
@@ -363,6 +371,26 @@ impl CdmHost {
         }
     }
 
+    /// Install a service certificate for Widevine privacy-mode requests.
+    pub fn set_server_certificate(&mut self, certificate: &[u8]) -> Result<()> {
+        if certificate.is_empty() || certificate.len() > 1024 * 1024 {
+            return Err(CdmHostError::Protocol("invalid server certificate length"));
+        }
+        let request_id = self.take_request_id();
+        let mut payload = Vec::new();
+        push_u32(&mut payload, request_id);
+        push_u32(&mut payload, certificate.len() as u32);
+        payload.extend_from_slice(certificate);
+        self.socket
+            .write_all(&frame(CMD_SET_SERVER_CERTIFICATE, &payload))?;
+        let (status, _, _) = self.wait_result(request_id, None)?;
+        if status == STATUS_OK {
+            Ok(())
+        } else {
+            Err(CdmHostError::Status(status))
+        }
+    }
+
     /// Create a session and return its id plus the first message the CDM
     /// produced for it, which is normally the licence request.
     pub fn create_session(
@@ -387,7 +415,10 @@ impl CdmHost {
             request_id,
             Some(&mut |event: HostEvent| {
                 match &event {
-                    HostEvent::Session { session_id: id, .. } => session_id = id.clone(),
+                    HostEvent::Session {
+                        request_id: id,
+                        session_id: value,
+                    } if *id == request_id => session_id = value.clone(),
                     _ => {}
                 }
                 events.push(event);
@@ -433,7 +464,12 @@ impl CdmHost {
         let (status, _, _) = self.wait_result(
             request_id,
             Some(&mut |event: HostEvent| {
-                if let HostEvent::Keys { keys: found, .. } = &event {
+                if let HostEvent::Keys {
+                    session_id: id,
+                    keys: found,
+                } = &event
+                    && id == session_id
+                {
                     keys = found.clone();
                 }
                 events.push(event);
@@ -459,40 +495,57 @@ impl CdmHost {
         }
     }
 
-    /// Decrypt one sample. The CDM refuses a subsample map with more than one
-    /// entry, so every region is decrypted on its own with the sample IV; the
-    /// packager restarts the keystream per region, which is what makes the two
-    /// equivalent. A zero-filled success is retried once.
+    /// CENC treats the cipher bytes across all subsamples as one continuous
+    /// stream. Gather that stream for a single CDM call, then scatter the clear
+    /// result back around the original unencrypted bytes. This also avoids the
+    /// CDM's rejected multi-entry subsample path without restarting its counter.
     pub fn decrypt(&mut self, request: &DecryptRequest<'_>) -> Result<Vec<u8>> {
-        let regions: Vec<Subsample> = if request.subsamples.is_empty() {
+        if request.scheme != SCHEME_CENC {
+            return Err(CdmHostError::Status(STATUS_UNSUPPORTED));
+        }
+        let regions = if request.subsamples.is_empty() {
             vec![Subsample {
                 clear_bytes: 0,
-                cipher_bytes: request.sample.len() as u32,
+                cipher_bytes: u32::try_from(request.sample.len())
+                    .map_err(|_| CdmHostError::Protocol("sample too large"))?,
             }]
         } else {
             request.subsamples.to_vec()
         };
-
-        let mut plaintext = vec![0u8; request.sample.len()];
+        let mut cipher = Vec::new();
+        let mut ranges = Vec::new();
         let mut position = 0usize;
         for region in &regions {
-            let size = (region.clear_bytes + region.cipher_bytes) as usize;
-            if position + size > request.sample.len() {
-                return Err(CdmHostError::Protocol("subsample map exceeds the sample"));
+            let size = region.clear_bytes as usize + region.cipher_bytes as usize;
+            if size > request.sample.len().saturating_sub(position) {
+                return Err(CdmHostError::Protocol("subsample map exceeds sample"));
             }
-            if region.cipher_bytes == 0 {
-                plaintext[position..position + size]
-                    .copy_from_slice(&request.sample[position..position + size]);
-                position += size;
-                continue;
-            }
-            let chunk = &request.sample[position..position + size];
-            let mut decrypted = self.decrypt_region(chunk, region, request)?;
-            if decrypted.iter().all(|byte| *byte == 0) {
-                decrypted = self.decrypt_region(chunk, region, request)?;
-            }
-            plaintext[position..position + size].copy_from_slice(&decrypted);
-            position += size;
+            let start = position + region.clear_bytes as usize;
+            let end = position + size;
+            cipher.extend_from_slice(&request.sample[start..end]);
+            ranges.push(start..end);
+            position = end;
+        }
+        if position != request.sample.len() {
+            return Err(CdmHostError::Protocol(
+                "subsample map does not cover sample",
+            ));
+        }
+        let mut plaintext = request.sample.to_vec();
+        if cipher.is_empty() {
+            return Ok(plaintext);
+        }
+        let region = Subsample {
+            clear_bytes: 0,
+            cipher_bytes: u32::try_from(cipher.len())
+                .map_err(|_| CdmHostError::Protocol("cipher stream too large"))?,
+        };
+        let decrypted = self.decrypt_region(&cipher, &region, request)?;
+        let mut offset = 0;
+        for range in ranges {
+            let size = range.len();
+            plaintext[range].copy_from_slice(&decrypted[offset..offset + size]);
+            offset += size;
         }
         Ok(plaintext)
     }
@@ -578,7 +631,9 @@ impl CdmHost {
         mut observer: Option<&mut dyn FnMut(HostEvent)>,
     ) -> Result<(i32, u32, u32)> {
         loop {
-            let (kind, payload) = read_frame(&mut self.socket)?;
+            let (kind, payload) = self
+                .next_frame(true)?
+                .ok_or(CdmHostError::Protocol("missing control frame"))?;
             if kind == EV_RESULT {
                 let mut offset = 0usize;
                 let id = take_u32(&payload, &mut offset)
@@ -598,8 +653,73 @@ impl CdmHost {
             let event = self.decode_event(kind, &payload)?;
             if let Some(callback) = observer.as_deref_mut() {
                 callback(event);
+            } else {
+                if self.deferred.len() >= 64 {
+                    return Err(CdmHostError::Protocol("CDM event queue full"));
+                }
+                self.deferred.push_back(event);
             }
         }
+    }
+
+    /// Drain spontaneous CDM messages/key changes without waiting for another
+    /// request. Partial stream frames stay buffered for the next poll/command.
+    pub fn poll_events(&mut self) -> Result<Vec<HostEvent>> {
+        let mut events: Vec<_> = self.deferred.drain(..).collect();
+        while events.len() < 64 {
+            let Some((kind, payload)) = self.next_frame(false)? else {
+                break;
+            };
+            if kind == EV_RESULT {
+                return Err(CdmHostError::Protocol("unsolicited CDM result"));
+            }
+            events.push(self.decode_event(kind, &payload)?);
+        }
+        Ok(events)
+    }
+
+    fn next_frame(&mut self, wait: bool) -> Result<Option<(u32, Vec<u8>)>> {
+        if !wait {
+            self.socket
+                .set_nonblocking(true)
+                .map_err(|_| CdmHostError::Protocol("cannot poll CDM socket"))?;
+        }
+        let result = (|| {
+            loop {
+                if self.incoming.len() >= 16 {
+                    let header = &self.incoming[..16];
+                    if u32::from_le_bytes(header[..4].try_into().unwrap()) != WVH_MAGIC {
+                        return Err(CdmHostError::Protocol("bad frame magic"));
+                    }
+                    let kind = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                    let size = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+                    if size > 16 * 1024 * 1024 {
+                        return Err(CdmHostError::Protocol("control frame too large"));
+                    }
+                    if self.incoming.len() >= 16 + size {
+                        let payload = self.incoming[16..16 + size].to_vec();
+                        self.incoming.drain(..16 + size);
+                        return Ok(Some((kind, payload)));
+                    }
+                }
+                let mut bytes = [0; 8192];
+                match self.socket.read(&mut bytes) {
+                    Ok(0) => return Err(CdmHostError::Protocol("CDM control socket closed")),
+                    Ok(count) => self.incoming.extend_from_slice(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && !wait => {
+                        return Ok(None);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        })();
+        if !wait {
+            self.socket
+                .set_nonblocking(false)
+                .map_err(|_| CdmHostError::Protocol("cannot restore CDM socket mode"))?;
+        }
+        result
     }
 
     fn decode_event(&mut self, kind: u32, payload: &[u8]) -> Result<HostEvent> {

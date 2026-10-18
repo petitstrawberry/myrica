@@ -118,17 +118,24 @@ X-AxDRM-Message test entitlement):
   request carried a single cipher region,
 - a wrong key id returns kNoKey, so the success path is key driven.
 
-Known limit: this CDM build returns kNoKey when Decrypt carries a subsample map
-with more than one entry, so a multi-NAL video sample cannot be decrypted
-through Decrypt. Video has to go through DecryptAndDecode, which is the same
-split Chromium uses (Decrypt serves audio, the decoder callbacks serve video).
+The early probe interpreted multi-entry failures as a CDM limitation. W3
+corrected the native client's input assembly: CENC cipher bytes from every
+subsample form one continuous stream, with clear bytes excluded. The client
+gathers that stream into one Decrypt request and scatters the result into the
+original sample. Reusing the IV separately for each region was incorrect.
+The previous zero-output retry has been removed.
 
 ## Status
 
-- Working: CDM load and initialize, session creation, licence request delivery
-  through shared memory, slot release, shutdown. Verified 2026-10-17 in an
-  aarch64 Debian container with the ChromeOS CDM from
-  `~/.local/share/widevine`.
-- Not yet wired: the Scarlet-native client that spawns the host with handle
-  mappings, licence provisioning over the network, and `DECRYPT` against real
-  keys (the request path exists; a keyless call returns `WVH_NO_KEY`).
+The Scarlet-native client in `crates/cdm-host` spawns this process using handle
+mappings. WebCore delivers container init data, the page performs the licence
+exchange, and the media worker decrypts before the native `/dev/video0` decoder.
+With the same CDM 4.10.2662.3, Scarlet Release validation passed two encrypted
+four-second Sintel fragments (94 decoded frames each) and the sixteen-second
+clear-lead transition (382 frames). Details and current format/session limits
+are in [the roadmap](../../docs/encrypted-media-roadmap.md#w3-メディア接続と実測-2026-10-18).
+
+The test client's raw `--decrypt-sample` / experimental decode modes are W1
+probes of CDM API behaviour. The browser playback regression is
+`tests/eme-widevine-playback.html`, served by `tests/webkit_server.py` on the
+host and exercised by the Scarlet `webkit-smoke --eme-only` example.

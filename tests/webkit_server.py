@@ -1115,6 +1115,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             self.reply(200, "text/html; charset=utf-8", JS_EXECUTION)
         elif path == "/eme-widevine.html":
             self.reply(200, "text/html; charset=utf-8", Path(__file__).with_name("eme-widevine.html").read_bytes())
+        elif path == "/eme-widevine-playback.html":
+            self.reply(200, "text/html; charset=utf-8", Path(__file__).with_name("eme-widevine-playback.html").read_bytes())
         elif path == "/damage":
             self.reply(200, "text/html", b"<!doctype html><title>damage-ready</title><body style='margin:0'><div style='position:absolute;left:20px;top:20px;width:20px;height:20px;background:#123456' id='patch'></div><script>window.addEventListener('keydown',()=>{document.getElementById('patch').style.backgroundColor='#654321';document.title='damage-changed'})</script></body>")
         elif path == "/storage":

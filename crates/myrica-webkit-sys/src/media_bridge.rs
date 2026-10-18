@@ -4,7 +4,8 @@
 //! Acquired event/frame pointers are pinned by a lease until explicitly
 //! released. Reset and seek invalidate queued work, never an acquired lease.
 use scarlet_codecs::media::{
-    AudioDecoder, AudioFrame, Codec, ColorInfo, MediaError, Mp4Parser, ParserEvent, Sample, Track,
+    AudioDecoder, AudioFrame, Codec, ColorInfo, MediaError, Mp4Parser, ParserEvent, Sample,
+    SampleEncryption, SubsampleEncryption, Track,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::c_char;
@@ -29,6 +30,160 @@ const VIDEO_EARLY_US: i64 = 5_000;
 const OK: i32 = 0;
 const AGAIN: i32 = 1;
 const ERROR: i32 = -1;
+
+// Owned per-sample metadata crosses WebCore unchanged with its encoded bytes.
+// Layout: KID[16], IV length u32, IV, subsample count u32, (clear u32, cipher u32)*.
+fn pack_encryption(info: &SampleEncryption) -> Vec<u8> {
+    let mut data = info.key_id.to_vec();
+    data.extend_from_slice(&(info.iv.len() as u32).to_le_bytes());
+    data.extend_from_slice(&info.iv);
+    data.extend_from_slice(&(info.subsamples.len() as u32).to_le_bytes());
+    for sub in &info.subsamples {
+        data.extend_from_slice(&sub.clear_bytes.to_le_bytes());
+        data.extend_from_slice(&sub.encrypted_bytes.to_le_bytes());
+    }
+    data
+}
+
+fn unpack_encryption(data: &[u8], sample_size: usize) -> Result<Option<SampleEncryption>, ()> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let word = |position: usize| -> Result<u32, ()> {
+        Ok(u32::from_le_bytes(
+            data.get(position..position + 4)
+                .ok_or(())?
+                .try_into()
+                .map_err(|_| ())?,
+        ))
+    };
+    let key_id = data.get(..16).ok_or(())?.try_into().map_err(|_| ())?;
+    let iv_size = word(16)? as usize;
+    if !matches!(iv_size, 8 | 16) {
+        return Err(());
+    }
+    let iv = data.get(20..20 + iv_size).ok_or(())?.to_vec();
+    let count = word(20 + iv_size)? as usize;
+    let start = 24 + iv_size;
+    if count > 65535 || data.len() != start + count * 8 {
+        return Err(());
+    }
+    let mut subsamples = Vec::new();
+    let mut total = 0u64;
+    for index in 0..count {
+        let clear_bytes = word(start + index * 8)?;
+        let encrypted_bytes = word(start + index * 8 + 4)?;
+        total += u64::from(clear_bytes) + u64::from(encrypted_bytes);
+        subsamples.push(SubsampleEncryption {
+            clear_bytes,
+            encrypted_bytes,
+        });
+    }
+    if count != 0 && total != sample_size as u64 {
+        return Err(());
+    }
+    Ok(Some(SampleEncryption {
+        key_id,
+        iv,
+        subsamples,
+    }))
+}
+
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+type AttachedCdm = Arc<crate::cdm_bridge::CdmShared>;
+#[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
+type AttachedCdm = ();
+
+fn attached_cdm(state: &SessionState) -> Option<AttachedCdm> {
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    {
+        state.cdm.clone()
+    }
+    #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
+    {
+        let _ = state;
+        None
+    }
+}
+fn key_revision(cdm: &Option<AttachedCdm>) -> (usize, u64) {
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    {
+        cdm.as_ref()
+            .map(|cdm| (Arc::as_ptr(cdm) as usize, cdm.revision()))
+            .unwrap_or_default()
+    }
+    #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
+    {
+        let _ = cdm;
+        (0, 0)
+    }
+}
+
+// AGAIN retains the encrypted packet until MediaKeys or a new key revision
+// arrives. Neither WebCore nor the compositor waits for the host process.
+fn decrypt_sample(cdm: &Option<AttachedCdm>, sample: &mut Sample) -> Result<(), i32> {
+    let Some(info) = &sample.encryption else {
+        return Ok(());
+    };
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    {
+        let Some(cdm) = cdm else {
+            return Err(AGAIN);
+        };
+        let subsamples: Vec<_> = info
+            .subsamples
+            .iter()
+            .map(|sub| cdm_host::Subsample {
+                clear_bytes: sub.clear_bytes,
+                cipher_bytes: sub.encrypted_bytes,
+            })
+            .collect();
+        let request = cdm_host::DecryptRequest {
+            sample: &sample.data,
+            key_id: &info.key_id,
+            iv: &info.iv,
+            subsamples: &subsamples,
+            scheme: 1,
+            timestamp: sample.pts_us,
+        };
+        match cdm.decrypt(&request) {
+            Ok(clear) if clear.len() == sample.data.len() => {
+                sample.data = clear;
+                sample.encryption = None;
+                Ok(())
+            }
+            Err(cdm_host::CdmHostError::Status(cdm_host::STATUS_NO_KEY)) => Err(AGAIN),
+            Err(error) => {
+                eprintln!("SCARLET_MEDIA_ERROR stage=decrypt error={error:?}");
+                Err(ERROR)
+            }
+            Ok(_) => {
+                eprintln!("SCARLET_MEDIA_ERROR stage=decrypt invalid-output-length");
+                Err(ERROR)
+            }
+        }
+    }
+    #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
+    {
+        let _ = (cdm, info);
+        Err(AGAIN)
+    }
+}
+
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn scarlet_media_session_set_cdm(
+    session: *mut MediaSession,
+    handle: *const crate::cdm_bridge::CdmHandle,
+) {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return;
+    };
+    let cdm = unsafe { handle.as_ref() }.map(|handle| handle.shared.clone());
+    let mut state = lock(&session.shared.state);
+    state.cdm = cdm;
+    session.shared.wake.notify_all();
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -56,6 +211,8 @@ pub struct MediaSample {
     pub reserved: u32,
     pub data: *const u8,
     pub size: usize,
+    pub encryption: *const u8,
+    pub encryption_size: usize,
 }
 
 #[repr(C)]
@@ -97,6 +254,7 @@ pub struct MediaStatus {
     pub ended: u32,
     pub ready_state: u32,
     pub error: i32,
+    pub waiting_for_key: u32,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -124,6 +282,7 @@ struct PlaybackClock {
     playing: bool,
     audio_master: bool,
     ready: bool,
+    key_block: Option<f64>,
 }
 
 impl PlaybackClock {
@@ -134,16 +293,29 @@ impl PlaybackClock {
             playing: false,
             audio_master: false,
             ready: false,
+            key_block: None,
         }
     }
     fn now(&self) -> f64 {
         self.at(Instant::now())
     }
     fn at(&self, instant: Instant) -> f64 {
-        if self.playing && self.ready && !self.audio_master {
+        let seconds = if self.playing && self.ready && !self.audio_master {
             self.seconds + instant.saturating_duration_since(self.anchor).as_secs_f64()
         } else {
             self.seconds
+        };
+        self.key_block.map_or(seconds, |limit| seconds.min(limit))
+    }
+    fn block_for_key(&mut self, seconds: f64) {
+        let limit = seconds.max(self.now());
+        self.key_block = Some(self.key_block.map_or(limit, |previous| previous.min(limit)));
+    }
+    fn clear_key_block(&mut self) {
+        if self.key_block.is_some() {
+            self.seconds = self.now();
+            self.anchor = Instant::now();
+            self.key_block = None;
         }
     }
     fn set_playing(&mut self, playing: bool) {
@@ -155,6 +327,7 @@ impl PlaybackClock {
         self.seconds = seconds;
         self.anchor = Instant::now();
         self.ready = false;
+        self.key_block = None;
     }
     fn mark_ready(&mut self) {
         if !self.ready {
@@ -190,17 +363,19 @@ enum ParseInput {
 }
 
 struct ParseOutput {
+    encryption: Vec<u8>,
     append: u64,
     result: Result<Option<ParserEvent>, ()>,
 }
 
 impl ParseOutput {
     fn size(&self) -> usize {
-        match &self.result {
+        (match &self.result {
             Ok(Some(ParserEvent::Track(track))) => track.extradata.len(),
+            Ok(Some(ParserEvent::InitializationData(data))) => data.len(),
             Ok(Some(ParserEvent::Sample(sample))) => sample.data.len(),
             _ => 0,
-        }
+        }) + self.encryption.len()
     }
 }
 
@@ -225,7 +400,12 @@ pub struct MediaParser {
     worker: Option<JoinHandle<()>>,
 }
 
-fn publish_parser(shared: &ParserShared, generation: u64, output: ParseOutput) -> bool {
+fn publish_parser(shared: &ParserShared, generation: u64, mut output: ParseOutput) -> bool {
+    if let Ok(Some(ParserEvent::Sample(sample))) = &output.result {
+        if let Some(encryption) = &sample.encryption {
+            output.encryption = pack_encryption(encryption);
+        }
+    }
     let size = output.size();
     let mut state = lock(&shared.state);
     while !state.stopping
@@ -292,6 +472,7 @@ fn parser_worker(shared: &ParserShared) {
             shared,
             generation,
             ParseOutput {
+                encryption: Vec::new(),
                 append,
                 result: if success { Ok(None) } else { Err(()) },
             },
@@ -312,6 +493,7 @@ fn drain_parser(
                     shared,
                     generation,
                     ParseOutput {
+                        encryption: Vec::new(),
                         append,
                         result: Ok(Some(event)),
                     },
@@ -353,6 +535,8 @@ fn sample_view(sample: &Sample) -> MediaSample {
         reserved: 0,
         data: sample.data.as_ptr(),
         size: sample.data.len(),
+        encryption: std::ptr::null(),
+        encryption_size: 0,
     }
 }
 
@@ -380,6 +564,8 @@ fn empty_sample() -> MediaSample {
         reserved: 0,
         data: std::ptr::null(),
         size: 0,
+        encryption: std::ptr::null(),
+        encryption_size: 0,
     }
 }
 
@@ -657,6 +843,13 @@ pub unsafe extern "C" fn scarlet_media_parser_poll(
         Ok(Some(ParserEvent::Sample(sample))) => {
             output.kind = 2;
             output.sample = sample_view(sample);
+            output.sample.encryption = event.encryption.as_ptr();
+            output.sample.encryption_size = event.encryption.len();
+        }
+        Ok(Some(ParserEvent::InitializationData(data))) => {
+            output.kind = 5;
+            output.sample.data = data.as_ptr();
+            output.sample.size = data.len();
         }
         Ok(None) => output.kind = 3,
         Err(()) => {
@@ -698,6 +891,7 @@ impl DecoderResetReason {
 }
 
 struct SessionTrack {
+    blocked_on_key: Option<(usize, u64)>,
     track: Track,
     generation: u64,
     reset_reason: DecoderResetReason,
@@ -706,6 +900,14 @@ struct SessionTrack {
     drained: bool,
     media_end_seconds: f64,
     cancellation: Arc<AtomicBool>,
+}
+
+fn sample_bytes(sample: &Sample) -> usize {
+    sample.data.len()
+        + sample
+            .encryption
+            .as_ref()
+            .map_or(0, |info| 24 + info.iv.len() + info.subsamples.len() * 8)
 }
 
 struct QueuedSample {
@@ -721,6 +923,8 @@ struct AudioProgress {
 }
 
 struct SessionState {
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    cdm: Option<Arc<crate::cdm_bridge::CdmShared>>,
     generation: u64,
     next_track_generation: u64,
     audio_generation: u64,
@@ -1222,7 +1426,18 @@ fn session_worker(shared: &SessionShared) {
         let queued_video = state.video.len();
         let audio_capacity = state.audio_bytes < MAX_AUDIO_BYTES && state.audio_seconds < 0.25;
         let state_audio_seconds = state.audio_seconds;
+        let cdm = attached_cdm(&state);
+        let revision = key_revision(&cdm);
+        state.status.waiting_for_key = u32::from(
+            state
+                .tracks
+                .values()
+                .any(|track| track.blocked_on_key == Some(revision)),
+        );
         let candidates = state.tracks.iter().filter_map(|(&id, track)| {
+            if track.blocked_on_key == Some(revision) {
+                return None;
+            }
             let has_sample = !track.samples.is_empty();
             if !has_sample && !(track.ended && !track.drained) {
                 return None;
@@ -1264,12 +1479,59 @@ fn session_worker(shared: &SessionShared) {
                 )
             },
         );
-        if let Some((id, generation, track, cancellation, reason, sample, reserved)) = work {
+        if let Some((id, generation, track, cancellation, reason, mut sample, reserved)) = work {
             last_decoded_track = Some(id);
             if let Some(sample) = &sample {
-                state.input_bytes -= sample.sample.data.len();
+                state.input_bytes -= sample_bytes(&sample.sample);
             }
             drop(state);
+            if let Some(packet) = &mut sample {
+                if let Err(result) = decrypt_sample(&cdm, &mut packet.sample) {
+                    let mut state = lock(&shared.state);
+                    if state
+                        .tracks
+                        .get(&id)
+                        .is_some_and(|track| track.generation == generation)
+                    {
+                        if result == AGAIN {
+                            let packet = sample.take().unwrap();
+                            state.input_bytes += sample_bytes(&packet.sample);
+                            let track = state.tracks.get_mut(&id).unwrap();
+                            track.samples.push_front(packet);
+                            track.blocked_on_key = Some(revision);
+                            if media_profile_enabled() {
+                                eprintln!(
+                                    "SCARLET_MEDIA_KEY_WAIT track={id} pts_us={} revision={}",
+                                    track.samples.front().unwrap().sample.pts_us,
+                                    revision.1
+                                );
+                            }
+                            let blocked_time =
+                                track.samples.front().unwrap().sample.pts_us as f64 / 1_000_000.0;
+                            state.status.waiting_for_key = 1;
+                            state.clock.block_for_key(blocked_time);
+                        } else {
+                            state.status.error = ERROR;
+                        }
+                    }
+                    continue;
+                }
+            }
+            {
+                let mut state = lock(&shared.state);
+                if let Some(track) = state.tracks.get_mut(&id)
+                    && track.generation == generation
+                {
+                    track.blocked_on_key = None;
+                }
+                if state
+                    .tracks
+                    .values()
+                    .all(|track| track.blocked_on_key.is_none())
+                {
+                    state.clock.clear_key_block();
+                }
+            }
             if decoders
                 .get(&id)
                 .is_none_or(|current| current.generation != generation)
@@ -1474,6 +1736,8 @@ fn session_worker(shared: &SessionShared) {
 fn new_session_shared() -> Arc<SessionShared> {
     Arc::new(SessionShared {
         state: Mutex::new(SessionState {
+            #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+            cdm: None,
             generation: 1,
             next_track_generation: 1,
             audio_generation: 1,
@@ -1629,7 +1893,7 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
         state.input_bytes -= old
             .samples
             .iter()
-            .map(|sample| sample.sample.data.len())
+            .map(|sample| sample_bytes(&sample.sample))
             .sum::<usize>();
     }
     if track.codec == Codec::H264 {
@@ -1644,6 +1908,7 @@ pub unsafe extern "C" fn scarlet_media_session_configure(
     state.tracks.insert(
         track.id,
         SessionTrack {
+            blocked_on_key: None,
             track,
             generation,
             reset_reason: DecoderResetReason::Configure,
@@ -1690,7 +1955,11 @@ pub unsafe extern "C" fn scarlet_media_session_enqueue(
     if sample.size > 4 * 1024 * 1024 {
         return ERROR;
     }
-    if state.input_bytes + sample.size > MAX_INPUT_BYTES
+    if state
+        .input_bytes
+        .saturating_add(sample.size)
+        .saturating_add(sample.encryption_size)
+        > MAX_INPUT_BYTES
         || track.samples.len() >= MAX_COMPRESSED_SAMPLES
     {
         return AGAIN;
@@ -1698,7 +1967,13 @@ pub unsafe extern "C" fn scarlet_media_session_enqueue(
     let Ok(data) = (unsafe { copy_bytes(sample.data, sample.size, 4 * 1024 * 1024) }) else {
         return ERROR;
     };
-    state.input_bytes += data.len();
+    let Ok(encryption) =
+        (unsafe { copy_bytes(sample.encryption, sample.encryption_size, 1024 * 1024) })
+            .and_then(|data| unpack_encryption(&data, sample.size))
+    else {
+        return ERROR;
+    };
+    state.input_bytes += data.len() + sample.encryption_size;
     let track = state
         .tracks
         .get_mut(&(sample.track as u32))
@@ -1707,6 +1982,7 @@ pub unsafe extern "C" fn scarlet_media_session_enqueue(
     track.drained = false;
     track.samples.push_back(QueuedSample {
         sample: Sample {
+            encryption,
             track_id: sample.track as u32,
             data,
             pts_us: sample.presentation_us,
@@ -1756,9 +2032,10 @@ pub unsafe extern "C" fn scarlet_media_session_flush(session: *mut MediaSession,
         let bytes = track
             .samples
             .iter()
-            .map(|sample| sample.sample.data.len())
+            .map(|sample| sample_bytes(&sample.sample))
             .sum::<usize>();
         track.samples.clear();
+        track.blocked_on_key = None;
         track.ended = false;
         track.drained = false;
         track.cancellation.store(true, Ordering::Release);
@@ -1796,7 +2073,7 @@ pub unsafe extern "C" fn scarlet_media_session_remove_track(
     state.input_bytes -= removed
         .samples
         .iter()
-        .map(|sample| sample.sample.data.len())
+        .map(|sample| sample_bytes(&sample.sample))
         .sum::<usize>();
     if removed.track.codec == Codec::H264 {
         state.video.clear();
@@ -1919,6 +2196,7 @@ pub unsafe extern "C" fn scarlet_media_session_seek(session: *mut MediaSession, 
             let mut generation = state.next_track_generation;
             for track in state.tracks.values_mut() {
                 track.samples.clear();
+                track.blocked_on_key = None;
                 track.ended = false;
                 track.drained = false;
                 track.cancellation.store(true, Ordering::Release);
@@ -2618,6 +2896,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn encrypted_sample_metadata_is_bounded_and_exact() {
+        let info = SampleEncryption {
+            key_id: [7; 16],
+            iv: vec![8; 8],
+            subsamples: vec![
+                SubsampleEncryption {
+                    clear_bytes: 5,
+                    encrypted_bytes: 27,
+                },
+                SubsampleEncryption {
+                    clear_bytes: 3,
+                    encrypted_bytes: 11,
+                },
+            ],
+        };
+        let packed = pack_encryption(&info);
+        assert_eq!(unpack_encryption(&packed, 46), Ok(Some(info)));
+        assert!(unpack_encryption(&packed, 45).is_err());
+        assert!(unpack_encryption(&packed[..packed.len() - 1], 46).is_err());
+        let mut malformed = packed.clone();
+        malformed[16..20].copy_from_slice(&7u32.to_le_bytes());
+        assert!(unpack_encryption(&malformed, 46).is_err());
+        let mut malformed = packed;
+        malformed[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(unpack_encryption(&malformed, 46).is_err());
+        assert_eq!(unpack_encryption(&[], 46), Ok(None));
+    }
+
+    #[test]
+    fn missing_keys_retain_encrypted_payload_without_decoder_submission() {
+        let mut sample = Sample {
+            track_id: 1,
+            data: vec![9; 32],
+            pts_us: 0,
+            dts_us: 0,
+            duration_us: 40_000,
+            keyframe: true,
+            encryption: Some(SampleEncryption {
+                key_id: [7; 16],
+                iv: vec![8; 16],
+                subsamples: vec![],
+            }),
+        };
+        let encrypted = sample.data.clone();
+        assert_eq!(decrypt_sample(&None, &mut sample), Err(AGAIN));
+        assert_eq!(sample.data, encrypted);
+        assert!(sample.encryption.is_some());
+        assert_eq!(sample_bytes(&sample), 32 + 24 + 16);
+    }
+
+    #[test]
+    fn key_wait_drains_preceding_pictures_and_stops_at_the_missing_packet() {
+        let mut clock = PlaybackClock::new();
+        clock.seek(12.0);
+        clock.mark_ready();
+        clock.set_playing(true);
+        let anchor = clock.anchor;
+        clock.block_for_key(12.1);
+        assert!((clock.at(anchor + Duration::from_millis(50)) - 12.05).abs() < 0.001);
+        assert_eq!(clock.at(anchor + Duration::from_secs(10)), 12.1);
+        clock.anchor = Instant::now() - Duration::from_secs(10);
+        clock.clear_key_block();
+        assert!((clock.now() - 12.1).abs() < 0.001);
+        assert!(clock.at(clock.anchor + Duration::from_millis(50)) > 12.14);
+        clock.block_for_key(12.2);
+        clock.seek(0.0);
+        assert!(clock.key_block.is_none());
+    }
+
+    #[test]
     fn presentation_queue_keeps_latest_due_and_all_future_output() {
         let mut queue = VecDeque::from([0, 10_000, 20_000, 40_000]);
         assert_eq!(coalesce_due_frames(&mut queue, true, 25_000, |pts| *pts), 2);
@@ -3236,6 +3584,7 @@ mod tests {
         track.channels = 2;
         track.duration = 30.0;
         let sample = Sample {
+            encryption: None,
             track_id: 1,
             data: vec![7; 32],
             pts_us: 0,
@@ -3259,6 +3608,7 @@ mod tests {
             assert_eq!(lock(&shared.state).input_bytes, MAX_COMPRESSED_SAMPLES * 32);
             scarlet_media_session_flush(session, 1);
             let large = Sample {
+                encryption: None,
                 data: vec![9; 4 * 1024 * 1024],
                 ..sample
             };
@@ -3285,12 +3635,12 @@ mod tests {
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<MediaTrack>(), 56);
         assert_eq!(offset_of!(MediaTrack, duration), 32);
-        assert_eq!(size_of::<MediaSample>(), 56);
+        assert_eq!(size_of::<MediaSample>(), 72);
         assert_eq!(offset_of!(MediaSample, data), 40);
-        assert_eq!(size_of::<MediaParserEvent>(), 136);
+        assert_eq!(size_of::<MediaParserEvent>(), 152);
         assert_eq!(size_of::<MediaFrame>(), 120);
         assert_eq!(offset_of!(MediaFrame, planes), 48);
-        assert_eq!(size_of::<MediaStatus>(), 56);
+        assert_eq!(size_of::<MediaStatus>(), 64);
     }
 
     /// Real MP4 demux plus the production configure/enqueue ABI. No decoder or
@@ -3324,6 +3674,7 @@ mod tests {
         let mut track_id = 0;
         while let Some(event) = parser.next_event().unwrap() {
             match event {
+                ParserEvent::InitializationData(_) => panic!("unexpected encrypted clear fixture"),
                 ParserEvent::Track(track) => {
                     track_id = track.id;
                     assert_eq!(
@@ -3480,6 +3831,7 @@ mod tests {
                 match event.kind {
                     1 => track = Some(unsafe { owned_track(&event.track) }.unwrap()),
                     2 => samples.push(Sample {
+                        encryption: None,
                         track_id: event.sample.track as u32,
                         data: unsafe {
                             copy_bytes(event.sample.data, event.sample.size, MAX_INPUT_BYTES)

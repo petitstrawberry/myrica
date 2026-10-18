@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>eme-running</title>
+<video id="video" controls muted width="512" height="220"></video>
+<pre id="eme-state">Starting…</pre>
+<script>
+(async () => {
+    const video = document.getElementById('video');
+    const state = {secureContext: isSecureContext, encrypted: 0, messages: 0, usable: 0};
+    const report = () => document.getElementById('eme-state').textContent = JSON.stringify(state);
+    let fail;
+    const failure = new Promise((_, reject) => { fail = reject; });
+    const wait = (target, name) => Promise.race([new Promise(resolve => target.addEventListener(name, resolve, {once: true})), failure]);
+    const timeout = setTimeout(() => fail(new Error('Encrypted playback timeout')), 60000);
+    video.addEventListener('error', () => fail(new Error('Video error ' + video.error?.code + ': ' + video.error?.message)));
+    video.addEventListener('waitingforkey', () => { state.waitingForKey = (state.waitingForKey || 0) + 1; report(); });
+    video.addEventListener('waiting', () => { state.waiting = (state.waiting || 0) + 1; report(); });
+    const mode = new URLSearchParams(location.search).get('segment');
+    const segment = mode === '20'
+        ? {start: 340308, end: 374404, time: 20, duration: 4, frames: 90}
+        : mode === 'clear-lead'
+        ? {start: 3933, end: 310015, time: 0, duration: 16, frames: 378}
+        : {start: 278144, end: 310015, time: 12, duration: 4, frames: 90};
+    state.segment = segment.time;
+    const sessions = [];
+    let keys;
+    video.addEventListener('encrypted', async event => {
+        try {
+            ++state.encrypted;
+            if (event.initDataType !== 'cenc') throw new Error('Unexpected init data type');
+            const session = keys.createSession(); sessions.push(session);
+            session.addEventListener('keystatuseschange', () => {
+                state.usable = 0;
+                for (const session of sessions) session.keyStatuses.forEach(status => { if (status === 'usable') ++state.usable; });
+                report();
+            });
+            session.addEventListener('message', async message => {
+                try {
+                    ++state.messages; report();
+                    const response = await fetch('https://cwip-shaka-proxy.appspot.com/no_auth', {method: 'POST', body: message.message});
+                    if (!response.ok) throw new Error('Licence HTTP ' + response.status);
+                    await session.update(await response.arrayBuffer());
+                } catch (error) { fail(error); }
+            });
+            await session.generateRequest(event.initDataType, event.initData); report();
+        } catch (error) { fail(error); }
+    });
+    try {
+        if (!isSecureContext) throw new Error('Secure context required');
+        const access = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [{
+            initDataTypes: ['cenc'], sessionTypes: ['temporary'],
+            distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed',
+            videoCapabilities: [{contentType: 'video/mp4; codecs="avc1.42c01e"', robustness: 'SW_SECURE_CRYPTO', encryptionScheme: 'cenc'}]
+        }]);
+        keys = await access.createMediaKeys(); await video.setMediaKeys(keys);
+        const source = new MediaSource();
+        const opened = wait(source, 'sourceopen');
+        video.src = URL.createObjectURL(source); await opened;
+        const buffer = source.addSourceBuffer('video/mp4; codecs="avc1.42c01e"');
+        const url = 'https://storage.googleapis.com/shaka-demo-assets/sintel-widevine/v-0144p-0100k-libx264.mp4';
+        const appendRange = async (start, end) => {
+            const response = await fetch(url, {headers: {Range: 'bytes=' + start + '-' + end}});
+            if (response.status !== 206) throw new Error('Range HTTP ' + response.status);
+            const bytes = await response.arrayBuffer();
+            if (bytes.byteLength !== end - start + 1) throw new Error('Range length mismatch');
+            const appended = wait(buffer, 'updateend'); buffer.appendBuffer(bytes); await appended;
+        };
+        state.stage = 'initialization'; report(); await appendRange(0, 1236);
+        // Default: encrypted fourth fragment only. clear-lead also checks the transition.
+        state.stage = 'encrypted-fragment'; report(); await appendRange(segment.start, segment.end);
+        source.duration = segment.time + segment.duration; source.endOfStream();
+        state.buffered = [buffer.buffered.start(0), buffer.buffered.end(0)];
+        state.stage = 'play'; report();
+        video.currentTime = segment.time;
+        await Promise.race([video.play(), failure]);
+        while (true) {
+            await Promise.race([new Promise(resolve => setTimeout(resolve, 100)), failure]);
+            state.time = video.currentTime; state.ready = video.readyState; state.paused = video.paused;
+            state.width = video.videoWidth; state.height = video.videoHeight;
+            state.decoded = video.getVideoPlaybackQuality().totalVideoFrames;
+            report();
+            if (state.encrypted && state.usable && state.decoded >= segment.frames && state.time >= segment.time + segment.duration - 0.25) break;
+        }
+        video.pause(); await video.setMediaKeys(null);
+        for (const session of sessions) await session.close();
+        state.ok = true; report(); document.title = 'eme-pass';
+    } catch (error) {
+        state.ok = false; state.error = String(error); report(); document.title = 'eme-fail';
+    } finally { clearTimeout(timeout); }
+})();
+</script>
