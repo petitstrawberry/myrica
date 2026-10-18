@@ -8,6 +8,9 @@ mod native_memory;
 #[cfg(all(target_os = "scarlet", feature = "media"))]
 mod media_bridge;
 
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+mod cdm_bridge;
+
 use std::ffi::c_int;
 
 pub const ABI_VERSION: u32 = 1;

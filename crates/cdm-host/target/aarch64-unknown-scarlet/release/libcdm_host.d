@@ -1,0 +1,1 @@
+/Users/petitstrawberry/Development/Rust/myrica.worktrees/widevine-cdm/crates/cdm-host/target/aarch64-unknown-scarlet/release/libcdm_host.rlib: /Users/petitstrawberry/Development/Rust/myrica.worktrees/widevine-cdm/crates/cdm-host/src/lib.rs

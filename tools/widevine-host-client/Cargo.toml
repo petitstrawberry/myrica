@@ -5,10 +5,6 @@ edition = "2024"
 description = "Scarlet-native client for the widevine-host CDM service process"
 license = "MIT"
 
-[lib]
-name = "cdm_host"
-path = "src/lib.rs"
-
 [[bin]]
 name = "widevine-host-client"
 path = "src/main.rs"
