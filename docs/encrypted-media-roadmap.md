@@ -420,3 +420,45 @@ QMP の読み取りで CPU 0 が `rust_begin_unwind` 内の停止ループ
 元の Canvas 無反応との関連は未確定。カーネル修正はまだ行っていない。
 ユーザー指示で再起動し、HVF / VirGL / native video を維持して
 通常イメージのコピーから復帰した。HTTP で同じ診断版と CDM host の環境を復元した。
+
+
+### Canvas と入力表示の更新欠落の修正 (2026-10-18)
+
+WebKit `cb9e9527` で、Skia Canvas2D の delegated display 通知を
+`RenderLayerBacking` の CanvasPixels 更新へ接続した。
+Scarlet は `USE(SKIA)=1`、WebGL / OffscreenCanvas は無効のため、従来の
+WebGL / OffscreenCanvas のみの条件では Canvas の更新通知が消えていた。
+この版を native `/bin/myrica` に HTTP 転送し、ユーザー操作で
+Amazon のパズルがクリックに反応することを確認した。
+
+続く文字・入力表示の更新欠落は、別の非同期合成の競合だった。
+新しい DOM タイルを worker が記録中でも、video / async scroll の
+composition-only フレームが DOM damage を先に消費していた。
+WebKit `a462f289` はこの damage を RenderingUpdate のタイル commit まで保持する。
+スクロール位置の更新は、既存の position damage を使う。
+調査用に一時導入した source / tile pixel readback は除去済み。
+
+WebKit `55677b5184c7af6b7c723c2a50d3a11c67d69b7b` を使う Scarlet Release 版で、
+以下を HVF / VirGL の検証 VM 内で実行した。
+
+- `webkit-vulkan-probe --canvas-input`: DPR2 の native trusted click の座標、
+  GPU / willReadFrequently Canvas の赤→緑、native 文字入力 ABC の入力欄と
+  DOM テキストへの反映を、実際の GPU 出力の readback で確認した。
+- `webkit-vulkan-probe --compositor-only`: CSS blur / drop-shadow、transform / opacity、
+  小・大スクロールのタイル再利用と露出描画、idle の不要描画なし、navigation / resize
+  と生存中 lease、DPR2 filter 境界、pending cover の隠蔽・再表示が通った。
+- 両コマンドの初期チェックで TLS / errno の 4 thread 分離、Skia Vulkan の
+  create / draw / readback / destroy 3 周、I420 / NV12 色変換と video presentation
+  feedback の GPU テストも通った。
+
+引数なしの旧 probe は「2 lease で capacity=0」を前提としており、現在の
+3 slot 出力と一致せず停止する。上記の独立したテストを実行した結果であり、
+旧 probe 全体の成功は記録していない。
+
+ユーザーはログイン後の Prime Video 作品画面まで進んだが、再生ボタンを
+押しても画面が変わらないと報告した。稼働中のウィンドウは paint profile 無効の
+ため、EME 要求ログの不在から EME 未到達を推論しない。
+WebKit `55677b51` は `SCARLET_EME_TRACE=1` 単独で capability 要求と
+key-system / configuration の受理・拒否を記録できる。
+フォーム値・ライセンス・鍵は記録しない。新しい process の cookie は既存 process
+と共有されないため、ログイン中のウィンドウを保持して次の診断を行う。

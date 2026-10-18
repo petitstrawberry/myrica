@@ -92,6 +92,14 @@ fn gpu_page_contract() -> Result<(), String> {
         )?;
         let mut pending_teardown = false;
         let result = (|| {
+            if std::env::args().any(|argument| argument == "--canvas-input") {
+                return canvas_input_contract(view);
+            }
+            if std::env::args().any(|argument| argument == "--compositor-only") {
+                compositor_page_contract(view)?;
+                filter_bounds_contract(view)?;
+                return pending_cover_boundary_contract(view);
+            }
             let location = "https://myrica.test/gpu-contract";
             check(
                 ffi::scarlet_webview_navigate(view, ffi::Bytes::from_str(location)),
@@ -901,6 +909,160 @@ unsafe fn settle_contract_composition(
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[cfg(feature = "backend-webkit-vulkan")]
+unsafe fn canvas_input_contract(
+    view: *mut myrica_webkit_sys::ScarletWebView,
+) -> Result<(), String> {
+    use myrica_webkit_sys as ffi;
+    check(
+        unsafe { ffi::scarlet_webview_resize(view, 1280, 960, 2.0) },
+        "resize canvas input fixture",
+    )?;
+    for frequent_readback in [false, true] {
+        let html = format!(
+            r#"<!doctype html><meta charset="utf-8"><title>canvas-loading</title>
+<style>html,body{{margin:0;background:white}}canvas{{position:absolute;left:80px;top:80px;width:324px;height:324px}}
+input,#typed{{position:absolute;left:80px;width:324px;height:48px;font:32px sans-serif;color:black;background:white;border:0;outline:0;caret-color:transparent;padding:0}}input{{top:8px}}#typed{{top:420px}}</style>
+<input aria-label="fixture editor"><span id="typed"></span><canvas width="324" height="324"></canvas><script>
+document.querySelector('input').addEventListener('input',event=>document.getElementById('typed').textContent=event.target.value);
+const canvas=document.querySelector('canvas');
+const context=canvas.getContext('2d',{{willReadFrequently:{frequent_readback}}});
+context.fillStyle='red';context.fillRect(0,0,324,324);
+document.title='canvas-ready-{frequent_readback}';
+canvas.addEventListener('click',event=>{{
+ context.fillStyle='lime';context.fillRect(0,0,324,324);
+ document.title='canvas-clicked:'+event.isTrusted+':'+event.offsetX+':'+event.offsetY;
+ console.log('CANVAS_INPUT_FIXTURE_CLICK readback={frequent_readback} '+document.title);
+}});
+</script>"#
+        );
+        let location = format!("https://myrica.test/canvas-input-{frequent_readback}");
+        unsafe { contract_navigation(view, &location, &html) }?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            check(
+                unsafe { ffi::scarlet_webview_tick(view) },
+                "tick canvas load",
+            )?;
+            let mut state = ffi::State::default();
+            check(
+                unsafe { ffi::scarlet_webview_state(view, &mut state) },
+                "canvas load state",
+            )?;
+            let title = if state.title.length == 0 {
+                String::new()
+            } else {
+                String::from_utf8_lossy(unsafe {
+                    std::slice::from_raw_parts(state.title.data, state.title.length)
+                })
+                .into_owned()
+            };
+            if title == format!("canvas-ready-{frequent_readback}") {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("canvas fixture did not load: {title}"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (initial, _) = unsafe {
+            await_contract_frame(view, |pixels, width| {
+                contract_pixel(pixels, width, 200, 200, [255, 0, 0, 255])
+            })
+        }?;
+        drop(initial);
+        // ABI input positions are physical pixels; the DOM rectangle is CSS.
+        unsafe { click_fixture(view, 240.0, 240.0) }?;
+        let (updated, _) = unsafe {
+            await_contract_frame(view, |pixels, width| {
+                contract_pixel(pixels, width, 200, 200, [0, 255, 0, 255])
+            })
+        }?;
+        let mut state = ffi::State::default();
+        check(
+            unsafe { ffi::scarlet_webview_state(view, &mut state) },
+            "canvas input state",
+        )?;
+        let title = if state.title.length == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(unsafe {
+                std::slice::from_raw_parts(state.title.data, state.title.length)
+            })
+            .into_owned()
+        };
+        if title != "canvas-clicked:true:40:40" {
+            return Err(format!("native canvas click event mismatch: {title}"));
+        }
+        drop(updated);
+        check(
+            unsafe { ffi::scarlet_webview_focus(view, 1) },
+            "focus editor fixture",
+        )?;
+        unsafe { click_fixture(view, 240.0, 64.0) }?;
+        for text in ["A", "B", "C"] {
+            let event = ffi::KeyEvent {
+                kind: 2,
+                modifiers: 0,
+                windows_virtual_key: 0,
+                auto_repeat: 0,
+                text: ffi::Bytes::from_str(text),
+                unmodified_text: ffi::Bytes::from_str(text),
+                key: ffi::Bytes::from_str(text),
+                code: ffi::Bytes::from_str(""),
+                key_identifier: ffi::Bytes::from_str(""),
+            };
+            let mut handled = 0;
+            check(
+                unsafe { ffi::scarlet_webview_key(view, &event, &mut handled) },
+                "type fixture text",
+            )?;
+            if handled == 0 {
+                return Err("native character event was not handled".into());
+            }
+        }
+        let (typed_frame, _) = unsafe {
+            await_contract_frame(view, |pixels, width| {
+                for (top, bottom) in [(16, 110), (840, 940)] {
+                    let mut dark = 0;
+                    for y in top..bottom {
+                        for x in 170..780 {
+                            let at = ((y * width + x) * 4) as usize;
+                            if pixels[at..at + 3].iter().all(|&value| value < 80) {
+                                dark += 1;
+                            }
+                        }
+                    }
+                    if dark < 50 {
+                        return Err(format!("typed glyphs missing from GPU output at y={top}"));
+                    }
+                }
+                Ok(())
+            })
+        }?;
+        let mut text = ffi::Bytes::default();
+        check(
+            unsafe {
+                ffi::scarlet_webview_text_content(view, ffi::Bytes::from_str("typed"), &mut text)
+            },
+            "read typed fixture text",
+        )?;
+        if unsafe { std::slice::from_raw_parts(text.data, text.length) } != b"ABC" {
+            return Err("native editor dropped typed characters".into());
+        }
+        drop(typed_frame);
+        check(
+            unsafe { ffi::scarlet_webview_focus(view, 0) },
+            "blur editor fixture",
+        )?;
+        unsafe { settle_contract_composition(view) }?;
+        println!(
+            "PASS: DPR2 trusted canvas click and native text input update actual GPU output, willReadFrequently={frequent_readback}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "backend-webkit-vulkan")]
