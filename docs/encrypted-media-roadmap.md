@@ -394,4 +394,29 @@ Amazon のパズルがクリックに反応しない件をユーザー操作で�
 通常ログでは当該操作時の新しい JS 例外はなかった。読み込み時には
 `PublicKeyCredential.getClientCapabilities` の未対応警告と analytics endpoint の
 CORS エラーがあるが、パズルの原因との対応は未確認。診断版の新しい Amazon
-ウィンドウでの操作ログを待ち、実際のクリック経路を調べる。
+ウィンドウでユーザーが無反応を再現した。
+
+最初の trace は native libc の浮動小数点書式で途中までしか出力されていなかった。
+WebKit `d7e04060` で座標を整数にし、1 レコードをまとめて出力するよう修正した。
+その版で、パズルの `CANVAS` に down / up が同じ座標で到達し、
+canvas の click listener が存在することを確認した。新しい JS 例外はない。
+`handled=0` は既定動作の処理結果であり、DOM listener が未実行という証拠ではない。
+
+WebKit `ff38358b` は同じ opt-in flag の下で、入力を処理する間だけ
+対象 document に受動的な capture listener を追加し、WebCore が実際に発火した
+mousedown / mouseup / click の trusted、button、client / offset 座標、
+canvas の内在サイズと CSS 矩形を記録する。listener は dispatch 後に外し、
+ページの伝播・既定動作・フォーム値には触れない。syntax check と Scarlet
+Release ビルドを通し、native `/bin/myrica` へ HTTP 転送して配置した。
+
+その起動後、クリックの trace が届く前に Scarlet 全体のハングが報告された。
+QMP の読み取りで CPU 0 が `rust_begin_unwind` 内の停止ループ
+(`0xffffffff8013c810`) に留まり、他 CPU が idle になっていることを確認した。
+起動した Release カーネルのシンボルと kernel stack 上の PanicInfo を照合し、
+`vm::user_vm_init` (当時の 393 行目) の
+`No free kernel stack window slots` を特定した。
+全タスク共通の枠は `KERNEL_KSTACK_SLOTS=256` で、spawn 時の枯渇を
+カーネル panic に変換する実装が残っている。枯渇に至ったタスクの内訳と、
+元の Canvas 無反応との関連は未確定。カーネル修正はまだ行っていない。
+ユーザー指示で再起動し、HVF / VirGL / native video を維持して
+通常イメージのコピーから復帰した。HTTP で同じ診断版と CDM host の環境を復元した。
