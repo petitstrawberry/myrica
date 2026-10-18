@@ -94,7 +94,15 @@ impl CdmShared {
     }
     pub(crate) fn decrypt(&self, request: &DecryptRequest<'_>) -> Result<Vec<u8>, CdmHostError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let clear = state.host.decrypt(request)?;
+        let clear = state.host.decrypt(request).inspect_err(|error| {
+            if trace_enabled() {
+                eprintln!(
+                    "SCARLET_CDM_DECRYPT_ERROR error={error:?} bytes={} key_id_bytes={} iv_bytes={} subsamples={} clear_bytes={}",
+                    request.sample.len(), request.key_id.len(), request.iv.len(), request.subsamples.len(),
+                    request.subsamples.iter().map(|region| u64::from(region.clear_bytes)).sum::<u64>()
+                );
+            }
+        })?;
         state.decrypted_samples += 1;
         state.decrypted_bytes += clear.len() as u64;
         static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

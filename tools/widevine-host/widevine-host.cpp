@@ -596,6 +596,11 @@ class CdmHost final : public cdm::Host_10 {
     append_u32(&payload, keys_info_count);
     for (uint32_t index = 0; index < keys_info_count; ++index) {
       const cdm::KeyInformation& info = keys_info[index];
+      if (info.status != cdm::kUsable && info.status != cdm::kStatusPending) {
+        log_line("key error status=" +
+                 std::to_string(static_cast<uint32_t>(info.status)) +
+                 " system_code=" + std::to_string(info.system_code));
+      }
       append_u32(&payload, info.key_id_size);
       append_bytes(&payload, info.key_id, info.key_id_size);
       append_u32(&payload, static_cast<uint32_t>(info.status));

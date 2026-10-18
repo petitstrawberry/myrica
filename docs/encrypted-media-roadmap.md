@@ -544,3 +544,30 @@ virtio-snd / audio0 の認識、SAS の稼働、更新バイナリと CDM/NSPR �
 host の usable=true は has_additional_usable_key であり、通知された全鍵が
 usable という意味ではない。鍵 ID を出さず状態ごとの件数を記録して確認する。
 SCARLET_EME_TRACE だけで復号した圧縮サンプル数と鍵待ちも記録する。
+
+### Prime Video: 鍵状態と復号入力の切り分け
+
+音声デバイスを有効にした同じ VM でユーザーが再現した結果、最初の通知は
+usable 2 / pending 1、その後 usable 1 / internal-error 1 / pending 1 になった。
+output-restricted / output-downscaled は 0。圧縮サンプル 341 バイトの復号は
+1 件成功したが、これだけでは暗号化された映像の再生成功を示さない。
+
+SCARLET_EME_TRACE に復号失敗の入力サイズだけを追加した。
+停止した入力は 184 バイト、鍵 ID 16 バイト、IV 8 バイト、subsample 1 件、
+clear prefix 50 バイトで、CDM の戻り値は NoKey。
+鍵 ID・IV の値、ライセンス、復号済みデータは記録しない。
+Host_10 の KeyInformation.system_code は従来捨てていたため、
+usable / pending 以外の状態についてホストのエラーログに残す。
+このコードは診断情報であり、鍵状態や EME capability の応答を変更しない。
+
+単一 subsample に限り clear prefix を保持して CDM に渡す変更も比較したが、
+Prime Video の 7031 は変わらなかった。公開 Sintel の暗号化区間も
+12.083333 秒 / decoded 2 の位置で NoKey 待ちになったため、この変更は撤回した。
+従来の cipher stream gather / scatter を維持する。
+撤回後の同じ Release 実行では公開 Sintel の 12〜16 秒の暗号化区間が
+15.844064 秒 / decoded 96 / usable 5 で合格し、owner の終了・join も完了した。
+試験中、ホストの std::system_error / Operation not permitted による終了も記録された。
+タイマーの別スレッド呼び出しとの因果関係は未確認。
+
+7031 の原因をライセンスの商用ポリシー、出力保護、ネットワークのいずれかへ
+断定する証拠は得られていない。次の再現では CDM の system_code を確認する。
