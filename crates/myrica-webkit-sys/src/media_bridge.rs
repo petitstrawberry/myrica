@@ -1502,7 +1502,10 @@ fn session_worker(shared: &SessionShared) {
                             let track = state.tracks.get_mut(&id).unwrap();
                             track.samples.push_front(packet);
                             track.blocked_on_key = Some(revision);
-                            if media_profile_enabled() {
+                            let trace_key_wait = media_profile_enabled();
+                            #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                            let trace_key_wait = trace_key_wait || crate::cdm_bridge::trace_enabled();
+                            if trace_key_wait {
                                 eprintln!(
                                     "SCARLET_MEDIA_KEY_WAIT track={id} pts_us={} revision={}",
                                     track.samples.front().unwrap().sample.pts_us,

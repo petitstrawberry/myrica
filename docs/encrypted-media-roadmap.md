@@ -519,7 +519,7 @@ ScarletUI main `332caaf0` は元の sws-client エラー種別を出力する。
 
 
 NSPR 配置後の再起動では CDM 4.10.2662.3 が initialize を完了し、
-Prime Video の license-request に応答が返り、3 鍵が usable になった。
+Prime Video の license-request に応答が返り、3 鍵の通知と usable key 追加のフラグを受け取った。
 SDK は hasStartedPlaying=yes を記録したが、その後 error 7031 の画面に遷移した。
 公開 SDK のコードでは 7031 は xp.unknown に対応する汎用エラーであり、
 この番号からネットワーク、HDCP、デコーダなど特定の原因を推論しない。
@@ -531,3 +531,16 @@ WebKit `141519af` は SCARLET_EME_TRACE でも既存の低頻度 media lifecycle
 Rust bridge も、従来詳細が消えていた音声出力、映像出力の容量・形式、
 playbackRate / seek の不正値の失敗を記録する。
 高頻度の paint / GPU readback 診断は有効にしない。
+
+
+音声 pump の失敗は、検証 QEMU 起動時の SCARLET_QEMU_AUDIO 未指定による
+音声デバイス不在だった。検証設定の漏れを修正した。
+稼働中 snapshot の boot disk を pause / commit して私有の検証用コピーへ保存し、
+通常 runner の SCARLET_QEMU_AUDIO=1 / coreaudio で再起動した。
+virtio-snd / audio0 の認識、SAS の稼働、更新バイナリと CDM/NSPR の保持を確認した。
+再試験では audio-pump エラーが消えたが、7031 は残った。
+ネイティブ decoder / MSE append の失敗ログも出ていない。
+
+host の usable=true は has_additional_usable_key であり、通知された全鍵が
+usable という意味ではない。鍵 ID を出さず状態ごとの件数を記録して確認する。
+SCARLET_EME_TRACE だけで復号した圧縮サンプル数と鍵待ちも記録する。

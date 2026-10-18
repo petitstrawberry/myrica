@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cdm_host::{CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, Subsample};
+use cdm_host::{CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, KeyStatus, Subsample};
 
 use crate::Bytes;
 
@@ -33,6 +33,25 @@ const EV_MESSAGE: u32 = 103;
 const EV_KEYS: u32 = 104;
 const EV_EXPIRATION: u32 = 105;
 const EV_SESSION_CLOSED: u32 = 106;
+
+pub(crate) fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SCARLET_EME_TRACE").is_ok_and(|value| value == "1"))
+}
+
+fn trace_key_statuses(keys: &[KeyStatus]) {
+    if !trace_enabled() {
+        return;
+    }
+    let mut counts = [0usize; 8];
+    for key in keys {
+        counts[(key.status as usize).min(7)] += 1;
+    }
+    eprintln!(
+        "SCARLET_CDM_KEYS total={} usable={} internal_error={} expired={} output_restricted={} output_downscaled={} pending={} released={} other={}",
+        keys.len(), counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]
+    );
+}
 
 /// Owned byte buffer that crosses the C ABI boundary.
 #[repr(C)]
@@ -79,7 +98,7 @@ impl CdmShared {
         state.decrypted_samples += 1;
         state.decrypted_bytes += clear.len() as u64;
         static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PROFILE.get_or_init(|| std::env::var_os("SCARLET_WEBVIEW_PROFILE").is_some())
+        if (*PROFILE.get_or_init(|| std::env::var_os("SCARLET_WEBVIEW_PROFILE").is_some()) || trace_enabled())
             && (state.decrypted_samples == 1 || state.decrypted_samples % 128 == 0)
         {
             eprintln!(
@@ -144,6 +163,7 @@ fn encode_event(event: &HostEvent) -> (u32, Vec<u8>) {
             (EV_MESSAGE, payload)
         }
         HostEvent::Keys { session_id, keys } => {
+            trace_key_statuses(keys);
             let mut payload = Vec::new();
             pack_u32(&mut payload, session_id.len() as u32);
             payload.extend_from_slice(session_id.as_bytes());
@@ -376,6 +396,7 @@ pub extern "C" fn cdm_host_update_session(
         .update_session(&session_id, &response, &mut events)
     {
         Ok(keys) => {
+            trace_key_statuses(&keys);
             handle.shared.revision.fetch_add(1, Ordering::Release);
             let mut packed = Vec::new();
             pack_u32(&mut packed, keys.len() as u32);
