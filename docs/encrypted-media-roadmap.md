@@ -597,3 +597,19 @@ task runner の owner thread / timer 順序 / nested callback / 他スレッド 
 container で合格した。Scarlet の同じ CDM を使った Release の公開 Sintel 試験も
 15.765890 秒 / decoded 94 / usable 5 で合格し、owner join と host 終了を確認した。
 この修正による Prime Video の再生結果は次のユーザー操作で検証する。
+
+再現後も internal-error / system_code=5 と映像先頭の NoKey は残った。
+別の圧縮サンプルの復号カウントは 384 件以上に進んだが、画面の再生位置は
+0:00 のまま黒画面だった。タイマー競合の修正だけではこの鍵エラーは解消しない。
+
+途中のブラウザ終了は、CDM host の例外ではなく GPU の受付上限超過だった。
+VirGL は staged=67056408 / packet=65452 / limit=67108864、Vulkan は
+texture_bytes=88109682 / passes=116 / draws=337 を記録し、メモリ不足から
+device lost に遷移した。CDM host はその後の制御ソケット切断で終了した。
+SGFX の既存 upload_batches は texture-only の command buffer に限って分割し、
+render pass が混在すると総転送量が多くても一括送信していた。
+SGFX `791e76f659f9ecdfafaa20bb5b66e261589d9a91` で、render/compute pass の内部を
+保ったまま前後の upload を 8 MiB ずつ分割する。全体と分割後の両方を事前検証し、
+転送順序・subrectangle・mip/layer・buffer offset を保持する。
+80 MiB + render pass の回帰試験を含む 6 件、Vulkan 単体 117 件が合格した
+(GPU が必要な 4 件は既存の ignored)。実機反映後の検証を続ける。
