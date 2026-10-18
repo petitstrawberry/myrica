@@ -72,6 +72,7 @@ jobs:
         with:
           path: target
           key: myrica-aarch64-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'platforms/scarlet/**', 'crates/myrica-webkit-sys/**') }}
+          restore-keys: myrica-aarch64-
       - name: Build Myrica and probe
         if: steps.inputs.outputs.exists != 'true'
         run: |

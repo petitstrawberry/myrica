@@ -14,6 +14,25 @@ fn main() {
     // The resident Scarlet interpreter supplies dlopen/dlsym/dlerror. A
     // standalone Myrica build needs the same imports as a bundled build.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("scarlet") {
+        // lld only emits executable imports when a DSO is among its inputs.
+        // An empty, as-needed DSO enables imports supplied by the interpreter
+        // without adding a runtime library dependency.
+        let output = std::path::PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+        let archive = output.join("interpreter-imports.a");
+        let shared = output.join("interpreter-imports.so");
+        fs::write(&archive, b"!<arch>\n").expect("write empty interpreter import archive");
+        let status = std::process::Command::new("rust-lld")
+            .args(["-flavor", "gnu", "-m", "aarch64elf", "-shared"])
+            .arg(&archive)
+            .arg("-o")
+            .arg(&shared)
+            .status()
+            .expect("link interpreter import DSO");
+        assert!(status.success(), "link interpreter import DSO");
+        println!("cargo:rustc-link-arg=--push-state");
+        println!("cargo:rustc-link-arg=--as-needed");
+        println!("cargo:rustc-link-arg={}", shared.display());
+        println!("cargo:rustc-link-arg=--pop-state");
         println!("cargo:rustc-link-arg=--dynamic-linker=/bin/scarlet-ld");
         println!("cargo:rustc-link-arg=--unresolved-symbols=ignore-all");
     }
