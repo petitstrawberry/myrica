@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <netdb.h>
 #include <fstream>
+#include <sstream>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -184,8 +185,24 @@ std::vector<uint8_t> make_widevine_pssh(const std::vector<uint8_t>& key_id) {
 
 }  // namespace
 
+struct FrameInfo {
+  uint32_t format = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t slot = 0;
+  uint32_t size = 0;
+  uint32_t stride_y = 0;
+  uint32_t stride_u = 0;
+  uint32_t stride_v = 0;
+  uint32_t offset_u = 0;
+  uint32_t offset_v = 0;
+  int64_t timestamp = 0;
+};
+
 struct Collected {
   std::string session_id;
+  bool frame_reported = false;
+  FrameInfo frame;
   bool keys_reported = false;
   std::vector<std::string> keys;
   bool has_message = false;
@@ -271,6 +288,20 @@ bool wait_result(int fd, uint32_t request_id, int32_t* status, uint32_t* value0,
     *status = static_cast<int32_t>(raw_status);
     return true;
   }
+}
+
+bool wait_frame(int fd, Collected* collected) {
+  while (!collected->frame_reported) {
+    Frame frame;
+    if (!read_frame(fd, &frame)) {
+      return false;
+    }
+    if (frame.kind == WVH_EV_RESULT) {
+      continue;
+    }
+    handle_event(frame, collected);
+  }
+  return true;
 }
 
 bool wait_keys(int fd, Collected* collected) {
@@ -435,6 +466,20 @@ int main(int argc, char** argv) {
   std::string decrypt_iv;
   std::string decrypt_key_id;
   std::string decrypt_subsamples;
+  std::string video_avcc;
+  std::string decode_sample;
+  std::string decode_iv;
+  std::string decode_key_id;
+  std::string decode_subsamples;
+  std::string decode_out;
+  std::string decode_media;
+  std::string decode_samples;
+  std::string decode_mode = "decode";
+  uint32_t video_width = 0;
+  uint32_t video_height = 0;
+  uint32_t video_profile = 5;
+  uint32_t video_codec = 2;
+  uint32_t decode_scheme = 1;
   for (int index = 1; index < argc; ++index) {
     const std::string argument = argv[index];
     if (index + 1 >= argc) {
@@ -458,6 +503,34 @@ int main(int argc, char** argv) {
       decrypt_key_id = argv[++index];
     } else if (argument == "--decrypt-subsamples") {
       decrypt_subsamples = argv[++index];
+    } else if (argument == "--video-avcc") {
+      video_avcc = argv[++index];
+    } else if (argument == "--video-width") {
+      video_width = static_cast<uint32_t>(std::stoul(argv[++index]));
+    } else if (argument == "--video-height") {
+      video_height = static_cast<uint32_t>(std::stoul(argv[++index]));
+    } else if (argument == "--video-profile") {
+      video_profile = static_cast<uint32_t>(std::stoul(argv[++index]));
+    } else if (argument == "--video-codec") {
+      video_codec = static_cast<uint32_t>(std::stoul(argv[++index]));
+    } else if (argument == "--decode-sample") {
+      decode_sample = argv[++index];
+    } else if (argument == "--decode-iv") {
+      decode_iv = argv[++index];
+    } else if (argument == "--decode-key-id") {
+      decode_key_id = argv[++index];
+    } else if (argument == "--decode-subsamples") {
+      decode_subsamples = argv[++index];
+    } else if (argument == "--decode-out") {
+      decode_out = argv[++index];
+    } else if (argument == "--decode-media") {
+      decode_media = argv[++index];
+    } else if (argument == "--decode-samples") {
+      decode_samples = argv[++index];
+    } else if (argument == "--decode-scheme") {
+      decode_scheme = static_cast<uint32_t>(std::stoul(argv[++index]));
+    } else if (argument == "--decode-mode") {
+      decode_mode = argv[++index];
     }
   }
   if (socket_path.empty() || shm_path.empty()) {
@@ -703,6 +776,341 @@ int main(int argc, char** argv) {
       std::vector<uint8_t> release_out;
       append_u32(&release_out, out_slot);
       send_frame(fd, WVH_CMD_RELEASE, release_out);
+    }
+  }
+
+  if (!decode_samples.empty()) {
+    std::vector<uint8_t> media;
+    std::ifstream list(decode_samples);
+    if (!read_file_bytes(decode_media, &media) || media.empty() || !list) {
+      std::cerr << "cannot read the media segment or sample list" << std::endl;
+      return 1;
+    }
+    std::vector<uint8_t> avcc;
+    if (!video_avcc.empty() && !read_file_bytes(video_avcc, &avcc)) {
+      std::cerr << "cannot read " << video_avcc << std::endl;
+      return 1;
+    }
+    std::vector<uint8_t> key_id;
+    if (!decode_hex(decode_key_id, &key_id)) {
+      std::cerr << "invalid key id" << std::endl;
+      return 1;
+    }
+    std::vector<uint8_t> config;
+    append_u32(&config, video_codec);
+    append_u32(&config, video_profile);
+    append_u32(&config, 2);
+    append_u32(&config, video_width);
+    append_u32(&config, video_height);
+    append_u32(&config, static_cast<uint32_t>(avcc.size()));
+    append_bytes(&config, avcc.data(), avcc.size());
+    if (!send_frame(fd, WVH_CMD_CONFIGURE_VIDEO, config)) {
+      std::cerr << "CONFIGURE_VIDEO send failed" << std::endl;
+      return 1;
+    }
+    uint32_t value_a = 0;
+    uint32_t value_b = 0;
+    if (!wait_result(fd, 0, &status, &value_a, &value_b, &collected)) {
+      std::cerr << "CONFIGURE_VIDEO reply missing" << std::endl;
+      return 1;
+    }
+    std::cout << "CONFIGURE_VIDEO status=" << status << std::endl;
+    if (status != WVH_OK) {
+      return 1;
+    }
+
+    if (decode_mode == "decrypt" && !decode_out.empty()) {
+      std::ofstream truncate(decode_out, std::ios::binary | std::ios::trunc);
+    }
+
+    std::string line;
+    int index = 0;
+    bool got_frame = false;
+    while (std::getline(list, line) && !got_frame) {
+      std::istringstream fields(line);
+      uint64_t offset = 0;
+      uint64_t size = 0;
+      uint64_t timestamp = 0;
+      std::string iv_hex;
+      if (!(fields >> offset >> size >> iv_hex >> timestamp)) {
+        continue;
+      }
+      std::vector<uint8_t> iv;
+      std::vector<uint8_t> entry_iv;
+      std::vector<std::pair<uint32_t, uint32_t>> subsamples;
+      std::string token;
+      bool first = true;
+      while (fields >> token) {
+        const size_t colon = token.find(':');
+        if (colon == std::string::npos) {
+          continue;
+        }
+        if (first) {
+          first = false;
+        }
+        subsamples.push_back({static_cast<uint32_t>(std::stoul(token.substr(0, colon))),
+                              static_cast<uint32_t>(std::stoul(token.substr(colon + 1)))});
+      }
+      if (!decode_hex(iv_hex, &iv) || offset + size > media.size()) {
+        std::cerr << "bad sample line" << std::endl;
+        return 1;
+      }
+      if (decode_mode == "decrypt") {
+        std::vector<uint8_t> plaintext(size);
+        size_t position = 0;
+        std::vector<std::pair<uint32_t, uint32_t>> chunks = subsamples;
+        if (chunks.empty()) {
+          chunks.push_back({0, static_cast<uint32_t>(size)});
+        }
+        bool failed = false;
+        for (const auto& chunk : chunks) {
+          const uint32_t chunk_size = chunk.first + chunk.second;
+          if (position + chunk_size > size) {
+            failed = true;
+            break;
+          }
+          if (chunk.second == 0) {
+            memcpy(plaintext.data() + position, media.data() + offset + position, chunk_size);
+          } else {
+            uint8_t* chunk_slot = static_cast<uint8_t*>(region) + WVH_SHM_HEADER_BYTES;
+            memcpy(chunk_slot, media.data() + offset + position, chunk_size);
+            std::vector<uint8_t> request;
+            append_u32(&request, 6);
+            append_u32(&request, 0);
+            append_u32(&request, 0);
+            append_u32(&request, chunk_size);
+            append_u32(&request, static_cast<uint32_t>(key_id.size()));
+            append_bytes(&request, key_id.data(), key_id.size());
+            append_u32(&request, static_cast<uint32_t>(iv.size()));
+            append_bytes(&request, iv.data(), iv.size());
+            append_u32(&request, 1);
+            append_u32(&request, chunk.first);
+            append_u32(&request, chunk.second);
+            append_u32(&request, WVH_SCHEME_CENC);
+            for (int shift = 0; shift < 8; ++shift) {
+              request.push_back(static_cast<uint8_t>(timestamp >> (shift * 8)));
+            }
+            if (!send_frame(fd, WVH_CMD_DECRYPT, request)) {
+              failed = true;
+              break;
+            }
+            uint32_t out_slot = 0;
+            uint32_t out_size = 0;
+            if (!wait_result(fd, 6, &status, &out_slot, &out_size, &collected)) {
+              failed = true;
+              break;
+            }
+            if (status != WVH_OK || out_size != chunk_size) {
+              std::cout << "CHUNK_FAILED index=" << index << " status=" << status
+                        << " size=" << out_size << std::endl;
+              failed = true;
+              break;
+            }
+            const uint8_t* chunk_out = static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
+                                       static_cast<size_t>(out_slot) * slot_size;
+            memcpy(plaintext.data() + position, chunk_out, chunk_size);
+            std::vector<uint8_t> release_chunk;
+            append_u32(&release_chunk, out_slot);
+            send_frame(fd, WVH_CMD_RELEASE, release_chunk);
+          }
+          position += chunk_size;
+        }
+        if (failed) {
+          std::cerr << "chunked decryption failed at index " << index << std::endl;
+          if (!decode_out.empty()) {
+            std::ofstream output(decode_out, std::ios::binary | std::ios::app);
+            output.write(reinterpret_cast<const char*>(plaintext.data()), size);
+          }
+          ++index;
+          continue;
+        }
+        if (!decode_out.empty()) {
+          std::ofstream output(decode_out, std::ios::binary | std::ios::app);
+          output.write(reinterpret_cast<const char*>(plaintext.data()), size);
+        }
+        ++index;
+        continue;
+      }
+
+      uint8_t* input_slot = static_cast<uint8_t*>(region) + WVH_SHM_HEADER_BYTES;
+      memcpy(input_slot, media.data() + offset, size);
+
+      std::vector<uint8_t> decode;
+      append_u32(&decode, 5);
+      append_u32(&decode, 0);
+      append_u32(&decode, 0);
+      append_u32(&decode, static_cast<uint32_t>(size));
+      append_u32(&decode, static_cast<uint32_t>(key_id.size()));
+      append_bytes(&decode, key_id.data(), key_id.size());
+      append_u32(&decode, static_cast<uint32_t>(iv.size()));
+      append_bytes(&decode, iv.data(), iv.size());
+      append_u32(&decode, static_cast<uint32_t>(subsamples.size()));
+      for (const auto& entry : subsamples) {
+        append_u32(&decode, entry.first);
+        append_u32(&decode, entry.second);
+      }
+      append_u32(&decode, decode_scheme);
+      for (int shift = 0; shift < 8; ++shift) {
+        decode.push_back(static_cast<uint8_t>(timestamp >> (shift * 8)));
+      }
+      if (!send_frame(fd, WVH_CMD_DECODE, decode)) {
+        std::cerr << "DECODE send failed" << std::endl;
+        return 1;
+      }
+      if (!wait_result(fd, 5, &status, &value_a, &value_b, &collected)) {
+        std::cerr << "DECODE reply missing" << std::endl;
+        return 1;
+      }
+      std::cout << "DECODE index=" << index << " size=" << size << " status=" << status
+                << std::endl;
+      if (status == WVH_OK && wait_frame(fd, &collected)) {
+        got_frame = true;
+        const FrameInfo& info = collected.frame;
+        std::cout << "FRAME index=" << index << " format=" << info.format
+                  << " size=" << info.width << "x" << info.height << " bytes=" << info.size
+                  << std::endl;
+        if (!decode_out.empty()) {
+          const uint8_t* frame_base = static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
+                                      static_cast<size_t>(info.slot) * slot_size;
+          std::ofstream output(decode_out, std::ios::binary | std::ios::trunc);
+          const uint32_t chroma_width = info.width / 2;
+          const uint32_t chroma_height = info.height / 2;
+          for (uint32_t row = 0; row < info.height; ++row) {
+            output.write(reinterpret_cast<const char*>(frame_base + row * info.stride_y),
+                         info.width);
+          }
+          for (uint32_t row = 0; row < chroma_height; ++row) {
+            output.write(
+                reinterpret_cast<const char*>(frame_base + info.offset_u + row * info.stride_u),
+                chroma_width);
+          }
+          for (uint32_t row = 0; row < chroma_height; ++row) {
+            output.write(
+                reinterpret_cast<const char*>(frame_base + info.offset_v + row * info.stride_v),
+                chroma_width);
+          }
+          std::cout << "FRAME_DUMPED " << decode_out << std::endl;
+        }
+        std::vector<uint8_t> release_frame;
+        append_u32(&release_frame, info.slot);
+        send_frame(fd, WVH_CMD_RELEASE, release_frame);
+      }
+      ++index;
+      if (index > 40) {
+        break;
+      }
+    }
+    if (decode_mode == "decrypt") {
+      std::cout << "DECRYPTED_SAMPLES " << index << std::endl;
+    } else if (!got_frame) {
+      std::cerr << "no decoded frame after " << index << " samples" << std::endl;
+    }
+  }
+
+  if (!decode_sample.empty()) {
+    std::vector<uint8_t> sample;
+    std::vector<uint8_t> avcc;
+    std::vector<uint8_t> iv;
+    std::vector<uint8_t> key_id;
+    std::vector<std::pair<uint32_t, uint32_t>> subsamples;
+    if (!read_file_bytes(decode_sample, &sample) || sample.empty()) {
+      std::cerr << "cannot read " << decode_sample << std::endl;
+      return 1;
+    }
+    if (!video_avcc.empty() && !read_file_bytes(video_avcc, &avcc)) {
+      std::cerr << "cannot read " << video_avcc << std::endl;
+      return 1;
+    }
+    if (!decode_hex(decode_iv, &iv) || !decode_hex(decode_key_id, &key_id)) {
+      std::cerr << "invalid decode IV or key id" << std::endl;
+      return 1;
+    }
+    if (!parse_subsamples(decode_subsamples, &subsamples)) {
+      std::cerr << "invalid decode subsample list" << std::endl;
+      return 1;
+    }
+
+    std::vector<uint8_t> config;
+    append_u32(&config, video_codec);
+    append_u32(&config, video_profile);
+    append_u32(&config, 2);
+    append_u32(&config, video_width);
+    append_u32(&config, video_height);
+    append_u32(&config, static_cast<uint32_t>(avcc.size()));
+    append_bytes(&config, avcc.data(), avcc.size());
+    if (!send_frame(fd, WVH_CMD_CONFIGURE_VIDEO, config)) {
+      std::cerr << "CONFIGURE_VIDEO send failed" << std::endl;
+      return 1;
+    }
+    uint32_t value_a = 0;
+    uint32_t value_b = 0;
+    if (!wait_result(fd, 0, &status, &value_a, &value_b, &collected)) {
+      std::cerr << "CONFIGURE_VIDEO reply missing" << std::endl;
+      return 1;
+    }
+    std::cout << "CONFIGURE_VIDEO status=" << status << std::endl;
+    if (status != WVH_OK) {
+      return 1;
+    }
+
+    uint8_t* input_slot = static_cast<uint8_t*>(region) + WVH_SHM_HEADER_BYTES;
+    memcpy(input_slot, sample.data(), sample.size());
+    std::vector<uint8_t> decode;
+    append_u32(&decode, 5);
+    append_u32(&decode, 0);
+    append_u32(&decode, 0);
+    append_u32(&decode, static_cast<uint32_t>(sample.size()));
+    append_u32(&decode, static_cast<uint32_t>(key_id.size()));
+    append_bytes(&decode, key_id.data(), key_id.size());
+    append_u32(&decode, static_cast<uint32_t>(iv.size()));
+    append_bytes(&decode, iv.data(), iv.size());
+    append_u32(&decode, static_cast<uint32_t>(subsamples.size()));
+    for (const auto& entry : subsamples) {
+      append_u32(&decode, entry.first);
+      append_u32(&decode, entry.second);
+    }
+    append_u32(&decode, WVH_SCHEME_CENC);
+    for (int index = 0; index < 8; ++index) {
+      decode.push_back(0);
+    }
+    if (!send_frame(fd, WVH_CMD_DECODE, decode)) {
+      std::cerr << "DECODE send failed" << std::endl;
+      return 1;
+    }
+    if (!wait_result(fd, 5, &status, &value_a, &value_b, &collected)) {
+      std::cerr << "DECODE reply missing" << std::endl;
+      return 1;
+    }
+    std::cout << "DECODE status=" << status << std::endl;
+    if (status == WVH_OK && wait_frame(fd, &collected)) {
+      const FrameInfo& info = collected.frame;
+      std::cout << "FRAME format=" << info.format << " size=" << info.width << "x" << info.height
+                << " bytes=" << info.size << std::endl;
+      if (!decode_out.empty()) {
+        const uint8_t* frame_base = static_cast<const uint8_t*>(region) + WVH_SHM_HEADER_BYTES +
+                                    static_cast<size_t>(info.slot) * slot_size;
+        std::ofstream output(decode_out, std::ios::binary | std::ios::trunc);
+        const uint32_t chroma_width = info.width / 2;
+        const uint32_t chroma_height = info.height / 2;
+        for (uint32_t row = 0; row < info.height; ++row) {
+          output.write(reinterpret_cast<const char*>(frame_base + row * info.stride_y),
+                       info.width);
+        }
+        for (uint32_t row = 0; row < chroma_height; ++row) {
+          output.write(
+              reinterpret_cast<const char*>(frame_base + info.offset_u + row * info.stride_u),
+              chroma_width);
+        }
+        for (uint32_t row = 0; row < chroma_height; ++row) {
+          output.write(
+              reinterpret_cast<const char*>(frame_base + info.offset_v + row * info.stride_v),
+              chroma_width);
+        }
+        std::cout << "FRAME_DUMPED " << decode_out << std::endl;
+      }
+      std::vector<uint8_t> release_frame;
+      append_u32(&release_frame, info.slot);
+      send_frame(fd, WVH_CMD_RELEASE, release_frame);
     }
   }
 

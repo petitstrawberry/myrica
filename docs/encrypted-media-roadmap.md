@@ -126,7 +126,8 @@ W0 実施記録 (2026-10-16):
 - 実データでの復号 (2026-10-18 完了): Axinom の v7-MultiDRM-SingleKey テストベクタ (dash.js のサンプルが公開している X-AxDRM-Message トークンを使用) で、テンポラリセッションに鍵が 1 つ usable として入り、音声サンプル (341 バイト、サブサンプルなし) が kSuccess で復号された。映像サンプルでは、単一の暗号化領域を指定したときに先頭 NAL 長 (755 バイト) がバイト一致で復元された。誤った鍵 ID では kNoKey が返るため、成功は鍵に基づいている。
 - 重要な制約: この CDM ビルドは、サブサンプルマップが 2 件以上ある Decrypt 要求に kNoKey を返す。複数 NAL の映像サンプルは Decrypt では復号できないため、映像は DecryptAndDecode (VideoDecoder / VideoFrame コールバック) 経由にする必要がある。Chromium が音声に Decrypt、映像に DecryptAndDecode を使う分担と一致し、W3 の前提がこれで確定した。
 - CENC 解析の知見 (scarlet-codecs に持ち込む): stsd は 8 バイト、encv は 78 バイト、enca は 28 バイトのヘッダの後に子ボックスが並ぶ。tenc にはパターン用バイトを含む 24 バイトのレイアウト (Shaka Packager など) と含まない旧レイアウトがあり、ボックスサイズで判別できる。senc は IV (tenc の default_Per_Sample_IV_Size、通常 8 バイト) とサブサンプル対 (clear, cipher) を持ち、サンプル位置は trun の data_offset から求まる。参照実装は tools/widevine-host/test/extract-sample.py。
-- W1 の残り: 永続セッション、映像の DecryptAndDecode 経路。
+- 映像経路の実測 (2026-10-18, 途中): この CDM ビルドでは DecryptAndDecodeFrame がフレームを返さない。クリアな H.264 (avcC 付き、増加するタイムスタンプ、512x288 High) を DecryptAndDecodeFrame に流しても全サンプルが kNeedMoreData のままだった。Decrypt はサブサンプルマップが 2 件以上で kNoKey、1 件なら成功する。サブサンプルごとに 1 件ずつの Decrypt 要求に分割する方式は、2 番目の NAL を単独で復号して NAL 長 6264 が復元できたことから「各暗号化領域は同じ IV で独立に復号できる」という観測に基づいて実装した。96 サンプル中 80 件は成功したが 16 件が kNoKey (単独実行でも再現)。映像の復号検証 (ffmpeg による参照デコード) は未実施。
+- 映像経路の選択肢: (a) 別の CDM ビルド (Chrome for Linux arm64 など) で同じ経路を試す、(b) サンプル全体が 1 つの暗号化領域であるストリームを対象にする (Decrypt がそのまま使える)、(c) 映像は ClearKey 経路に限定する。
 
 W0 (規模: 小) Linux ビューでの実証。Debian glibc ビューで libwidevinecdm.so を dlopen し、CDM の初期化とライセンス往復 (テスト用ライセンスサーバ) の可否を確認する。Linux ABI のギャップ (epoll スタブ、fcntl の F_DUPFD 欠落、シグナル簡易実装、auxv/TLS 整合) をここで洗い出す。最大の未知はここ。
 W1 (規模: 中) ヘルパープロセスと CDM ホストの実装。license request / response と鍵取得まで通す。
