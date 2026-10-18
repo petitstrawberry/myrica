@@ -130,6 +130,8 @@ W0 実施記録 (2026-10-16):
 - 映像復号の検証 (2026-10-18): サブサンプル単位に分割した Decrypt (各暗号化領域で同じ IV を使う) で Axinom セグメントの 96 サンプルを復号し、ffmpeg で再生したところ 2.0 秒地点のフレームが正しい絵 (Blender/Axinom のテスト映像、オーバーレイに H.264 High Profile 512x288 と表示) として復号できた。この方式の復号自体は正しい。ただしこの CDM は 96 サンプル中 16 件で不安定で、ある実行では kSuccess を返しながら出力をゼロで埋め、別の実行では同じサンプルに kNoKey を返す。DecryptAndDecodeFrame はクリアな H.264 でも一切フレームを返さない。
 - 映像経路の結論 (暫定): この ChromeOS 向け CDM ビルドは映像の復号・デコード経路が我々の環境では信頼できない。設計としては「サブサンプル単位の Decrypt + Scarlet 側デコーダ」が正しい形なので、次は別の CDM ビルド (Chrome for Linux arm64 など) で同じ経路を比較する。ClearKey 経路はこの影響を受けない。
 - 映像経路の選択肢: (a) 別の CDM ビルド (Chrome for Linux arm64 など) で同じ経路を試す、(b) サンプル全体が 1 つの暗号化領域であるストリームを対象にする (Decrypt がそのまま使える)、(c) 映像は ClearKey 経路に限定する。
+- W1/W2 の橋渡し (2026-10-18): tools/widevine-host-client をライブラリ (cdm_host) と CLI に分割し、aarch64-unknown-scarlet でのビルドを確認した。ライブラリは共有メモリと socketpair の作成、linux-aarch64 ビューのホスト起動 (stdio を 0..2、socket を 3、共有メモリを 4 に map)、HELLO/READY、initialize / create_session / update_session / close_session / decrypt / shutdown を提供する。decrypt はサブサンプル単位に分割して同じ IV で呼び、ゼロ埋めの成功は 1 回だけ再試行する。
+- W2 の接続方針: WebKit 側の CDMPrivate / CDMInstance / CDMInstanceSession は、ScarletWebView C ABI に追加する関数 (create / destroy / initialize / create_session / update_session / close_session / decrypt / take_event) 経由でこのライブラリを呼ぶ。init data は InitDataRegistry、ライセンス POST はページの fetch() が担当するため、ブラウザ側にライセンス用ネットワークは不要。
 
 W0 (規模: 小) Linux ビューでの実証。Debian glibc ビューで libwidevinecdm.so を dlopen し、CDM の初期化とライセンス往復 (テスト用ライセンスサーバ) の可否を確認する。Linux ABI のギャップ (epoll スタブ、fcntl の F_DUPFD 欠落、シグナル簡易実装、auxv/TLS 整合) をここで洗い出す。最大の未知はここ。
 W1 (規模: 中) ヘルパープロセスと CDM ホストの実装。license request / response と鍵取得まで通す。
