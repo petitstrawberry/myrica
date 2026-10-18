@@ -656,15 +656,17 @@ class CdmHost final : public cdm::Host_10 {
   }
 
   void EnableOutputProtection(uint32_t mask) final {
-    if (options_.verbose) {
-      log_line("EnableOutputProtection mask=" + std::to_string(mask));
-    }
+    log_line("EnableOutputProtection requested_mask=" + std::to_string(mask) +
+             " supported=false");
   }
 
   void QueryOutputProtectionStatus() final {
+    // There is no native display-protection query API wired to this host.
+    // A successful NONE result would incorrectly report no connected output.
+    log_line("QueryOutputProtectionStatus available=false");
     with_cdm([](ContentDecryptionModule* cdm) {
-      cdm->OnQueryOutputProtectionStatus(cdm::kQuerySucceeded, cdm::kLinkTypeNone,
-                                         cdm::kProtectionNone);
+      cdm->OnQueryOutputProtectionStatus(cdm::kQueryFailed, cdm::kLinkTypeUnknown,
+                                       cdm::kProtectionNone);
     });
   }
 

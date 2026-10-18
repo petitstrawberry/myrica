@@ -624,3 +624,31 @@ Prime の再試験用ウィンドウも同じ ICD で起動した。
 usable / internal_error / system_code の件数を出す診断を追加した。
 実際の鍵 ID をログに出さず、session が閉じたら照合用状態も破棄する。
 これは復号先や鍵の選択を変更する機能ではない。
+
+GPU 修正後もユーザー操作で Prime の 7031 が再現した。失敗サンプルは
+matching_sessions=1 / usable=0 / internal_error=1 / system_code=5。
+復号に渡す鍵 ID は CDM が通知した鍵と一致している。ライセンス受信前の
+matching_sessions=0 と、受信後に鍵自体がエラーとなる状態を区別できた。
+同試験で SGFX の受付上限超過 / device lost は記録されなかった。
+
+### CDM ホスト応答の監査
+
+WebKit は空 robustness / SW_SECURE_CRYPTO のみを公開し、hardware secure /
+CDM 内 decoder の能力を公開していない。保存不可時の CreateFileIO=null /
+StorageId=empty は Chromium の実装とも一致する。
+Chromium の CDM host verification の既定対象は branded Windows / Mac であり、
+署名不足を Linux 経路の原因と断定しない。
+
+一方、Scarlet ホストの QueryOutputProtectionStatus は表示経路の検査を
+実装せず kQuerySucceeded / kLinkTypeNone を固定応答していた。
+取得不能として kQueryFailed / kLinkTypeUnknown / kProtectionNone を返すよう修正した。
+EnableOutputProtection は要求 mask と未対応であることを記録する。
+出力保護を有効にしたとの応答や、CDM の鍵状態を書き換える処理は追加しない。
+同 CDM が mask=1 を要求・query を行った公開 Sintel の試験でも、修正後は
+15.785546 秒 / decoded 94 / usable 5、owner join まで合格した。
+Prime への影響はページを再読み込みして再試験する。
+
+参照: [Chromium CdmAdapter](https://github.com/chromium/chromium/blob/main/media/cdm/cdm_adapter.cc)
+の RequestStorageId / CreateFileIO / OnQueryOutputProtectionStatusDone、
+[media_options.gni](https://github.com/chromium/chromium/blob/main/media/media_options.gni)
+の enable_cdm_host_verification。
