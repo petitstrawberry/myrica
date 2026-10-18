@@ -725,7 +725,8 @@ class CdmHost final : public cdm::Host_10 {
 
   ContentDecryptionModule* cdm() const { return cdm_; }
 
-  void trace_decrypt_failure(const std::vector<uint8_t>& key_id, cdm::Status status) {
+  void trace_decrypt_failure(const std::vector<uint8_t>& key_id, cdm::Status status,
+                             uint32_t iv_size) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     const std::string id(key_id.begin(), key_id.end());
     unsigned known = 0, usable = 0, internal_error = 0;
@@ -739,6 +740,7 @@ class CdmHost final : public cdm::Host_10 {
       if (key->second.second != 0) system_code = key->second.second;
     }
     log_line("decrypt failed status=" + std::to_string(static_cast<uint32_t>(status)) +
+             " iv_bytes=" + std::to_string(iv_size) +
              " matching_sessions=" + std::to_string(known) +
              " usable=" + std::to_string(usable) +
              " internal_error=" + std::to_string(internal_error) +
@@ -974,7 +976,12 @@ bool parse_input(const std::vector<uint8_t>& payload, ParsedInput* parsed) {
   return reader.u32(&parsed->scheme) && reader.i64(&parsed->timestamp);
 }
 
-void fill_input_buffer(const ParsedInput& parsed, SharedRegion& region, cdm::InputBuffer_2* input) {
+void fill_input_buffer(ParsedInput& parsed, SharedRegion& region, cdm::InputBuffer_2* input) {
+  // ISO CENC's 64-bit per-sample IV is the high half of the 128-bit CTR
+  // counter. Chromium also zero-extends it before passing it to the CDM ABI.
+  if (parsed.scheme == WVH_SCHEME_CENC && parsed.iv.size() == 8) {
+    parsed.iv.resize(16, 0);
+  }
   memset(input, 0, sizeof(*input));
   input->data = region.slot(parsed.slot) + parsed.offset;
   input->data_size = parsed.size;
@@ -1058,7 +1065,7 @@ void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
       push_result(events, parsed.request_id, WVH_ERROR, 0, 0);
     }
   } else {
-    host.trace_decrypt_failure(parsed.key_id, status);
+    host.trace_decrypt_failure(parsed.key_id, status, static_cast<uint32_t>(parsed.iv.size()));
     push_result(events, parsed.request_id,
                 status == cdm::kNoKey ? WVH_NO_KEY : WVH_DECRYPT_ERROR, 0, 0);
   }

@@ -669,3 +669,21 @@ PC 要件では Windows/macOS 以外を標準画質に制限している。
 
 参照: [再生時の公式ヘルプ](https://www.primevideo.com/help?nodeId=GU85HKX66NVFNQ9Y&language=ja_JP)、
 [PC の公式要件](https://www.primevideo.com/help?nodeId=GUX9FYHU5D8LC9EJ&language=ja_JP)。
+
+ユーザー操作で選択された H.264 track は 960x540 (720p 未満)、先頭 PTS は
+644477166 us だった。同じ映像の鍵は internal-error / system_code=5 で NoKey が続く。
+後から別の鍵に output-restricted / system_code=49 も現れた。復号に使った鍵の
+照合結果は internal-error のままであり、全鍵を HDCP エラーと一括分類しない。
+
+Chromium の MP4 parser / DecryptConfig / ToCdmInputBuffer と照合すると、
+Scarlet host は 8 バイト IV を CDM に直接渡していたが、Chromium は
+後半 8 バイトをゼロ埋めして 16 バイトに正規化していた。
+host の CENC InputBuffer 組み立て時に同じ正規化を追加した。
+16 バイト IV、鍵、subsample の暗号化 stream 順序は保持する。
+CDM に渡した実際の IV 長だけを復号失敗ログに残す。
+同じ Scarlet/CDM の公開 Sintel 暗号化区間は 15.778688 秒 / decoded 94 / usable 5、
+owner join まで合格した。Prime の低解像度映像での影響は次の再試験で確認する。
+
+参照: [Chromium TrackRunIterator の IV 正規化テスト](https://chromium.googlesource.com/chromium/src/+/45ec87b29fb536932d3c26d6cf236128a872a14b/media/formats/mp4/track_run_iterator_unittest.cc)、
+[DecryptConfig](https://chromium.googlesource.com/chromium/src/media/+/refs/heads/main/base/decrypt_config.h)、
+[ToCdmInputBuffer](https://chromium.googlesource.com/chromium/src/+/HEAD/media/cdm/cdm_type_conversion.cc)。
