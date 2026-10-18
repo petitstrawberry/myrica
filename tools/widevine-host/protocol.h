@@ -24,6 +24,8 @@ enum {
   WVH_CMD_DECRYPT = 7,
   WVH_CMD_SHUTDOWN = 8,
   WVH_CMD_RELEASE = 9,
+  WVH_CMD_CONFIGURE_VIDEO = 10,
+  WVH_CMD_DECODE = 11,
 };
 
 /* Host to client. */
@@ -35,6 +37,7 @@ enum {
   WVH_EV_KEYS = 104,
   WVH_EV_EXPIRATION = 105,
   WVH_EV_SESSION_CLOSED = 106,
+  WVH_EV_FRAME = 107,
 };
 
 /* Result status shared by EV_RESULT and the native client. */
@@ -124,6 +127,21 @@ typedef struct {
 } wvh_session_event;
 
 typedef struct {
+  uint32_t request_id; /* EV_FRAME */
+  uint32_t format;
+  uint32_t width;
+  uint32_t height;
+  uint32_t slot;
+  uint32_t size;
+  uint32_t stride_y;
+  uint32_t stride_u;
+  uint32_t stride_v;
+  uint32_t offset_u;
+  uint32_t offset_v;
+  int64_t timestamp;
+} wvh_frame_event;
+
+typedef struct {
   uint32_t session_id_size; /* EV_MESSAGE */
   uint32_t message_type;
   uint32_t slot;
@@ -132,7 +150,15 @@ typedef struct {
 } wvh_message_event;
 
 typedef struct {
-  uint32_t request_id; /* CMD_DECRYPT */
+  uint32_t codec;   /* CMD_CONFIGURE_VIDEO, CDM VideoCodec */
+  uint32_t profile; /* CDM VideoCodecProfile */
+  uint32_t format;  /* CDM VideoFormat */
+  uint32_t coded_width;
+  uint32_t coded_height;
+} wvh_video_config;
+
+typedef struct {
+  uint32_t request_id; /* CMD_DECRYPT, CMD_DECODE */
   uint32_t slot;
   uint32_t offset;
   uint32_t size;

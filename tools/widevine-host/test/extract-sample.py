@@ -133,6 +133,28 @@ def parse_senc(payload, default_iv_size):
     return entries
 
 
+def parse_tfhd(payload):
+    flags = int.from_bytes(payload[1:4], "big")
+    position = 4
+    track_id = int.from_bytes(payload[position : position + 4], "big")
+    position += 4
+    default_sample_duration = None
+    if flags & 0x01:
+        position += 8
+    if flags & 0x02:
+        position += 4
+    if flags & 0x08:
+        default_sample_duration = int.from_bytes(payload[position : position + 4], "big")
+    return {"track_id": track_id, "default_sample_duration": default_sample_duration}
+
+
+def parse_tfdt(payload):
+    version = payload[0]
+    if version == 1:
+        return int.from_bytes(payload[4:12], "big")
+    return int.from_bytes(payload[4:8], "big")
+
+
 def parse_trun(payload):
     flags = int.from_bytes(payload[1:4], "big")
     position = 4
@@ -171,6 +193,7 @@ def main():
     parser.add_argument("--media", required=True, type=Path)
     parser.add_argument("--sample", type=int, default=0)
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--all", action="store_true", help="also dump every sample of the segment")
     args = parser.parse_args()
 
     init = args.init.read_bytes()
@@ -193,6 +216,13 @@ def main():
     if senc_box is None or trun_box is None or mdat is None:
         raise SystemExit("missing senc, trun or mdat")
 
+    tfhd_box = find_box(media, b"tfhd", traf[0], traf[1])
+    default_duration = 1
+    if tfhd_box is not None:
+        tfhd = parse_tfhd(media[tfhd_box[0] : tfhd_box[1]])
+        default_duration = tfhd["default_sample_duration"] or 1
+    tfdt_box = find_box(media, b"tfdt", traf[0], traf[1])
+    base_decode_time = parse_tfdt(media[tfdt_box[0] : tfdt_box[1]]) if tfdt_box is not None else 0
     senc = parse_senc(media[senc_box[0] : senc_box[1]], tenc["iv_size"])
     trun = parse_trun(media[trun_box[0] : trun_box[1]])
 
@@ -213,6 +243,21 @@ def main():
     sample = media[offset : offset + size]
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    avcc = deep_find(init, b"avcC")
+    encv = deep_find(init, b"encv")
+    width = height = 0
+    profile = 0
+    if encv is not None:
+        payload = init[encv[0] : encv[1]]
+        if len(payload) >= 28:
+            width = int.from_bytes(payload[24:26], "big")
+            height = int.from_bytes(payload[26:28], "big")
+    if avcc is not None:
+        payload = init[avcc[0] : avcc[1]]
+        (args.out_dir / "avcc.bin").write_bytes(payload)
+        if len(payload) >= 2:
+            profile = payload[1]
+
     (args.out_dir / "sample.bin").write_bytes(sample)
     info = {
         "key_id": tenc["key_id"],
@@ -230,7 +275,28 @@ def main():
     print("sample size:", size, "offset:", offset)
     print("iv:", iv.hex())
     print("subsamples:", subsamples[:4], "count:", len(subsamples))
+    if args.all:
+        lines = []
+        running = data_start
+        decode_time = base_decode_time
+        timescale = 24
+        for index in range(trun["sample_count"]):
+            entry_iv, entry_subs = senc[index] if index < len(senc) else (b"", [])
+            entry_size = trun["samples"][index]["size"] or 0
+            duration = trun["samples"][index]["duration"] or default_duration
+            timestamp_us = decode_time * 1000000 // timescale
+            parts = [str(running), str(entry_size), entry_iv.hex(), str(timestamp_us)]
+            parts.extend(f"{clear}:{cipher}" for clear, cipher in entry_subs)
+            lines.append(" ".join(parts))
+            running += entry_size
+            decode_time += duration
+        (args.out_dir / "samples.txt").write_text(chr(10).join(lines) + chr(10))
+        (args.out_dir / "media.bin").write_bytes(media)
+        print("samples.txt entries:", len(lines))
+
     print("first bytes:", sample[:8].hex())
+    print("video:", {"width": width, "height": height, "profile_idc": profile})
+    print("timing:", {"timescale": 24, "default_duration": default_duration})
     clear = sum(entry[0] for entry in subsamples)
     if clear >= 4 and len(sample) >= 8:
         length = int.from_bytes(sample[0:4], "big")

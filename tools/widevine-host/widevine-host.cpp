@@ -826,86 +826,156 @@ void* get_cdm_host(int host_interface_version, void* user_data) {
   return static_cast<cdm::Host_10*>(static_cast<CdmHost*>(user_data));
 }
 
-void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
-                    SharedRegion& region, SlotPool& slots, const std::vector<uint8_t>& payload) {
-  Reader reader{payload.data(), payload.size(), 0};
-  wvh_decrypt request;
-  memset(&request, 0, sizeof(request));
-  if (!reader.u32(&request.request_id) || !reader.u32(&request.slot) ||
-      !reader.u32(&request.offset) || !reader.u32(&request.size)) {
-    push_result(events, 0, WVH_ERROR, 0, 0);
-    return;
+class HostVideoFrame final : public cdm::VideoFrame {
+ public:
+  void SetFormat(cdm::VideoFormat format) final { format_ = format; }
+  cdm::VideoFormat Format() const final { return format_; }
+  void SetSize(cdm::Size size) final { size_ = size; }
+  cdm::Size Size() const final { return size_; }
+  void SetFrameBuffer(cdm::Buffer* buffer) final { buffer_ = buffer; }
+  cdm::Buffer* FrameBuffer() final { return buffer_; }
+  void SetPlaneOffset(cdm::VideoPlane plane, uint32_t offset) final {
+    if (plane < cdm::kMaxPlanes) {
+      offsets_[plane] = offset;
+    }
   }
+  uint32_t PlaneOffset(cdm::VideoPlane plane) final {
+    return plane < cdm::kMaxPlanes ? offsets_[plane] : 0;
+  }
+  void SetStride(cdm::VideoPlane plane, uint32_t stride) final {
+    if (plane < cdm::kMaxPlanes) {
+      strides_[plane] = stride;
+    }
+  }
+  uint32_t Stride(cdm::VideoPlane plane) final {
+    return plane < cdm::kMaxPlanes ? strides_[plane] : 0;
+  }
+  void SetTimestamp(int64_t timestamp) final { timestamp_ = timestamp; }
+  int64_t Timestamp() const final { return timestamp_; }
+
+ private:
+  cdm::VideoFormat format_ = cdm::kUnknownVideoFormat;
+  cdm::Size size_ = {0, 0};
+  cdm::Buffer* buffer_ = nullptr;
+  uint32_t offsets_[cdm::kMaxPlanes] = {0, 0, 0};
+  uint32_t strides_[cdm::kMaxPlanes] = {0, 0, 0};
+  int64_t timestamp_ = 0;
+};
+
+struct ParsedInput {
+  uint32_t request_id = 0;
+  uint32_t slot = 0;
+  uint32_t offset = 0;
+  uint32_t size = 0;
   std::vector<uint8_t> key_id;
   std::vector<uint8_t> iv;
   std::vector<cdm::SubsampleEntry> subsamples;
-  uint32_t count = 0;
-  if (!reader.blob(&key_id) || !reader.blob(&iv)) {
-    push_result(events, request.request_id, WVH_ERROR, 0, 0);
-    return;
+  uint32_t scheme = 0;
+  int64_t timestamp = 0;
+};
+
+std::string to_hex(const std::vector<uint8_t>& bytes) {
+  static const char* digits = "0123456789abcdef";
+  std::string out;
+  for (uint8_t byte : bytes) {
+    out.push_back(digits[byte >> 4]);
+    out.push_back(digits[byte & 15]);
   }
-  if (!reader.u32(&count)) {
-    push_result(events, request.request_id, WVH_ERROR, 0, 0);
-    return;
+  return out;
+}
+
+bool parse_input(const std::vector<uint8_t>& payload, ParsedInput* parsed) {
+  Reader reader{payload.data(), payload.size(), 0};
+  uint32_t count = 0;
+  if (!reader.u32(&parsed->request_id) || !reader.u32(&parsed->slot) ||
+      !reader.u32(&parsed->offset) || !reader.u32(&parsed->size)) {
+    return false;
+  }
+  if (!reader.blob(&parsed->key_id) || !reader.blob(&parsed->iv) || !reader.u32(&count)) {
+    return false;
   }
   for (uint32_t index = 0; index < count; ++index) {
-    cdm::SubsampleEntry entry;
     uint32_t clear_bytes = 0;
     uint32_t cipher_bytes = 0;
     if (!reader.u32(&clear_bytes) || !reader.u32(&cipher_bytes)) {
-      push_result(events, request.request_id, WVH_ERROR, 0, 0);
-      return;
+      return false;
     }
+    cdm::SubsampleEntry entry;
     entry.clear_bytes = clear_bytes;
     entry.cipher_bytes = cipher_bytes;
-    subsamples.push_back(entry);
+    parsed->subsamples.push_back(entry);
   }
-  uint32_t scheme = 0;
-  if (!reader.u32(&scheme)) {
-    push_result(events, request.request_id, WVH_ERROR, 0, 0);
+  return reader.u32(&parsed->scheme) && reader.i64(&parsed->timestamp);
+}
+
+void fill_input_buffer(const ParsedInput& parsed, SharedRegion& region, cdm::InputBuffer_2* input) {
+  memset(input, 0, sizeof(*input));
+  input->data = region.slot(parsed.slot) + parsed.offset;
+  input->data_size = parsed.size;
+  if (parsed.scheme == 0) {
+    input->encryption_scheme = cdm::EncryptionScheme::kUnencrypted;
+  } else if (parsed.scheme == WVH_SCHEME_CBCS) {
+    input->encryption_scheme = cdm::EncryptionScheme::kCbcs;
+  } else {
+    input->encryption_scheme = cdm::EncryptionScheme::kCenc;
+  }
+  input->key_id = parsed.key_id.empty() ? nullptr : parsed.key_id.data();
+  input->key_id_size = static_cast<uint32_t>(parsed.key_id.size());
+  input->iv = parsed.iv.empty() ? nullptr : parsed.iv.data();
+  input->iv_size = static_cast<uint32_t>(parsed.iv.size());
+  input->subsamples = parsed.subsamples.empty() ? nullptr : parsed.subsamples.data();
+  input->num_subsamples = static_cast<uint32_t>(parsed.subsamples.size());
+  input->timestamp = parsed.timestamp;
+}
+
+bool push_frame(EventSink& events, uint32_t request_id, HostVideoFrame& frame, SharedRegion& region,
+                SlotPool& slots, uint32_t slot_size, uint32_t* out_slot, uint32_t* out_size) {
+  cdm::Buffer* buffer = frame.FrameBuffer();
+  if (buffer == nullptr) {
+    return false;
+  }
+  const int slot = slots.take();
+  const uint32_t size = buffer->Size();
+  if (slot < 0 || size > slot_size) {
+    return false;
+  }
+  memcpy(region.slot(static_cast<uint32_t>(slot)), buffer->Data(), size);
+  const cdm::Size frame_size = frame.Size();
+  std::vector<uint8_t> payload;
+  append_u32(&payload, request_id);
+  append_u32(&payload, static_cast<uint32_t>(frame.Format()));
+  append_u32(&payload, static_cast<uint32_t>(frame_size.width));
+  append_u32(&payload, static_cast<uint32_t>(frame_size.height));
+  append_u32(&payload, static_cast<uint32_t>(slot));
+  append_u32(&payload, size);
+  append_u32(&payload, frame.Stride(cdm::kYPlane));
+  append_u32(&payload, frame.Stride(cdm::kUPlane));
+  append_u32(&payload, frame.Stride(cdm::kVPlane));
+  append_u32(&payload, frame.PlaneOffset(cdm::kUPlane));
+  append_u32(&payload, frame.PlaneOffset(cdm::kVPlane));
+  append_u64(&payload, static_cast<uint64_t>(frame.Timestamp()));
+  events.push_event(WVH_EV_FRAME, payload);
+  *out_slot = static_cast<uint32_t>(slot);
+  *out_size = size;
+  return true;
+}
+
+void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
+                    SharedRegion& region, SlotPool& slots,
+                    const std::vector<uint8_t>& payload) {
+  ParsedInput parsed;
+  if (!parse_input(payload, &parsed)) {
+    push_result(events, 0, WVH_ERROR, 0, 0);
     return;
   }
-  int64_t timestamp = 0;
-  if (!reader.i64(&timestamp)) {
-    push_result(events, request.request_id, WVH_ERROR, 0, 0);
-    return;
-  }
-
-  cdm::InputBuffer_2 input;
-  memset(&input, 0, sizeof(input));
-  input.data = region.slot(request.slot) + request.offset;
-  input.data_size = request.size;
-  input.encryption_scheme =
-      scheme == WVH_SCHEME_CBCS ? cdm::EncryptionScheme::kCbcs : cdm::EncryptionScheme::kCenc;
-  input.key_id = key_id.empty() ? nullptr : key_id.data();
-  input.key_id_size = static_cast<uint32_t>(key_id.size());
-  input.iv = iv.empty() ? nullptr : iv.data();
-  input.iv_size = static_cast<uint32_t>(iv.size());
-  input.subsamples = subsamples.empty() ? nullptr : subsamples.data();
-  input.num_subsamples = static_cast<uint32_t>(subsamples.size());
-  input.timestamp = timestamp;
-
   if (options.verbose) {
-    static const char* digits = "0123456789abcdef";
-    std::string key_hex;
-    for (uint8_t byte : key_id) {
-      key_hex.push_back(digits[byte >> 4]);
-      key_hex.push_back(digits[byte & 15]);
-    }
-    std::string iv_hex;
-    for (uint8_t byte : iv) {
-      iv_hex.push_back(digits[byte >> 4]);
-      iv_hex.push_back(digits[byte & 15]);
-    }
-    std::string subsample_text;
-    for (const cdm::SubsampleEntry& entry : subsamples) {
-      subsample_text += std::to_string(entry.clear_bytes) + ":" +
-                        std::to_string(entry.cipher_bytes) + " ";
-    }
-    log_line("decrypt request key_id=" + key_hex + " iv=" + iv_hex +
-             " scheme=" + std::to_string(scheme) + " bytes=" + std::to_string(request.size) +
-             " subsamples=" + std::to_string(subsamples.size()) + " [" + subsample_text + "]");
+    log_line("decrypt request key_id=" + to_hex(parsed.key_id) + " iv=" + to_hex(parsed.iv) +
+             " scheme=" + std::to_string(parsed.scheme) +
+             " bytes=" + std::to_string(parsed.size) +
+             " subsamples=" + std::to_string(parsed.subsamples.size()));
   }
+  cdm::InputBuffer_2 input;
+  fill_input_buffer(parsed, region, &input);
   HostDecryptedBlock block;
   const cdm::Status status = host.cdm()->Decrypt(input, &block);
   if (options.verbose) {
@@ -915,20 +985,87 @@ void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
     const int out_slot = slots.take();
     const uint32_t out_size = block.DecryptedBuffer()->Size();
     if (out_slot >= 0 && out_size <= options.slot_size) {
-      memcpy(region.slot(static_cast<uint32_t>(out_slot)),
-             block.DecryptedBuffer()->Data(), out_size);
-      push_result(events, request.request_id, WVH_OK, static_cast<uint32_t>(out_slot),
-                  out_size);
+      memcpy(region.slot(static_cast<uint32_t>(out_slot)), block.DecryptedBuffer()->Data(),
+             out_size);
+      push_result(events, parsed.request_id, WVH_OK, static_cast<uint32_t>(out_slot), out_size);
     } else {
-      push_result(events, request.request_id, WVH_ERROR, 0, 0);
+      push_result(events, parsed.request_id, WVH_ERROR, 0, 0);
     }
   } else {
-    push_result(events, request.request_id,
+    push_result(events, parsed.request_id,
                 status == cdm::kNoKey ? WVH_NO_KEY : WVH_DECRYPT_ERROR, 0, 0);
   }
   if (block.DecryptedBuffer() != nullptr) {
     block.DecryptedBuffer()->Destroy();
   }
+}
+
+void handle_decode(const Options& options, CdmHost& host, EventSink& events,
+                   SharedRegion& region, SlotPool& slots,
+                   const std::vector<uint8_t>& payload) {
+  ParsedInput parsed;
+  if (!parse_input(payload, &parsed)) {
+    push_result(events, 0, WVH_ERROR, 0, 0);
+    return;
+  }
+  if (options.verbose) {
+    log_line("decode request key_id=" + to_hex(parsed.key_id) + " iv=" + to_hex(parsed.iv) +
+             " bytes=" + std::to_string(parsed.size) +
+             " subsamples=" + std::to_string(parsed.subsamples.size()));
+  }
+  cdm::InputBuffer_2 input;
+  fill_input_buffer(parsed, region, &input);
+  HostVideoFrame frame;
+  const cdm::Status status = host.cdm()->DecryptAndDecodeFrame(input, &frame);
+  uint32_t out_slot = 0;
+  uint32_t out_size = 0;
+  if (status == cdm::kSuccess) {
+    push_frame(events, parsed.request_id, frame, region, slots, options.slot_size, &out_slot,
+               &out_size);
+  }
+  if (frame.FrameBuffer() != nullptr) {
+    frame.FrameBuffer()->Destroy();
+  }
+  if (options.verbose) {
+    log_line("decode status=" + std::to_string(static_cast<uint32_t>(status)) +
+             " frame_slot=" + std::to_string(out_slot) + " frame_size=" + std::to_string(out_size));
+  }
+  push_result(events, parsed.request_id,
+              status == cdm::kSuccess ? WVH_OK
+                                      : (status == cdm::kNoKey ? WVH_NO_KEY : WVH_DECRYPT_ERROR),
+              out_slot, out_size);
+}
+
+void handle_configure_video(const Options& options, CdmHost& host, EventSink& events,
+                            const std::vector<uint8_t>& payload) {
+  Reader reader{payload.data(), payload.size(), 0};
+  wvh_video_config config;
+  std::vector<uint8_t> extra_data;
+  if (!reader.u32(&config.codec) || !reader.u32(&config.profile) || !reader.u32(&config.format) ||
+      !reader.u32(&config.coded_width) || !reader.u32(&config.coded_height) ||
+      !reader.blob(&extra_data)) {
+    push_result(events, 0, WVH_ERROR, 0, 0);
+    return;
+  }
+  cdm::VideoDecoderConfig_2 decoder_config;
+  memset(&decoder_config, 0, sizeof(decoder_config));
+  decoder_config.codec = static_cast<cdm::VideoCodec>(config.codec);
+  decoder_config.profile = static_cast<cdm::VideoCodecProfile>(config.profile);
+  decoder_config.format = static_cast<cdm::VideoFormat>(config.format);
+  decoder_config.coded_size.width = static_cast<int32_t>(config.coded_width);
+  decoder_config.coded_size.height = static_cast<int32_t>(config.coded_height);
+  decoder_config.extra_data = extra_data.empty() ? nullptr : extra_data.data();
+  decoder_config.extra_data_size = static_cast<uint32_t>(extra_data.size());
+  decoder_config.encryption_scheme = cdm::EncryptionScheme::kCenc;
+  const cdm::Status status = host.cdm()->InitializeVideoDecoder(decoder_config);
+  if (options.verbose) {
+    log_line("configure video codec=" + std::to_string(config.codec) +
+             " profile=" + std::to_string(config.profile) + " size=" +
+             std::to_string(config.coded_width) + "x" + std::to_string(config.coded_height) +
+             " extra=" + std::to_string(extra_data.size()) +
+             " status=" + std::to_string(static_cast<uint32_t>(status)));
+  }
+  push_result(events, 0, status == cdm::kSuccess ? WVH_OK : WVH_ERROR, 0, 0);
 }
 
 void serve(int client_fd, const Options& options, CdmHost& host, EventSink& events,
@@ -1064,6 +1201,12 @@ void serve(int client_fd, const Options& options, CdmHost& host, EventSink& even
       }
       case WVH_CMD_DECRYPT:
         handle_decrypt(options, host, events, region, slots, payload);
+        break;
+      case WVH_CMD_DECODE:
+        handle_decode(options, host, events, region, slots, payload);
+        break;
+      case WVH_CMD_CONFIGURE_VIDEO:
+        handle_configure_video(options, host, events, payload);
         break;
       case WVH_CMD_RELEASE: {
         Reader body{payload.data(), payload.size(), 0};
