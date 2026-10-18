@@ -516,3 +516,18 @@ SWS は WINDOW_CREATED 送信後に window 作成を記録し、直後に client
 ScarletUI main `332caaf0` は元の sws-client エラー種別を出力する。
 この版の Release ビルドと転送後の再起動は成功し、GUI / WebKit の起動完了を確認した。
 同じ surface エラーは再現せず、原因修正済みとは扱わない。
+
+
+NSPR 配置後の再起動では CDM 4.10.2662.3 が initialize を完了し、
+Prime Video の license-request に応答が返り、3 鍵が usable になった。
+SDK は hasStartedPlaying=yes を記録したが、その後 error 7031 の画面に遷移した。
+公開 SDK のコードでは 7031 は xp.unknown に対応する汎用エラーであり、
+この番号からネットワーク、HDCP、デコーダなど特定の原因を推論しない。
+/dev/video0 の 1920x1080 H.264 configure / flush が記録された。
+最初の映像が広告等の clear content か暗号化区間かは未確認。
+
+WebKit `141519af` は SCARLET_EME_TRACE でも既存の低頻度 media lifecycle を
+記録できるようにし、MSE append/parser の失敗を記録する。
+Rust bridge も、従来詳細が消えていた音声出力、映像出力の容量・形式、
+playbackRate / seek の不正値の失敗を記録する。
+高頻度の paint / GPU readback 診断は有効にしない。

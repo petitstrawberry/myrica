@@ -1394,6 +1394,9 @@ fn session_worker(shared: &SessionShared) {
             continue;
         }
         if audio_result.is_err() {
+            if state.status.error == 0 {
+                eprintln!("SCARLET_MEDIA_ERROR stage=audio-pump");
+            }
             state.status.error = ERROR;
             state.clock.set_playing(false);
         }
@@ -1589,6 +1592,7 @@ fn session_worker(shared: &SessionShared) {
                             .get(&id)
                             .is_some_and(|track| track.generation == generation)
                         {
+                            eprintln!("SCARLET_MEDIA_ERROR stage=decode-only-capacity track={id}");
                             state.status.error = ERROR;
                         }
                         continue;
@@ -1633,6 +1637,10 @@ fn session_worker(shared: &SessionShared) {
                         || !video_output_has_capacity(state.video.len(), frames.len())
                         || !frames.iter().all(decoded_video_is_valid)
                     {
+                        eprintln!(
+                            "SCARLET_MEDIA_ERROR stage=video-output track={id} frames={} reserved={reserved} queued={} valid={}",
+                            frames.len(), state.video.len(), frames.iter().all(decoded_video_is_valid)
+                        );
                         state.status.error = ERROR;
                         continue;
                     }
@@ -1663,6 +1671,10 @@ fn session_worker(shared: &SessionShared) {
                         continue;
                     }
                     if frame.channels == 0 || frame.rate == 0 {
+                        eprintln!(
+                            "SCARLET_MEDIA_ERROR stage=audio-format track={id} channels={} rate={}",
+                            frame.channels, frame.rate
+                        );
                         state.status.error = ERROR;
                     } else {
                         if !state.clock.audio_master {
@@ -1679,6 +1691,7 @@ fn session_worker(shared: &SessionShared) {
                         }
                         update_duration(&mut state);
                         if audio.push(frame).is_err() {
+                            eprintln!("SCARLET_MEDIA_ERROR stage=audio-output track={id}");
                             state.status.error = ERROR;
                         }
                     }
@@ -2161,6 +2174,7 @@ pub unsafe extern "C" fn scarlet_media_session_set_rate(session: *mut MediaSessi
             if rate == 0.0 {
                 state.clock.set_playing(false);
             } else if rate != 1.0 {
+                eprintln!("SCARLET_MEDIA_ERROR stage=playback-rate rate={rate}");
                 state.status.error = ERROR;
                 state.clock.set_playing(false);
             }
@@ -2186,6 +2200,7 @@ pub unsafe extern "C" fn scarlet_media_session_seek(session: *mut MediaSession, 
     unsafe {
         control(session, |state| {
             if !seconds.is_finite() || seconds < 0.0 {
+                eprintln!("SCARLET_MEDIA_ERROR stage=seek-target seconds={seconds}");
                 state.status.error = ERROR;
                 return;
             }
