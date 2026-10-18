@@ -652,3 +652,20 @@ Prime への影響はページを再読み込みして再試験する。
 の RequestStorageId / CreateFileIO / OnQueryOutputProtectionStatusDone、
 [media_options.gni](https://github.com/chromium/chromium/blob/main/media/media_options.gni)
 の enable_cdm_host_verification。
+
+### Prime Video の SD 再生を目標に切り分け
+
+ユーザーは SD 画質での再生を希望した。HDCP の対応範囲を拡大する作業とは分け、
+まず選択された暗号化映像の解像度を実測する。
+従来の width / height 記録はデコーダ初期化後だけだったため、復号前に NoKey で
+停止する映像には出なかった。既存の低頻度 SCARLET_MEDIA_KEY_WAIT に
+codec / width / height を追加した。認証情報・鍵 ID・ライセンスは記録しない。
+Scarlet 向け Release ビルドで確認した。
+
+Amazon の公式要件は外部出力の HD に HDCP 1.4、UHD/HDR に HDCP 2.2 と記載し、
+PC 要件では Windows/macOS 以外を標準画質に制限している。
+これだけで SD の全コンテンツが出力保護を要求しないとは判断しない。
+現在の Chrome/Linux 互換 UA が選ぶ実際の画質と、鍵状態を照合する。
+
+参照: [再生時の公式ヘルプ](https://www.primevideo.com/help?nodeId=GU85HKX66NVFNQ9Y&language=ja_JP)、
+[PC の公式要件](https://www.primevideo.com/help?nodeId=GUX9FYHU5D8LC9EJ&language=ja_JP)。

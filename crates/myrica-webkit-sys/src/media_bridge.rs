@@ -1507,7 +1507,10 @@ fn session_worker(shared: &SessionShared) {
                             let trace_key_wait = trace_key_wait || crate::cdm_bridge::trace_enabled();
                             if trace_key_wait {
                                 eprintln!(
-                                    "SCARLET_MEDIA_KEY_WAIT track={id} pts_us={} revision={}",
+                                    "SCARLET_MEDIA_KEY_WAIT track={id} codec={:?} width={} height={} pts_us={} revision={}",
+                                    track.track.codec,
+                                    track.track.width,
+                                    track.track.height,
                                     track.samples.front().unwrap().sample.pts_us,
                                     revision.1
                                 );
