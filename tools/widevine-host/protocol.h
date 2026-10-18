@@ -11,7 +11,7 @@
 #include <stdint.h>
 
 #define WVH_MAGIC 0x31564857u /* WVH1 */
-#define WVH_VERSION 1u
+#define WVH_VERSION 2u /* reserved input slot, video drain/status and deinitialize */
 
 /* Client to host. */
 enum {
@@ -26,6 +26,7 @@ enum {
   WVH_CMD_RELEASE = 9,
   WVH_CMD_CONFIGURE_VIDEO = 10,
   WVH_CMD_DECODE = 11,
+  WVH_CMD_DEINITIALIZE_VIDEO = 13, /* request_id */
   WVH_CMD_SET_SERVER_CERTIFICATE = 12, /* request_id, certificate blob */
 };
 
@@ -44,6 +45,7 @@ enum {
 /* Result status shared by EV_RESULT and the native client. */
 enum {
   WVH_OK = 0,
+  WVH_NEED_MORE_DATA = 1, /* decode consumed input, no picture yet */
   WVH_ERROR = -1,
   WVH_NO_KEY = -2,
   WVH_DECRYPT_ERROR = -3,

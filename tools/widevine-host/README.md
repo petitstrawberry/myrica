@@ -32,15 +32,17 @@ Framing is a 16-byte header (`magic`, `kind`, `flags`, `length`) followed by
 the payload. Integers are little-endian.
 
 Requests: `HELLO`, `INIT`, `CREATE_SESSION`, `UPDATE_SESSION`,
-`CLOSE_SESSION`, `REMOVE_SESSION`, `DECRYPT`, `RELEASE`, `SHUTDOWN`.
+`CLOSE_SESSION`, `REMOVE_SESSION`, `SET_SERVER_CERTIFICATE`, `DECRYPT`,
+`CONFIGURE_VIDEO`, `DECODE`, `DEINITIALIZE_VIDEO`, `RELEASE`, `SHUTDOWN`.
 
 Events: `READY`, `RESULT`, `SESSION`, `MESSAGE`, `KEYS`, `EXPIRATION`,
-`SESSION_CLOSED`. Events are asynchronous: a session id or licence request can
+`SESSION_CLOSED`, `FRAME`. Events are asynchronous: a session id or licence request can
 arrive before the result of the request that produced it, so clients must
 dispatch on the frame kind rather than on a fixed reply order.
 
 The shared region starts with a 4096-byte `wvh_shm_header` and continues with
-`slot_count` slots of `slot_size` bytes (default 4 x 1 MiB). Message payloads
+`slot_count` slots of `slot_size` bytes (Myrica uses 4 x 4 MiB). Slot zero
+is reserved for client input; output and asynchronous messages use slots 1 onward. Message payloads
 and decrypted samples are addressed as `[slot, offset, size]`; the client
 returns a slot with `RELEASE`.
 
@@ -79,10 +81,10 @@ NSPR_LIB_DIR=/tmp/nspr ./test/run-in-container.sh /tmp/widevine-host ~/.local/sh
 Expected tail:
 
 ```
-READY version=1 header=4096 slots=4 slot_size=1048576
+READY version=2 header=4096 slots=4 slot_size=1048576
 INIT status=0
 EV_SESSION request=1 session=...
-EV_MESSAGE type=0 slot=0 size=1677
+EV_MESSAGE type=0 slot=1 size=1677
 CREATE_SESSION status=0
 MESSAGE_BYTES 8 1 18 239 size=1677
 CLIENT_OK
@@ -133,22 +135,33 @@ X-AxDRM-Message test entitlement):
   request carried a single cipher region,
 - a wrong key id returns kNoKey, so the success path is key driven.
 
-The early probe interpreted multi-entry failures as a CDM limitation. W3
-corrected the native client's input assembly: CENC cipher bytes from every
-subsample form one continuous stream, with clear bytes excluded. The client
-gathers that stream into one Decrypt request and scatters the result into the
-original sample. Reusing the IV separately for each region was incorrect.
-The previous zero-output retry has been removed.
+The early multi-entry/zero-output results did not establish a CDM limitation.
+The test client omitted FRAME event handling and therefore waited forever even
+when the CDM returned a decoded picture. The native frame parser also omitted
+the request id. Both are fixed. H.264 must be converted to Annex B, with clear
+SPS/PPS inserted for keyframes and subsample maps adjusted to preserve cipher
+byte order. Decoder extra_data is empty because parameter sets travel in-band.
 
 ## Status
 
-The Scarlet-native client in `crates/cdm-host` spawns this process using handle
-mappings. WebCore delivers container init data, the page performs the licence
-exchange, and the media worker decrypts before the native `/dev/video0` decoder.
-With the same CDM 4.10.2662.3, Scarlet Release validation passed two encrypted
-four-second Sintel fragments (94 decoded frames each) and the sixteen-second
-clear-lead transition (382 frames). Details and current format/session limits
-are in [the roadmap](../../docs/encrypted-media-roadmap.md#w3-メディア接続と実測-2026-10-18).
+Myrica uses the CDM video decoder for H.264 with attached MediaKeys. It sends
+complete access units and subsample maps, handles NeedMoreData and delayed
+frames, and converts padded I420/YV12 into NV12 for the existing GPU display.
+Audio uses Decrypt followed by the AAC decoder. Ordinary video continues to
+use `/dev/video0`. NoKey waits for a key revision; CDM key/output protection
+statuses are preserved.
+
+**The helper and native client must both use protocol version 2.** Rebuild
+`widevine-host` from the same Myrica revision and replace the executable at
+`MYRICA_WIDEVINE_HOST` (default `/shared/widevine/widevine-host`). Existing
+processes keep their current executable; new instances use the replacement.
+The proprietary CDM and Linux-view dependencies remain user-provided.
+
+Scarlet Release validation with CDM 4.10.2662.3 passed encrypted playback,
+EOS drain (96 frames), seek/replay (191 cumulative frames), and the clear-lead
+transition through EOS (384 frames). The user also confirmed Prime Video
+playback, with logs showing CDM-decoded 960x540 video continuing past 640 frames.
+See [the roadmap](../../docs/encrypted-media-roadmap.md) for the measurements.
 
 The test client's raw `--decrypt-sample` / experimental decode modes are W1
 probes of CDM API behaviour. The browser playback regression is

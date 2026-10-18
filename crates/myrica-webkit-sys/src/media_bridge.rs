@@ -121,7 +121,11 @@ fn key_revision(cdm: &Option<AttachedCdm>) -> (usize, u64) {
 
 // AGAIN retains the encrypted packet until MediaKeys or a new key revision
 // arrives. Neither WebCore nor the compositor waits for the host process.
-fn decrypt_sample(cdm: &Option<AttachedCdm>, sample: &mut Sample) -> Result<(), i32> {
+fn decrypt_sample(
+    cdm: &Option<AttachedCdm>,
+    track: &Track,
+    sample: &mut Sample,
+) -> Result<(), i32> {
     let Some(info) = &sample.encryption else {
         return Ok(());
     };
@@ -130,6 +134,11 @@ fn decrypt_sample(cdm: &Option<AttachedCdm>, sample: &mut Sample) -> Result<(), 
         let Some(cdm) = cdm else {
             return Err(AGAIN);
         };
+        // The CDM consumes encrypted H.264 through its video decoder. Keep
+        // encryption metadata attached until that decoder accepts the sample.
+        if track.codec == Codec::H264 {
+            return Ok(());
+        }
         let subsamples: Vec<_> = info
             .subsamples
             .iter()
@@ -165,7 +174,7 @@ fn decrypt_sample(cdm: &Option<AttachedCdm>, sample: &mut Sample) -> Result<(), 
     }
     #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
     {
-        let _ = (cdm, info);
+        let _ = (cdm, track, info);
         Err(AGAIN)
     }
 }
@@ -957,7 +966,16 @@ pub struct MediaSession {
     worker: Option<JoinHandle<()>>,
 }
 
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+#[path = "cdm_pixels.rs"]
+mod cdm_pixels;
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+#[path = "cdm_video.rs"]
+mod cdm_video;
+
 enum Decoder {
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    CdmVideo(cdm_video::CdmVideoDecoder),
     Video(HardwareVideoDecoder),
     Audio(AudioDecoder),
 }
@@ -969,6 +987,8 @@ struct TrackDecoder {
 }
 
 enum DecodeOutput {
+    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+    WaitingForKey,
     Video(Vec<VideoFrame>),
     Audio(AudioFrame),
 }
@@ -980,14 +1000,25 @@ struct VideoFrame {
     duration_us: u64,
     color: ColorInfo,
     #[cfg(target_os = "scarlet")]
-    pixels: scarlet_video_client::OwnedDecodedFrame,
+    pixels: VideoPixels,
+}
+
+#[cfg(target_os = "scarlet")]
+enum VideoPixels {
+    Native(scarlet_video_client::OwnedDecodedFrame),
+    #[cfg(feature = "encrypted-media")]
+    Cdm(Vec<u8>),
 }
 
 impl VideoFrame {
     fn payload(&self) -> &[u8] {
         #[cfg(target_os = "scarlet")]
         {
-            self.pixels.payload()
+            match &self.pixels {
+                VideoPixels::Native(pixels) => pixels.payload(),
+                #[cfg(feature = "encrypted-media")]
+                VideoPixels::Cdm(pixels) => pixels,
+            }
         }
         #[cfg(not(target_os = "scarlet"))]
         {
@@ -1187,7 +1218,7 @@ impl HardwareVideoDecoder {
             pts_us,
             duration_us,
             color,
-            pixels,
+            pixels: VideoPixels::Native(pixels),
         };
         if !decoded_video_is_valid(&frame) {
             return Err(MediaError::InvalidData(
@@ -1448,6 +1479,8 @@ fn session_worker(shared: &SessionShared) {
             let reserved = if track.track.codec == Codec::H264 {
                 let pending = match decoders.get(&id).map(|decoder| &decoder.decoder) {
                     Some(Decoder::Video(decoder)) => decoder.pending_frames(),
+                    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                    Some(Decoder::CdmVideo(decoder)) => decoder.pending_frames(),
                     _ => 0,
                 };
                 video_output_reservation(has_sample, pending)
@@ -1469,7 +1502,14 @@ fn session_worker(shared: &SessionShared) {
                 let track = state.tracks.get_mut(&id).expect("selected decode track");
                 let sample = track.samples.pop_front();
                 if sample.is_none() {
-                    track.drained = true;
+                    #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                    let cdm_video = matches!(
+                        decoders.get(&id).map(|d| &d.decoder),
+                        Some(Decoder::CdmVideo(_))
+                    );
+                    #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
+                    let cdm_video = false;
+                    track.drained = !cdm_video;
                 }
                 (
                     id,
@@ -1489,7 +1529,7 @@ fn session_worker(shared: &SessionShared) {
             }
             drop(state);
             if let Some(packet) = &mut sample {
-                if let Err(result) = decrypt_sample(&cdm, &mut packet.sample) {
+                if let Err(result) = decrypt_sample(&cdm, &track, &mut packet.sample) {
                     let mut state = lock(&shared.state);
                     if state
                         .tracks
@@ -1504,7 +1544,8 @@ fn session_worker(shared: &SessionShared) {
                             track.blocked_on_key = Some(revision);
                             let trace_key_wait = media_profile_enabled();
                             #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
-                            let trace_key_wait = trace_key_wait || crate::cdm_bridge::trace_enabled();
+                            let trace_key_wait =
+                                trace_key_wait || crate::cdm_bridge::trace_enabled();
                             if trace_key_wait {
                                 eprintln!(
                                     "SCARLET_MEDIA_KEY_WAIT track={id} codec={:?} width={} height={} pts_us={} revision={}",
@@ -1541,19 +1582,45 @@ fn session_worker(shared: &SessionShared) {
                     state.clock.clear_key_block();
                 }
             }
-            if decoders
-                .get(&id)
-                .is_none_or(|current| current.generation != generation)
-            {
+            #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+            let needs_cdm = track.codec == Codec::H264 && cdm.is_some();
+            let replace_decoder = decoders.get(&id).is_none_or(|current| {
+                #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                match &current.decoder {
+                    Decoder::CdmVideo(decoder)
+                        if cdm.as_ref().is_none_or(|cdm| !decoder.uses_cdm(cdm)) =>
+                    {
+                        return true;
+                    }
+                    Decoder::Video(_) if needs_cdm => return true,
+                    _ => (),
+                }
+                current.generation != generation
+            });
+            if replace_decoder {
+                // Release the old CDM decoder before configuring the new generation.
+                decoders.remove(&id);
                 let decoder = match track.codec {
                     Codec::H264 => {
+                        #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                        if needs_cdm {
+                            cdm_video::CdmVideoDecoder::new(
+                                cdm.as_ref().unwrap().clone(),
+                                &track,
+                                cancellation,
+                            )
+                            .map(Decoder::CdmVideo)
+                        } else {
+                            HardwareVideoDecoder::new(&track, cancellation).map(Decoder::Video)
+                        }
+                        #[cfg(not(all(target_os = "scarlet", feature = "encrypted-media")))]
                         HardwareVideoDecoder::new(&track, cancellation).map(Decoder::Video)
                     }
                     Codec::Aac => AudioDecoder::new(&track).map(Decoder::Audio),
                 };
                 match decoder {
                     Ok(decoder) => {
-                        if track.codec == Codec::H264 {
+                        if matches!(&decoder, Decoder::Video(_)) {
                             eprintln!(
                                 "[myrica:media] video-decoder=scarlet-native device=/dev/video0 output=nv12 cpu-h264-fallback=none session={:#x} track={} generation={} reason={} width={} height={} configuration_bytes={}",
                                 shared as *const SessionShared as usize,
@@ -1607,6 +1674,8 @@ fn session_worker(shared: &SessionShared) {
                 }
             }
             let result = match (&mut decoder.decoder, sample.as_ref()) {
+                #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                (Decoder::CdmVideo(decoder), packet) => decoder.push(packet.map(|p| &p.sample)),
                 (Decoder::Video(decoder), Some(sample)) => {
                     decoder.push(&sample.sample).map(DecodeOutput::Video)
                 }
@@ -1638,14 +1707,31 @@ fn session_worker(shared: &SessionShared) {
                 continue;
             }
             match result {
+                #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+                Ok(DecodeOutput::WaitingForKey) => {
+                    if let Some(packet) = sample.take() {
+                        let blocked_time = packet.sample.pts_us as f64 / 1_000_000.0;
+                        state.input_bytes += sample_bytes(&packet.sample);
+                        let track = state.tracks.get_mut(&id).unwrap();
+                        track.samples.push_front(packet);
+                        track.blocked_on_key = Some(revision);
+                        state.status.waiting_for_key = 1;
+                        state.clock.block_for_key(blocked_time);
+                    }
+                }
                 Ok(DecodeOutput::Video(mut frames)) => {
+                    if sample.is_none() && frames.is_empty() {
+                        state.tracks.get_mut(&id).unwrap().drained = true;
+                    }
                     if frames.len() > reserved
                         || !video_output_has_capacity(state.video.len(), frames.len())
                         || !frames.iter().all(decoded_video_is_valid)
                     {
                         eprintln!(
                             "SCARLET_MEDIA_ERROR stage=video-output track={id} frames={} reserved={reserved} queued={} valid={}",
-                            frames.len(), state.video.len(), frames.iter().all(decoded_video_is_valid)
+                            frames.len(),
+                            state.video.len(),
+                            frames.iter().all(decoded_video_is_valid)
                         );
                         state.status.error = ERROR;
                         continue;
@@ -2961,7 +3047,18 @@ mod tests {
             }),
         };
         let encrypted = sample.data.clone();
-        assert_eq!(decrypt_sample(&None, &mut sample), Err(AGAIN));
+        let track = Track {
+            id: 1,
+            codec: Codec::H264,
+            extradata: Vec::new(),
+            width: 256,
+            height: 110,
+            sample_rate: 0,
+            channels: 0,
+            timescale: 1_000_000,
+            duration_us: None,
+        };
+        assert_eq!(decrypt_sample(&None, &track, &mut sample), Err(AGAIN));
         assert_eq!(sample.data, encrypted);
         assert!(sample.encryption.is_some());
         assert_eq!(sample_bytes(&sample), 32 + 24 + 16);

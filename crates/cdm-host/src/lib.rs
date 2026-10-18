@@ -19,7 +19,7 @@ use scarlet_os::socket::Socket;
 use scarlet_sys::{Syscall, syscall1};
 
 pub const WVH_MAGIC: u32 = 0x3156_4857;
-pub const WVH_VERSION: u32 = 1;
+pub const WVH_VERSION: u32 = 2;
 
 pub const CMD_HELLO: u32 = 1;
 pub const CMD_INIT: u32 = 2;
@@ -32,6 +32,7 @@ pub const CMD_SHUTDOWN: u32 = 8;
 pub const CMD_RELEASE: u32 = 9;
 pub const CMD_CONFIGURE_VIDEO: u32 = 10;
 pub const CMD_DECODE: u32 = 11;
+pub const CMD_DEINITIALIZE_VIDEO: u32 = 13;
 pub const CMD_SET_SERVER_CERTIFICATE: u32 = 12;
 
 pub const EV_READY: u32 = 100;
@@ -44,6 +45,7 @@ pub const EV_SESSION_CLOSED: u32 = 106;
 pub const EV_FRAME: u32 = 107;
 
 pub const STATUS_OK: i32 = 0;
+pub const STATUS_NEED_MORE_DATA: i32 = 1;
 pub const STATUS_ERROR: i32 = -1;
 pub const STATUS_NO_KEY: i32 = -2;
 pub const STATUS_DECRYPT_ERROR: i32 = -3;
@@ -155,6 +157,7 @@ pub enum HostEvent {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FrameInfo {
+    pub request_id: u32,
     pub format: u32,
     pub width: u32,
     pub height: u32,
@@ -495,10 +498,8 @@ impl CdmHost {
         }
     }
 
-    /// CENC treats the cipher bytes across all subsamples as one continuous
-    /// stream. Gather that stream for a single CDM call, then scatter the clear
-    /// result back around the original unencrypted bytes. This also avoids the
-    /// CDM's rejected multi-entry subsample path without restarting its counter.
+    /// Preserve the encoded access unit and its clear/cipher boundaries. The
+    /// CDM needs the clear codec headers as well as the encrypted payload.
     pub fn decrypt(&mut self, request: &DecryptRequest<'_>) -> Result<Vec<u8>> {
         if request.scheme != SCHEME_CENC {
             return Err(CdmHostError::Status(STATUS_UNSUPPORTED));
@@ -512,65 +513,35 @@ impl CdmHost {
         } else {
             request.subsamples.to_vec()
         };
-        let mut cipher = Vec::new();
-        let mut ranges = Vec::new();
         let mut position = 0usize;
+        let mut cipher_bytes = 0usize;
         for region in &regions {
             let size = region.clear_bytes as usize + region.cipher_bytes as usize;
             if size > request.sample.len().saturating_sub(position) {
                 return Err(CdmHostError::Protocol("subsample map exceeds sample"));
             }
-            let start = position + region.clear_bytes as usize;
-            let end = position + size;
-            cipher.extend_from_slice(&request.sample[start..end]);
-            ranges.push(start..end);
-            position = end;
+            cipher_bytes += region.cipher_bytes as usize;
+            position += size;
         }
         if position != request.sample.len() {
             return Err(CdmHostError::Protocol(
                 "subsample map does not cover sample",
             ));
         }
-        let mut plaintext = request.sample.to_vec();
-        if cipher.is_empty() {
-            return Ok(plaintext);
+        if cipher_bytes == 0 {
+            return Ok(request.sample.to_vec());
         }
-        let region = Subsample {
-            clear_bytes: 0,
-            cipher_bytes: u32::try_from(cipher.len())
-                .map_err(|_| CdmHostError::Protocol("cipher stream too large"))?,
-        };
-        let decrypted = self.decrypt_region(&cipher, &region, request)?;
-        let mut offset = 0;
-        for range in ranges {
-            let size = range.len();
-            plaintext[range].copy_from_slice(&decrypted[offset..offset + size]);
-            offset += size;
-        }
-        Ok(plaintext)
+        self.decrypt_region(request.sample, &regions, request)
     }
 
     fn decrypt_region(
         &mut self,
         chunk: &[u8],
-        region: &Subsample,
+        regions: &[Subsample],
         request: &DecryptRequest<'_>,
     ) -> Result<Vec<u8>> {
         let request_id = self.take_request_id();
-        let mut payload = Vec::new();
-        push_u32(&mut payload, request_id);
-        push_u32(&mut payload, 0);
-        push_u32(&mut payload, 0);
-        push_u32(&mut payload, chunk.len() as u32);
-        push_u32(&mut payload, request.key_id.len() as u32);
-        payload.extend_from_slice(request.key_id);
-        push_u32(&mut payload, request.iv.len() as u32);
-        payload.extend_from_slice(request.iv);
-        push_u32(&mut payload, 1);
-        push_u32(&mut payload, region.clear_bytes);
-        push_u32(&mut payload, region.cipher_bytes);
-        push_u32(&mut payload, request.scheme);
-        payload.extend_from_slice(&request.timestamp.to_le_bytes());
+        let payload = Self::input_payload(request_id, request, regions);
 
         self.write_slot(0, chunk)?;
         self.socket.write_all(&frame(CMD_DECRYPT, &payload))?;
@@ -578,14 +549,104 @@ impl CdmHost {
         if status != STATUS_OK {
             return Err(CdmHostError::Status(status));
         }
-        let out = self.read_slot_vec(slot, size as usize)?;
+        let out = self.read_slot_vec(slot, size as usize);
+        self.socket
+            .write_all(&frame(CMD_RELEASE, &slot.to_le_bytes()))?;
+        let out = out?;
         if out.len() != chunk.len() {
             return Err(CdmHostError::Protocol("decrypted sample size changed"));
         }
-        let mut release = Vec::new();
-        push_u32(&mut release, slot);
-        let _ = self.socket.write_all(&frame(CMD_RELEASE, &release));
         Ok(out)
+    }
+
+    fn input_payload(
+        request_id: u32,
+        request: &DecryptRequest<'_>,
+        regions: &[Subsample],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        push_u32(&mut payload, request_id);
+        push_u32(&mut payload, 0);
+        push_u32(&mut payload, 0);
+        push_u32(&mut payload, request.sample.len() as u32);
+        push_u32(&mut payload, request.key_id.len() as u32);
+        payload.extend_from_slice(request.key_id);
+        push_u32(&mut payload, request.iv.len() as u32);
+        payload.extend_from_slice(request.iv);
+        push_u32(&mut payload, regions.len() as u32);
+        for region in regions {
+            push_u32(&mut payload, region.clear_bytes);
+            push_u32(&mut payload, region.cipher_bytes);
+        }
+        push_u32(&mut payload, request.scheme);
+        payload.extend_from_slice(&request.timestamp.to_le_bytes());
+
+        payload
+    }
+
+    /// Configure the CDM's H.264 decoder; parameter sets are sent in Annex B input.
+    pub fn configure_video(&mut self, profile: u32, width: u32, height: u32) -> Result<()> {
+        if width == 0 || height == 0 || width > 1920 || height > 1080 {
+            return Err(CdmHostError::Protocol("unsupported CDM video dimensions"));
+        }
+        let mut payload = Vec::new();
+        for value in [2, profile, 2, width, height, 0] {
+            push_u32(&mut payload, value);
+        }
+        self.socket
+            .write_all(&frame(CMD_CONFIGURE_VIDEO, &payload))?;
+        let (status, _, _) = self.wait_result(0, None)?;
+        if status == STATUS_OK {
+            Ok(())
+        } else {
+            Err(CdmHostError::Status(status))
+        }
+    }
+
+    pub fn deinitialize_video(&mut self) -> Result<()> {
+        let id = self.take_request_id();
+        self.socket
+            .write_all(&frame(CMD_DEINITIALIZE_VIDEO, &id.to_le_bytes()))?;
+        let (status, _, _) = self.wait_result(id, None)?;
+        if status == STATUS_OK {
+            Ok(())
+        } else {
+            Err(CdmHostError::Status(status))
+        }
+    }
+
+    /// A consumed access unit can produce no picture until the decoder has
+    /// enough reference pictures. Empty unencrypted input drains at EOS.
+    pub fn decode_video(
+        &mut self,
+        request: &DecryptRequest<'_>,
+    ) -> Result<Option<(FrameInfo, Vec<u8>)>> {
+        let id = self.take_request_id();
+        self.write_slot(0, request.sample)?;
+        let payload = Self::input_payload(id, request, request.subsamples);
+        self.socket.write_all(&frame(CMD_DECODE, &payload))?;
+        let (status, slot, size) = self.wait_result(id, None)?;
+        let position = self
+            .deferred
+            .iter()
+            .position(|event| matches!(event, HostEvent::Frame(info) if info.request_id == id));
+        let picture = position.and_then(|pos| self.deferred.remove(pos));
+        if let Some(HostEvent::Frame(info)) = picture {
+            let output = self.read_slot_vec(info.slot, info.size as usize);
+            self.socket
+                .write_all(&frame(CMD_RELEASE, &info.slot.to_le_bytes()))?;
+            if status != STATUS_OK || info.slot != slot || info.size != size {
+                return Err(CdmHostError::Protocol("CDM frame/result mismatch"));
+            }
+            return Ok(Some((info, output?)));
+        }
+        if status == STATUS_NEED_MORE_DATA {
+            return Ok(None);
+        }
+        if status == STATUS_OK {
+            return Err(CdmHostError::Protocol("CDM decoded without a frame event"));
+        }
+        Err(CdmHostError::Status(status))
     }
 
     /// Stop the host process.
@@ -799,6 +860,8 @@ impl CdmHost {
             },
             EV_FRAME => {
                 let mut info = FrameInfo::default();
+                info.request_id = take_u32(payload, &mut offset)
+                    .ok_or(CdmHostError::Protocol("truncated frame request id"))?;
                 info.format = take_u32(payload, &mut offset)
                     .ok_or(CdmHostError::Protocol("truncated event integer"))?;
                 info.width = take_u32(payload, &mut offset)

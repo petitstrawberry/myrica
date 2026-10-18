@@ -111,7 +111,7 @@ W0 実施記録 (2026-10-16):
 - 起動とハンドル: spawn の handle map で制御ソケット (socketpair の片端) と共有メモリハンドルを明示的に渡す。stdio は継承されないため、必要なものは必ずマップで渡す。PDFview が zathura にファイルを渡しているのと同じ機構。
 - 制御プロトコル: 長さ前置の TLV。Initialize / CreateSession (temporary, persistent) / Update (license または provisioning 応答) / Close / Remove / Message (license-request, individualization-request) / Keys (key id と status) / Decrypt / Status / Shutdown。CDM 呼び出しはホスト内の 1 本のワーカースレッドに直列化する (CDM は単一スレッド前提)。
 - データ経路: 共有メモリのスロットリング。ヘッダに {slot, offset, size, generation, lease} を持ち、暗号化サンプル (圧縮のまま数百 KB) を書いて Decrypt 要求に {slot, key_id, iv, subsample map} を載せる。CDM の応答 (平文圧縮サンプル) は別スロットに書いて generation で再利用を管理する。フレームの lease は既存の frame_lease と同じ考え方で、UI が消費し終わるまで返却しない。
-- CDM API の選択: 映像は DecryptAndDecode ではなく Decrypt を使い、復号済みの圧縮サンプルを Scarlet の既存 H.264 パイプライン (scarlet-codecs / video client) に流す。CDM が Decrypt を拒否する場合は VideoDecoder / VideoFrame コールバックの実装が必要になるので、この可否は W1 のスパイクで先に確定させる。
+- CDM API の選択 (2026-10-18 更新): MediaKeys を接続した H.264 は CDM の InitializeVideoDecoder / DecryptAndDecodeFrame を使う。音声は Decrypt 後に既存 AAC デコーダへ渡す。通常の非暗号化動画は Scarlet `/dev/video0` を使う。下記の初期 Decrypt-only 試験の結論は、フレーム受信漏れが判明したため訂正した。
 - WebKit 側: com.widevine.alpha の CDMPrivate / CDMInstance / CDMInstanceSession を IPC クライアントとして実装する。MediaKeys の非同期通知 (session message, keys change, expiration) はプロトコルの通知とそのまま対応する。
 - プローブとの関係: tools/widevine-probe の Host_10 実装がそのままホストの心臓部になる。W1 はイベントループ、プロトコル、共有メモリを足すだけで、捨てる作業はない。
 - 共有メモリの受け渡し (2026-10-17 ソース確認済み): ネイティブ側で sys_shared_memory_create → scarlet_os::ipc::SharedMemory::create(size, permissions) により確保し、Environment::spawn の HandleMapping { source, target } で子に渡すと、子のハンドル番号は target になる。Linux イメージの実行時は LinuxAbi::prepare_exec_fds が image のハンドルをそのまま fd に写像する (fd_to_handle[handle] = handle、handle < MAX_FDS = 1024、CloseOnExec メタデータは FD_CLOEXEC に反映)。
@@ -124,9 +124,9 @@ W0 実施記録 (2026-10-16):
 - 実測で判明した Linux ABI の注意: SharedMemory の fd に対する fstat は失敗するため、ホストは呼び出し側が渡すレイアウトを正とする。spawn では標準入出力も明示的に map しないと子の出力が届かない (handle map に 0/1/2 を入れる)。
 - ライセンス往復の実測 (2026-10-18 完了): Shaka の Sintel Widevine アセット (storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd) から取り出した 167 バイトの PSSH で、CDM は 1797 バイトのライセンス要求を生成した。コンテナのクライアントは TLS を持たないため、ホスト側の license-relay.py が HTTPS 終端として cwip-shaka-proxy.appspot.com/no_auth に転送し、1229 バイトの応答を返した。UPDATE_SESSION は status=0、CDM は 5 つの鍵を usable (status=0) として報告した。実際のブラウザ統合ではページの fetch() がライセンス POST を行うため、ブラウザ側にライセンス用のネットワーク実装は不要になる。
 - 実データでの復号 (2026-10-18 完了): Axinom の v7-MultiDRM-SingleKey テストベクタ (dash.js のサンプルが公開している X-AxDRM-Message トークンを使用) で、テンポラリセッションに鍵が 1 つ usable として入り、音声サンプル (341 バイト、サブサンプルなし) が kSuccess で復号された。映像サンプルでは、単一の暗号化領域を指定したときに先頭 NAL 長 (755 バイト) がバイト一致で復元された。誤った鍵 ID では kNoKey が返るため、成功は鍵に基づいている。
-- W1 の初期診断の訂正 (2026-10-18): サブサンプルを同じ IV で個別に復号する方式を採用し、96 サンプル中 16 件の NoKey / ゼロ出力を CDM の不安定性と判断していた。この判断と「映像は DecryptAndDecode が必須」という結論を撤回する。Chromium CDM API は全暗号化領域を連結した一つのストリームとして扱い、クリア領域を復号入力から除外する契約である。単一フレームの参照表示だけでは、旧方式の正当性は確認できていなかった。
-- 現在の復号方式: 各暗号化領域を順に連結し、単一の `{clear=0, cipher=合計}` で CDM の Decrypt を一度呼ぶ。結果を元のサブサンプル位置へ戻し、クリア部分を保存する。IV はサンプルにつき一度使う。ゼロ出力の再試行は削除した。同じ CDM 4.10.2662.3 で、従来停止した Sintel の区間を Scarlet 実機で連続デコードできた。別ビルドの CDM への交換は不要だった。
-- DecryptAndDecodeFrame の単体試験は過去の診断であり、現在の映像経路には使わない。CDM は圧縮サンプルの復号、Scarlet `/dev/video0` が映像デコードを担当する。
+- W1 の診断履歴 (2026-10-18 訂正): サブサンプルごとに同じ IV で復号する試験、その後の cipher gather/scatter 試験を実施した。後者では公開 Sintel の再生が通ったが、これを Chromium の CDM 入力契約と同一視した説明は誤り。Chromium はアクセスユニットと subsample map 全体を渡し、H.264 は Annex B 変換・SPS/PPS 挿入に合わせて clear byte 数を調整する。
+- DecryptAndDecodeFrame の再検証: test-client が EV_FRAME を処理しておらず、フレーム受信を待ち続けていた。さらに native client の EV_FRAME 解析にも request_id の読み飛ばし漏れがあった。これらを修正し、Annex B + 空の decoder extra_data で公開 Sintel の正しい映像を確認した。「CDM がフレームを返さない」という過去の結論を訂正する。
+- 現行映像経路: H.264 のアクセスユニットと全 subsample map を CDM に渡してデコードし、8-bit planar 出力を NV12 に変換して既存 GPU 動画表示へ渡す。CDM の kNeedMoreData は入力受理・出力待ちとして扱い、NoKey は鍵更新待ちにする。出力保護・鍵状態は CDM の結果を保持する。
 - コンテナ解析: Symphonia fork が `sinf` / `tenc` とフラグメント内 `senc` を読み、KID・IV・サブサンプル対を packet に対応させる。`stsd` のクリア用/暗号化用エントリはフラグメントの sample description index で選ぶ。`moov` 内の PSSH は一つの cenc init data にまとめる。
 - W1/W2 の橋渡し (2026-10-18): `crates/cdm-host` は共有メモリと socketpair、linux-aarch64 ホスト起動 (stdio 0..2、socket 3、共有メモリ 4)、初期化・セッション・復号・終了を提供する。制御応答の途中で届く非同期イベントを保持し、部分的なソケットフレームも次のポーリングへ引き継ぐ。
 - W2 の接続方針: WebKit 側の CDMPrivate / CDMInstance / CDMInstanceSession は、ScarletWebView C ABI に追加する関数 (create / destroy / initialize / create_session / update_session / close_session / decrypt / take_event) 経由でこのライブラリを呼ぶ。init data は InitDataRegistry、ライセンス POST はページの fetch() が担当するため、ブラウザ側にライセンス用ネットワークは不要。
@@ -696,3 +696,50 @@ matching_sessions=1 / internal_error=1 / system_code=5 の鍵で NoKey が続く
 output-restricted / system_code=49 も出た。IV の差は修正できたが、
 Prime の映像再生失敗は継続している。低解像度を選ぶだけでは改善しなかった。
 この再試験範囲には SGFX の受付上限超過 / device lost の記録はない。
+
+### Prime Video の CDM 映像経路接続と再生確認 (2026-10-18)
+
+Decrypt-only の再検証では、正しい Annex B と全 subsample map を渡しても
+公開 Sintel の usable 鍵で NoKey になった。映像デコーダを初期化してから
+Decrypt を呼ぶ場合も同じだった。一方、同じ入力を DecryptAndDecodeFrame に
+渡すと kNeedMoreData の後に kSuccess / I420 フレームが返った。
+Debian aarch64 コンテナで 256x110 の正しい映像を画素確認した。
+
+修正内容:
+- AVCC から Annex B への変換、keyframe の SPS/PPS 挿入、subsample map の調整。
+  clear な NAL 長とヘッダを検証し、暗号化 byte の順番を維持する。
+- InitializeVideoDecoder の extra_data は空。パラメータセットは映像内に渡す。
+- Rust/C++ 両クライアントの EV_FRAME 解析を修正。要求 ID と結果を照合し、
+  padded stride / plane offset を検証して NV12 表示バッファへ変換する。
+- NeedMoreData と NoKey の区別、EOS drain、世代変更・シーク時の decoder 解放、
+  MediaKeys 単位の decoder 所有権を追加。通常動画の `/dev/video0` 経路は保持。
+- 共有 slot 0 を入力専用にし、非同期メッセージ・出力との上書き競合を除去。
+  出力 slot を 4 MiB に拡大し、1080p の padded I420 を収容する。
+  protocol version 2 により古い helper との混在を起動時に検出する。
+
+Scarlet の Release 版で、公開 Sintel の暗号化区間は
+`time=15.752451 / decoded=94 / usable=5 / ok=true`、owner join まで合格。
+ユーザー操作による Prime の再試験で「映像が出た」と確認された。
+同一ウィンドウのログでも CDM decoder / 960x540 / H.264 Main、
+128→256→384→512→640 フレーム、PTS 26.65 秒まで進行している。
+この映像の鍵は internal-error が消え、usable のまま再生している。
+別鍵の output-restricted は CDM が返したまま保持している。
+CDM 本体、鍵、ライセンス、HDCP 応答を偽装する変更はない。
+
+この接続では保護された H.264 のデコードは CDM 内で行う。
+CDM の平面出力から NV12 へのコピー・並べ替えがあり、ハードウェアデコードの
+`/dev/video0` 経路とは性能条件が異なる。描画先は既存の GPU 動画表示。
+実際のタイトル・ライセンス・出力条件ごとの対応範囲は個別に検証する。
+
+参照: [Chromium MP4StreamParser](https://raw.githubusercontent.com/chromium/chromium/main/media/formats/mp4/mp4_stream_parser.cc)、
+[AVCBitstreamConverter](https://raw.githubusercontent.com/chromium/chromium/main/media/formats/mp4/avc.cc)、
+[CDM input conversion](https://raw.githubusercontent.com/chromium/chromium/main/media/cdm/cdm_type_conversion.cc)。
+
+追加の Scarlet 回帰検証: `?drain=1&seek=1` では EOS で 96 フレームを回収し、
+同じ MediaKeys でシーク後に decoder を再初期化して累計 191 フレームまで再生。
+`?segment=clear-lead&drain=1` は 0〜16 秒の clear→encrypted 遷移と EOS を通り、
+384 フレーム、`ok=true` / owner join で終了した。
+Annex B の長さ・subsample 境界検証 3 件、padded plane と範囲外データ検証 2 件も合格。
+ヘルパーは通常バンドルへ同梱される CDM ではなく、従来と同様に別途配置する
+Linux-view 実行ファイル。今回の native client と組み合わせるには protocol v2 の
+同一ソース版を使用する。検証 VM の `/shared/widevine/widevine-host` は更新済み。

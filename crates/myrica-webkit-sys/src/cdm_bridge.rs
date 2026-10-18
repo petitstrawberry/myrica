@@ -18,7 +18,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cdm_host::{CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, KeyStatus, Subsample};
+use cdm_host::{
+    CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, KeyStatus, Subsample,
+};
 
 use crate::Bytes;
 
@@ -49,7 +51,15 @@ fn trace_key_statuses(keys: &[KeyStatus]) {
     }
     eprintln!(
         "SCARLET_CDM_KEYS total={} usable={} internal_error={} expired={} output_restricted={} output_downscaled={} pending={} released={} other={}",
-        keys.len(), counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], counts[6], counts[7]
+        keys.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        counts[4],
+        counts[5],
+        counts[6],
+        counts[7]
     );
 }
 
@@ -87,10 +97,50 @@ struct CdmState {
     events: VecDeque<(u32, Vec<u8>)>,
     decrypted_samples: u64,
     decrypted_bytes: u64,
+    video_owner: Option<u64>,
+    next_video_owner: u64,
 }
 impl CdmShared {
     pub(crate) fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+    pub(crate) fn configure_video(
+        &self,
+        profile: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<u64, CdmHostError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.video_owner.is_some() {
+            return Err(CdmHostError::Protocol("CDM video decoder already in use"));
+        }
+        state.host.configure_video(profile, width, height)?;
+        state.next_video_owner += 1;
+        let owner = state.next_video_owner;
+        state.video_owner = Some(owner);
+        Ok(owner)
+    }
+    pub(crate) fn decode_video(
+        &self,
+        owner: u64,
+        request: &DecryptRequest<'_>,
+    ) -> Result<Option<(cdm_host::FrameInfo, Vec<u8>)>, CdmHostError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.video_owner != Some(owner) {
+            return Err(CdmHostError::Protocol(
+                "CDM video decoder ownership changed",
+            ));
+        }
+        state.host.decode_video(request)
+    }
+    pub(crate) fn release_video(&self, owner: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.video_owner == Some(owner) {
+            if let Err(error) = state.host.deinitialize_video() {
+                eprintln!("SCARLET_CDM_VIDEO_CLOSE error={error:?}");
+            }
+            state.video_owner = None;
+        }
     }
     pub(crate) fn decrypt(&self, request: &DecryptRequest<'_>) -> Result<Vec<u8>, CdmHostError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -106,11 +156,12 @@ impl CdmShared {
         state.decrypted_samples += 1;
         state.decrypted_bytes += clear.len() as u64;
         static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if (*PROFILE.get_or_init(|| std::env::var_os("SCARLET_WEBVIEW_PROFILE").is_some()) || trace_enabled())
+        if (*PROFILE.get_or_init(|| std::env::var_os("SCARLET_WEBVIEW_PROFILE").is_some())
+            || trace_enabled())
             && (state.decrypted_samples == 1 || state.decrypted_samples % 128 == 0)
         {
             eprintln!(
-                "SCARLET_CDM_DECRYPT samples={} compressed_bytes={} decoder=scarlet-native",
+                "SCARLET_CDM_DECRYPT samples={} compressed_bytes={}",
                 state.decrypted_samples, state.decrypted_bytes
             );
         }
@@ -227,6 +278,8 @@ pub extern "C" fn cdm_host_create(
         options.slot_size = slot_size;
     }
 
+    // I420 decoder output includes padded strides; reserve capacity for 1080p.
+    options.slot_size = options.slot_size.max(4 * 1024 * 1024);
     match CdmHost::spawn(&options) {
         Ok(host) => Box::into_raw(Box::new(CdmHandle {
             shared: Arc::new(CdmShared {
@@ -235,6 +288,8 @@ pub extern "C" fn cdm_host_create(
                     events: VecDeque::new(),
                     decrypted_samples: 0,
                     decrypted_bytes: 0,
+                    video_owner: None,
+                    next_video_owner: 0,
                 }),
                 revision: AtomicU64::new(1),
                 poll_failed: AtomicBool::new(false),

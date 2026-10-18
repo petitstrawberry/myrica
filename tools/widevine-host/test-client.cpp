@@ -258,6 +258,26 @@ void handle_event(const Frame& frame, Collected* collected) {
     std::cout << "EV_EXPIRATION" << std::endl;
   } else if (frame.kind == WVH_EV_SESSION_CLOSED) {
     std::cout << "EV_SESSION_CLOSED" << std::endl;
+  } else if (frame.kind == WVH_EV_FRAME) {
+    uint32_t request_id = 0;
+    auto& info = collected->frame;
+    if (!take_u32(frame.payload, &offset, &request_id) ||
+        !take_u32(frame.payload, &offset, &info.format) ||
+        !take_u32(frame.payload, &offset, &info.width) ||
+        !take_u32(frame.payload, &offset, &info.height) ||
+        !take_u32(frame.payload, &offset, &info.slot) ||
+        !take_u32(frame.payload, &offset, &info.size) ||
+        !take_u32(frame.payload, &offset, &info.stride_y) ||
+        !take_u32(frame.payload, &offset, &info.stride_u) ||
+        !take_u32(frame.payload, &offset, &info.stride_v) ||
+        !take_u32(frame.payload, &offset, &info.offset_u) ||
+        !take_u32(frame.payload, &offset, &info.offset_v) ||
+        offset + sizeof(info.timestamp) != frame.payload.size()) {
+      std::cerr << "invalid frame event" << std::endl;
+      return;
+    }
+    memcpy(&info.timestamp, frame.payload.data() + offset, sizeof(info.timestamp));
+    collected->frame_reported = true;
   } else {
     std::cout << "EV_UNKNOWN kind=" << frame.kind << std::endl;
   }

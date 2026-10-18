@@ -11,6 +11,9 @@ mod media_bridge;
 #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
 mod cdm_bridge;
 
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+mod cdm_avc;
+
 use std::ffi::c_int;
 
 pub const ABI_VERSION: u32 = 1;

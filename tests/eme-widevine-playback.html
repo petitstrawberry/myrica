@@ -15,7 +15,8 @@
     video.addEventListener('error', () => fail(new Error('Video error ' + video.error?.code + ': ' + video.error?.message)));
     video.addEventListener('waitingforkey', () => { state.waitingForKey = (state.waitingForKey || 0) + 1; report(); });
     video.addEventListener('waiting', () => { state.waiting = (state.waiting || 0) + 1; report(); });
-    const mode = new URLSearchParams(location.search).get('segment');
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('segment');
     const segment = mode === '20'
         ? {start: 340308, end: 374404, time: 20, duration: 4, frames: 90}
         : mode === 'clear-lead'
@@ -80,6 +81,21 @@
             state.decoded = video.getVideoPlaybackQuality().totalVideoFrames;
             report();
             if (state.encrypted && state.usable && state.decoded >= segment.frames && state.time >= segment.time + segment.duration - 0.25) break;
+        }
+        if (params.has('drain')) {
+            while (!video.ended) await Promise.race([new Promise(resolve => setTimeout(resolve, 100)), failure]);
+            state.drainedFrames = video.getVideoPlaybackQuality().totalVideoFrames;
+        }
+        if (params.has('seek')) {
+            const before = video.getVideoPlaybackQuality().totalVideoFrames;
+            state.stage = 'seek'; report(); video.currentTime = segment.time;
+            await Promise.race([video.play(), failure]);
+            while (video.getVideoPlaybackQuality().totalVideoFrames < before + segment.frames
+                || video.currentTime < segment.time + segment.duration - 0.25) {
+                await Promise.race([new Promise(resolve => setTimeout(resolve, 100)), failure]);
+            }
+            state.afterSeekFrames = video.getVideoPlaybackQuality().totalVideoFrames;
+            state.afterSeekTime = video.currentTime;
         }
         video.pause(); await video.setMediaKeys(null);
         for (const session of sessions) await session.close();
