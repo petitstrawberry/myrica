@@ -351,3 +351,31 @@ Amazon Prime Video / Netflix など実サービスのライセンス条件は未
 通常バンドルの `/bin/myrica` は、検証用 `/shared/myrica-eme-98df` と
 異なる旧 pin のまま起動した記録がある。二つの実行ファイルを混同して
 DRM 判定サイトの結果を評価しない。通常バンドルの更新は次の反映作業。
+
+
+### 判定サイトと起動中 VM への反映
+
+実装コミット `455279611ac954bb56084e7e1337ae75a230075c` の Release 実行ファイルで
+`https://scrapfly.io/web-scraping-tools/drm-capabilities` を直接開いた。
+同サイトの EME 判定は `'requestMediaKeySystemAccess' in navigator`。
+その後の Widevine H.264/AAC capability 要求が受理され、robustness の個別検査
+(`SW_SECURE_CRYPTO` を含む) に進んだことを WebCore の要求ログで確認した。
+このサイトは capability 検査であり、ライセンス取得や復号の証拠には使わない。
+復号・再生の検証対象は上記 Sintel の暗号化区間である。
+
+起動中 VM への転送にはホスト上の一時 HTTP サーバーとゲストの curl を使った。
+最初に Linux ビューの `/bin/myrica` を更新してしまい、native の
+`/bin/myrica` を更新したと誤報した。Linux ツールのパスは Linux ビュー内で
+解決される。`bootstrap::abi_view` が公開する `/scarlet` bind を使って、
+`/scarlet/bin/myrica.widevine-new` に配置し、SHA-256 を照合した後に
+`/scarlet/bin/myrica` へ rename して修正した。
+当該ファイルの SHA-256 は
+`4cc12bd36a7f47fdec2757cff8b1d10f6acc87d8a27ca9b55ec7a7c1422bf190`。
+起動済みウィンドウの実行ファイルを truncate せず、次回起動を最新版にする。
+
+Linux 側に誤配置した追加ファイルは共有の検証用パス
+`/shared/myrica-eme-4552796` へ移動した。転送サーバーと fixture サーバーは
+検証終了後に停止し、公開済みの WebKit / Symphonia 一時 checkout も削除した。
+操作中の検証 VM とその使用中ディスクは保持している。
+通常バンドルは実装コミット `4552796` を参照する。以降の作業記録だけの変更は
+実行コードや WebKit pin を変えない。
