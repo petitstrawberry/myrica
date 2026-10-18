@@ -613,3 +613,14 @@ SGFX `791e76f659f9ecdfafaa20bb5b66e261589d9a91` で、render/compute pass の内
 転送順序・subrectangle・mip/layer・buffer offset を保持する。
 80 MiB + render pass の回帰試験を含む 6 件、Vulkan 単体 117 件が合格した
 (GPU が必要な 4 件は既存の ignored)。実機反映後の検証を続ける。
+
+通常バンドルの Release ビルドを完了し、rootfs 内の Vulkan ICD と VM へ転送した
+ファイルの SHA-256 が一致した (385a798672c953b1fe4ca0844c99e46e9d7f6f9acdb058b96b492426c3abc6dc)。
+この ICD と直列化した CDM host を組み合わせ、公開 Sintel の暗号化区間は
+15.768925 秒 / decoded 94 / usable 5、owner join まで合格した。
+Prime の再試験用ウィンドウも同じ ICD で起動した。
+
+復号時の鍵 ID が CDM 通知済みの鍵かを照合し、失敗時に matching_sessions /
+usable / internal_error / system_code の件数を出す診断を追加した。
+実際の鍵 ID をログに出さず、session が閉じたら照合用状態も破棄する。
+これは復号先や鍵の選択を変更する機能ではない。

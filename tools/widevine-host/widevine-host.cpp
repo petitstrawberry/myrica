@@ -583,6 +583,18 @@ class CdmHost final : public cdm::Host_10 {
     std::vector<uint8_t> payload;
     append_string(&payload, id);
     append_u32(&payload, keys_info_count);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      auto& statuses = key_statuses_[id];
+      statuses.clear();
+      for (uint32_t index = 0; index < keys_info_count; ++index) {
+        const auto& info = keys_info[index];
+        if (info.key_id != nullptr && info.key_id_size != 0) {
+          statuses[std::string(reinterpret_cast<const char*>(info.key_id), info.key_id_size)] =
+              {static_cast<uint32_t>(info.status), info.system_code};
+        }
+      }
+    }
     for (uint32_t index = 0; index < keys_info_count; ++index) {
       const cdm::KeyInformation& info = keys_info[index];
       if (info.status != cdm::kUsable && info.status != cdm::kStatusPending) {
@@ -616,6 +628,10 @@ class CdmHost final : public cdm::Host_10 {
     std::string id;
     if (session_id != nullptr && session_id_size > 0) {
       id.assign(session_id, session_id + session_id_size);
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      key_statuses_.erase(id);
     }
     std::vector<uint8_t> payload;
     append_string(&payload, id);
@@ -707,6 +723,26 @@ class CdmHost final : public cdm::Host_10 {
 
   ContentDecryptionModule* cdm() const { return cdm_; }
 
+  void trace_decrypt_failure(const std::vector<uint8_t>& key_id, cdm::Status status) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const std::string id(key_id.begin(), key_id.end());
+    unsigned known = 0, usable = 0, internal_error = 0;
+    uint32_t system_code = 0;
+    for (const auto& session : key_statuses_) {
+      auto key = session.second.find(id);
+      if (key == session.second.end()) continue;
+      ++known;
+      if (key->second.first == cdm::kUsable) ++usable;
+      if (key->second.first == cdm::kInternalError) ++internal_error;
+      if (key->second.second != 0) system_code = key->second.second;
+    }
+    log_line("decrypt failed status=" + std::to_string(static_cast<uint32_t>(status)) +
+             " matching_sessions=" + std::to_string(known) +
+             " usable=" + std::to_string(usable) +
+             " internal_error=" + std::to_string(internal_error) +
+             " system_code=" + std::to_string(system_code));
+  }
+
  private:
   template <typename Predicate>
   bool wait_state(Predicate ready) {
@@ -746,6 +782,7 @@ class CdmHost final : public cdm::Host_10 {
   std::set<uint32_t> resolved_;
   std::set<std::string> message_sessions_;
   std::map<uint32_t, std::string> rejected_;
+  std::map<std::string, std::map<std::string, std::pair<uint32_t, uint32_t>>> key_statuses_;
 };
 
 void push_result(EventSink& events, uint32_t request_id, int32_t status, uint32_t value0,
@@ -1019,6 +1056,7 @@ void handle_decrypt(const Options& options, CdmHost& host, EventSink& events,
       push_result(events, parsed.request_id, WVH_ERROR, 0, 0);
     }
   } else {
+    host.trace_decrypt_failure(parsed.key_id, status);
     push_result(events, parsed.request_id,
                 status == cdm::kNoKey ? WVH_NO_KEY : WVH_DECRYPT_ERROR, 0, 0);
   }
