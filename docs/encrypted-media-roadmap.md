@@ -306,9 +306,9 @@ Scarlet 向け Release ビルドが成功した。
 残作業: `seig` によるフラグメント内鍵切替、非フラグメント暗号化 MP4、
 `moov` 外 PSSH、暗号化音声との同期、再生中のシーク・鍵待ちの反復検証。
 `seig`、cbcs/pattern encryption、保護された非フラグメント MP4 は明示的に拒否する。
-非同期 expiry / spontaneous close の DOM 通知、ホスト異常終了のメディア通知、
-ホスト内タイマーの単一スレッド化も残る。現在のホストの SetTimer は別スレッドで
-TimerExpired を呼ぶため、要求ループ上の CDM 呼び出しとの競合を解消する必要がある。
+非同期 expiry / spontaneous close の DOM 通知、ホスト異常終了のメディア通知も残る。
+この時点で残っていたホスト内タイマーの単一スレッド化は、後述の Prime Video
+調査中に実装・検証した。
 実サービスごとの VMP / 出力保護要件への適合はこの fixture 試験の対象外。
 
 
@@ -571,3 +571,29 @@ Prime Video の 7031 は変わらなかった。公開 Sintel の暗号化区間
 
 7031 の原因をライセンスの商用ポリシー、出力保護、ネットワークのいずれかへ
 断定する証拠は得られていない。次の再現では CDM の system_code を確認する。
+
+### Prime Video: system_code=5 と CDM ホストの直列化
+
+通常の gather / scatter を使う版でユーザーが 7031 を再現した。
+3 鍵すべて usable の通知後、1 鍵が internal-error / system_code=5 へ変わり、
+残る 2 鍵は usable。停止サンプルは 46461 バイト、IV 8 バイト、subsample 1 件、
+clear prefix 49 バイトで NoKey。CDM 公開 ABI は system_code の 5 の意味を
+定義しておらず、CDM の status enum やサーバーの HTTP エラー番号と混同しない。
+別途、同ウィンドウのログには native decode の RESOURCE_QUEUE 失敗があり、
+vhost-video は VideoToolbox callback -12909 を記録した。両エラーを残して調査する。
+
+ホストの SetTimer が detached thread から TimerExpired を呼び、要求ループの
+Decrypt / UpdateSession と並行していた。QueryOutputProtectionStatus /
+RequestStorageId も CDM 呼び出しの内側から同期で CDM に再入していた。
+これらを要求ループ上の期限付き task queue に統合した。
+制御ソケットの idle / 部分読み取り中、initialize / promise 応答待ちの間も
+タイマーを実行する。別スレッドからの通知は nonblocking wake socket で受ける。
+終了時は残りの callback を破棄し、Destroy 後に TimerExpired を呼ばない。
+未提供の platform attestation は空の失敗応答を返し、要求を放置しない。
+robustness・出力保護・鍵状態の成功値を追加する変更はない。
+
+task runner の owner thread / timer 順序 / nested callback / 他スレッド wake /
+部分 stream / EOF / timeout / 終了時 cancellation テストが macOS と aarch64 Linux
+container で合格した。Scarlet の同じ CDM を使った Release の公開 Sintel 試験も
+15.765890 秒 / decoded 94 / usable 5 で合格し、owner join と host 終了を確認した。
+この修正による Prime Video の再生結果は次のユーザー操作で検証する。

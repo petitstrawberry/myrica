@@ -17,6 +17,8 @@ client sends back, mirroring Chromium's out-of-process CDM split.
 - `widevine-host.cpp`: the CDM host. Implements `cdm::Host_10`, serializes CDM
   calls on the request loop, and writes slot-backed messages back to the
   client. `api/` headers come from `../widevine-probe/api`.
+- `task-runner.h`: request-loop timers and deferred host responses, with a
+  wake socket for asynchronous producers. No timer thread enters the CDM.
 - `test-client.cpp`: a small driver used to exercise the protocol without
   Scarlet.
 - `build.sh`: builds both for aarch64 Linux with the Scarlet toolchain.
@@ -53,6 +55,19 @@ and `--fd`. For local testing the host also accepts `--shm PATH` and
 ```sh
 ./build.sh /tmp/widevine-host
 ```
+
+The task runner has a standalone C++17 test (no CDM or credentials needed):
+
+```sh
+c++ -std=c++17 -Wall -Wextra -Werror -pthread test/task-runner.cpp -o /tmp/cdm-task-runner-test
+/tmp/cdm-task-runner-test
+```
+
+It checks timer ordering, owner thread affinity, nested callbacks, wakeups
+from another thread, partial control-stream reads, EOF, timeout and shutdown
+cancellation. CDM initialization and promise waits also service these timers.
+Optional platform attestation requests receive the ABI's empty failure
+response when no attestation service is available.
 
 ## Verify in a container
 

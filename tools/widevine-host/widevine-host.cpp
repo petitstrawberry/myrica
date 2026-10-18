@@ -12,6 +12,7 @@
 
 #include "api/content_decryption_module.h"
 #include "protocol.h"
+#include "task-runner.h"
 
 #include <dlfcn.h>
 #include <elf.h>
@@ -167,10 +168,11 @@ struct Reader {
   }
 };
 
-bool read_full(int fd, void* buffer, size_t size) {
+bool read_full(CdmTaskRunner& tasks, int fd, void* buffer, size_t size) {
   uint8_t* bytes = static_cast<uint8_t*>(buffer);
   size_t done = 0;
   while (done < size) {
+    if (tasks.wait(fd) != CdmTaskRunner::Wait::Ready) return false;
     ssize_t got = ::read(fd, bytes + done, size - done);
     if (got == 0) {
       return false;
@@ -439,12 +441,6 @@ class HostFileIO final : public cdm::FileIO {
   bool opened_ = false;
 };
 
-struct Liveness {
-  std::mutex mutex;
-  ContentDecryptionModule* cdm = nullptr;
-  bool destroyed = false;
-};
-
 class HostDecryptedBlock final : public cdm::DecryptedBlock {
  public:
   void SetDecryptedBuffer(cdm::Buffer* buffer) final { buffer_ = buffer; }
@@ -462,21 +458,14 @@ class CdmHost final : public cdm::Host_10 {
   CdmHost(const Options& options, SharedRegion& region, SlotPool& slots, EventSink& events)
       : options_(options), region_(region), slots_(slots), events_(events) {}
 
-  void set_liveness(std::shared_ptr<Liveness> live) { live_ = std::move(live); }
+  CdmTaskRunner& tasks() { return tasks_; }
 
   cdm::Buffer* Allocate(uint32_t capacity) final { return new HostBuffer(capacity); }
 
   void SetTimer(int64_t delay_ms, void* context) final {
-    auto live = live_;
-    std::thread([live, delay_ms, context]() {
-      if (delay_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-      }
-      std::lock_guard<std::mutex> lock(live->mutex);
-      if (!live->destroyed && live->cdm != nullptr) {
-        live->cdm->TimerExpired(context);
-      }
-    }).detach();
+    tasks_.post(delay_ms, [this, context]() {
+      if (cdm_ != nullptr) cdm_->TimerExpired(context);
+    });
   }
 
   cdm::Time GetCurrentWallTime() final {
@@ -493,7 +482,7 @@ class CdmHost final : public cdm::Host_10 {
       initialized_ = true;
       init_success_ = success;
     }
-    state_cv_.notify_all();
+    tasks_.wake();
   }
 
   void OnResolveKeyStatusPromise(uint32_t promise_id, cdm::KeyStatus status) final {
@@ -517,7 +506,7 @@ class CdmHost final : public cdm::Host_10 {
     append_u32(&payload, promise_id);
     append_string(&payload, id);
     events_.push_event(WVH_EV_SESSION, payload);
-    state_cv_.notify_all();
+    tasks_.wake();
   }
 
   void OnResolvePromise(uint32_t promise_id) final {
@@ -525,7 +514,7 @@ class CdmHost final : public cdm::Host_10 {
       std::lock_guard<std::mutex> lock(state_mutex_);
       resolved_.insert(promise_id);
     }
-    state_cv_.notify_all();
+    tasks_.wake();
   }
 
   void OnRejectPromise(uint32_t promise_id, cdm::Exception exception,
@@ -542,7 +531,7 @@ class CdmHost final : public cdm::Host_10 {
       std::lock_guard<std::mutex> lock(state_mutex_);
       rejected_[promise_id] = text.empty() ? WVH_ERROR : WVH_ERROR;
     }
-    state_cv_.notify_all();
+    tasks_.wake();
   }
 
   void OnSessionMessage(const char* session_id, uint32_t session_id_size,
@@ -578,7 +567,7 @@ class CdmHost final : public cdm::Host_10 {
       std::lock_guard<std::mutex> lock(state_mutex_);
       message_sessions_.insert(id);
     }
-    state_cv_.notify_all();
+    tasks_.wake();
   }
 
   void OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
@@ -642,6 +631,12 @@ class CdmHost final : public cdm::Host_10 {
     }
     log_line("SendPlatformChallenge service=" + id +
              " bytes=" + std::to_string(challenge_size));
+    // This platform has no attestation service. Complete the optional request
+    // with the ABI's empty failure response instead of leaving it pending.
+    with_cdm([](ContentDecryptionModule* cdm) {
+      cdm::PlatformChallengeResponse response{};
+      cdm->OnPlatformChallengeResponse(response);
+    });
   }
 
   void EnableOutputProtection(uint32_t mask) final {
@@ -678,19 +673,16 @@ class CdmHost final : public cdm::Host_10 {
   }
 
   bool wait_init() {
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    return state_cv_.wait_for(lock, std::chrono::seconds(options_.wait_seconds),
-                              [this]() { return initialized_; });
+    return wait_state([this]() { return initialized_; });
   }
 
   bool wait_session(uint32_t request_id, std::string* session_id) {
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    const bool ready = state_cv_.wait_for(
-        lock, std::chrono::seconds(options_.wait_seconds), [this, request_id]() {
-          auto session = sessions_.find(request_id);
-          return (session != sessions_.end() && message_sessions_.count(session->second))
-              || rejected_.count(request_id) != 0;
-        });
+    const bool ready = wait_state([this, request_id]() {
+      auto session = sessions_.find(request_id);
+      return (session != sessions_.end() && message_sessions_.count(session->second)) ||
+             rejected_.count(request_id) != 0;
+    });
+    std::lock_guard<std::mutex> lock(state_mutex_);
     if (!ready || rejected_.count(request_id) != 0) {
       return false;
     }
@@ -699,13 +691,11 @@ class CdmHost final : public cdm::Host_10 {
   }
 
   bool wait_promise(uint32_t request_id) {
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    return state_cv_.wait_for(lock, std::chrono::seconds(options_.wait_seconds),
-                              [this, request_id]() {
-                                return resolved_.count(request_id) != 0 ||
-                                       rejected_.count(request_id) != 0;
-                              }) &&
-           rejected_.count(request_id) == 0;
+    const bool ready = wait_state([this, request_id]() {
+      return resolved_.count(request_id) != 0 || rejected_.count(request_id) != 0;
+    });
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return ready && rejected_.count(request_id) == 0;
   }
 
   bool init_success() {
@@ -718,22 +708,38 @@ class CdmHost final : public cdm::Host_10 {
   ContentDecryptionModule* cdm() const { return cdm_; }
 
  private:
+  template <typename Predicate>
+  bool wait_state(Predicate ready) {
+    const auto deadline = CdmTaskRunner::Clock::now() +
+                          std::chrono::seconds(options_.wait_seconds);
+    for (;;) {
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (ready()) return true;
+      }
+      if (tasks_.wait(-1, deadline) != CdmTaskRunner::Wait::Ready) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return ready();
+      }
+    }
+  }
+
   template <typename Callback>
   void with_cdm(Callback callback) {
-    std::lock_guard<std::mutex> lock(live_->mutex);
-    if (!live_->destroyed && live_->cdm != nullptr) {
-      callback(live_->cdm);
-    }
+    // Host callbacks can be issued from inside a CDM call. Defer the response
+    // so the CDM is never re-entered, and keep it on the same request thread.
+    tasks_.post(0, [this, callback]() {
+      if (cdm_ != nullptr) callback(cdm_);
+    });
   }
 
   Options options_;
   SharedRegion& region_;
   SlotPool& slots_;
   EventSink& events_;
-  std::shared_ptr<Liveness> live_;
+  CdmTaskRunner tasks_;
   ContentDecryptionModule* cdm_ = nullptr;
   std::mutex state_mutex_;
-  std::condition_variable state_cv_;
   bool initialized_ = false;
   bool init_success_ = false;
   std::map<uint32_t, std::string> sessions_;
@@ -1094,7 +1100,7 @@ void serve(int client_fd, const Options& options, CdmHost& host, EventSink& even
   bool running = true;
   while (running) {
     uint8_t header[16];
-    if (!read_full(client_fd, header, sizeof(header))) {
+    if (!read_full(host.tasks(), client_fd, header, sizeof(header))) {
       log_line("control channel closed");
       return;
     }
@@ -1109,7 +1115,7 @@ void serve(int client_fd, const Options& options, CdmHost& host, EventSink& even
       return;
     }
     std::vector<uint8_t> payload(length);
-    if (length > 0 && !read_full(client_fd, payload.data(), length)) {
+    if (length > 0 && !read_full(host.tasks(), client_fd, payload.data(), length)) {
       log_line("control channel closed while reading a payload");
       return;
     }
@@ -1318,9 +1324,11 @@ int main(int argc, char** argv) {
     log_line(std::string("cdm version ") + get_version());
   }
 
-  auto live = std::make_shared<Liveness>();
   CdmHost host(options, region, slots, events);
-  host.set_liveness(live);
+  if (!host.tasks().valid()) {
+    std::cerr << "CDM task wake socket setup failed" << std::endl;
+    return 4;
+  }
 
   static const char kKeySystem[] = "com.widevine.alpha";
   void* raw = create_instance(ContentDecryptionModule::kVersion, kKeySystem,
@@ -1331,7 +1339,6 @@ int main(int argc, char** argv) {
   }
   auto* cdm = static_cast<ContentDecryptionModule*>(raw);
   host.set_cdm(cdm);
-  live->cdm = cdm;
 
   const int client_fd = open_control_socket(options);
   if (client_fd < 0) {
@@ -1343,12 +1350,8 @@ int main(int argc, char** argv) {
   serve(client_fd, options, host, events, region, slots, cdm);
 
   events.stop();
-  {
-    std::lock_guard<std::mutex> lock(live->mutex);
-    live->destroyed = true;
-    cdm->Destroy();
-    live->cdm = nullptr;
-  }
+  host.set_cdm(nullptr);
+  cdm->Destroy();
   close(client_fd);
   log_line("host stopped");
   return 0;
