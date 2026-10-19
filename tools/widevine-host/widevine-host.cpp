@@ -13,6 +13,7 @@
 #include "api/content_decryption_module.h"
 #include "protocol.h"
 #include "task-runner.h"
+#include "cdm-path.h"
 
 #include <algorithm>
 #include <dlfcn.h>
@@ -59,6 +60,7 @@ struct Options {
   int wait_seconds = 20;
   bool persistent = false;
   bool verbose = false;
+  bool check = false;
 };
 
 void log_line(const std::string& text) {
@@ -214,6 +216,16 @@ class SharedRegion {
     if (owned_fd_ && fd_ >= 0) {
       close(fd_);
     }
+  }
+
+  bool anonymous() {
+    size_ = WVH_SHM_HEADER_BYTES + 4096;
+    void* mapped = mmap(nullptr, size_, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) return false;
+    base_ = static_cast<uint8_t*>(mapped);
+    slot_size_ = 4096;
+    return true;
   }
 
   bool open_path(const std::string& path, uint32_t slot_count, uint32_t slot_size) {
@@ -849,6 +861,8 @@ bool parse_arguments(int argc, char** argv, Options* options) {
       options->slot_count = static_cast<uint32_t>(std::atoi(value.c_str()));
     } else if (argument == "--persistent") {
       options->persistent = true;
+    } else if (argument == "--check") {
+      options->check = true;
     } else if (argument == "--verbose") {
       options->verbose = true;
     } else {
@@ -859,6 +873,7 @@ bool parse_arguments(int argc, char** argv, Options* options) {
   if (options->cdm_path.empty() || options->slot_count == 0 || options->slot_size == 0) {
     return false;
   }
+  if (options->check) return true;
   if (options->socket_path.empty() && options->socket_fd < 0) {
     return false;
   }
@@ -1372,9 +1387,26 @@ int main(int argc, char** argv) {
   if (!parse_arguments(argc, argv, &options)) {
     std::cerr << "usage: widevine-host --cdm PATH (--socket PATH | --fd N) "
                  "(--shm PATH | --shm-fd N) [--storage DIR] [--persistent] "
-                 "[--slot-count N] [--slot-size BYTES] [--verbose]"
+                 "[--slot-count N] [--slot-size BYTES] [--verbose] [--check]"
               << std::endl;
     return 1;
+  }
+
+  // Check mode never waits for an IPC client, writes persistent state or
+  // leaves temporary files. Bound even a CDM that hangs during loading.
+  if (options.check) alarm(8);
+  auto reply = [&](bool ok, std::string detail) {
+    if (!options.check) return;
+    for (char& c : detail) if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+    std::string line = std::string("WVH_CHECK\t") + (ok ? "OK\t" : "ERROR\t") + detail + "\n";
+    write_full(options.socket_fd >= 0 ? options.socket_fd : STDOUT_FILENO,
+               line.data(), line.size());
+  };
+  if (options.cdm_path == "auto") options.cdm_path = widevine::discover();
+  if (options.cdm_path.empty()) {
+    reply(false, "CDM_NOT_FOUND: run widevine-installer in the Debian view");
+    std::cerr << "Widevine CDM not found" << std::endl;
+    return 3;
   }
 
   std::error_code error;
@@ -1383,12 +1415,13 @@ int main(int argc, char** argv) {
   }
 
   SharedRegion region;
-  const bool region_ok = !options.shm_path.empty()
+  const bool region_ok = options.check ? region.anonymous() : !options.shm_path.empty()
                              ? region.open_path(options.shm_path, options.slot_count,
                                                 options.slot_size)
                              : region.map_fd(options.shm_fd, options.slot_count,
                                              options.slot_size);
   if (!region_ok || !region.valid()) {
+    reply(false, "shared memory setup failed");
     std::cerr << "shared memory setup failed" << std::endl;
     return 2;
   }
@@ -1400,7 +1433,9 @@ int main(int argc, char** argv) {
 
   void* library = dlopen(options.cdm_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (library == nullptr) {
-    std::cerr << "dlopen failed: " << dlerror() << std::endl;
+    const char* message = dlerror();
+    reply(false, std::string("dlopen: ") + (message ? message : "unknown error"));
+    std::cerr << "dlopen failed: " << (message ? message : "unknown error") << std::endl;
     return 3;
   }
   auto initialize_module =
@@ -1410,7 +1445,8 @@ int main(int argc, char** argv) {
           dlsym(library, "CreateCdmInstance"));
   auto get_version =
       reinterpret_cast<const char* (*)()>(dlsym(library, "GetCdmVersion"));
-  if (create_instance == nullptr) {
+  if (create_instance == nullptr || initialize_module == nullptr || get_version == nullptr) {
+    reply(false, "incompatible CDM exports");
     std::cerr << "CreateCdmInstance missing" << std::endl;
     return 3;
   }
@@ -1423,6 +1459,7 @@ int main(int argc, char** argv) {
 
   CdmHost host(options, region, slots, events);
   if (!host.tasks().valid()) {
+    reply(false, "CDM task wake socket setup failed");
     std::cerr << "CDM task wake socket setup failed" << std::endl;
     return 4;
   }
@@ -1431,11 +1468,22 @@ int main(int argc, char** argv) {
   void* raw = create_instance(ContentDecryptionModule::kVersion, kKeySystem,
                               static_cast<uint32_t>(strlen(kKeySystem)), &get_cdm_host, &host);
   if (raw == nullptr) {
+    reply(false, "CreateCdmInstance failed (CDM interface 10)");
     std::cerr << "CreateCdmInstance failed" << std::endl;
     return 4;
   }
   auto* cdm = static_cast<ContentDecryptionModule*>(raw);
   host.set_cdm(cdm);
+
+  if (options.check) {
+    cdm->Initialize(false, false, false);
+    const bool initialized = host.wait_init() && host.init_success();
+    reply(initialized, initialized ? std::string(get_version()) + " " + options.cdm_path
+                                  : "CDM initialization failed");
+    host.set_cdm(nullptr);
+    cdm->Destroy();
+    return initialized ? 0 : 4;
+  }
 
   const int client_fd = open_control_socket(options);
   if (client_fd < 0) {

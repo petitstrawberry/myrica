@@ -7,9 +7,10 @@ command -v "$cxx" >/dev/null 2>&1 || {
   echo "$cxx not found; enter the Scarlet development shell first" >&2
   exit 1
 }
-out=${1:-$here}
+out=${1:-$here/../../target/widevine-host}
+mkdir -p "$out"
 flags="-O2 -std=c++17 -Wall -Wextra -static-libstdc++ -static-libgcc -Wl,--dynamic-linker=/lib/ld-linux-aarch64.so.1"
-"$cxx" $flags -I "$here/../widevine-probe" -o "$out/widevine-host" "$here/widevine-host.cpp" -ldl
+sh "$here/build-host.sh" "$out/widevine-host"
 "$cxx" $flags -w -I "$here" -o "$out/test-client" "$here/test-client.cpp"
 echo "built $out/widevine-host"
 echo "built $out/test-client"

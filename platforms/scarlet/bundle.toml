@@ -1,0 +1,26 @@
+# Myrica owns its native browser and Linux-view CDM service recipe.
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "myrica"
+bin = "myrica"
+features = ["backend-webkit-vulkan"]
+default-features = false
+architectures = ["aarch64"]
+to = "/bin/myrica"
+
+[[layers]]
+kind = "cargo"
+source = "../.."
+package = "myrica"
+bin = "webkit-vulkan-probe"
+features = ["webkit-vulkan-probe", "backend-webkit-vulkan"]
+default-features = false
+architectures = ["aarch64"]
+to = "/bin/myrica-vulkan-probe"
+
+[[layers]]
+kind = "script"
+source = "../../tools/widevine-host/build-host.sh"
+architectures = ["aarch64"]
+to = "/systems/linux-aarch64/usr/libexec/myrica/widevine-host"

@@ -28,6 +28,8 @@ const BROWSER_CHROME_HEIGHT: f32 = 86.0;
 #[derive(Clone)]
 pub struct MyricaApp {
     backend: Rc<RefCell<BrowserWorker>>,
+    widevine: Rc<RefCell<crate::widevine::Setup>>,
+    widevine_open: State<bool>,
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
     canvas_handle: SgfxCanvasHandle,
@@ -75,8 +77,12 @@ impl MyricaApp {
         let initial_frame =
             BrowserFrame::empty(viewport.width, viewport.height).into_canvas_frame();
 
+        let widevine = crate::widevine::Setup::default();
+        let widevine_open = widevine.open.clone();
         Ok(Self {
             backend: Rc::new(RefCell::new(backend)),
+            widevine: Rc::new(RefCell::new(widevine)),
+            widevine_open,
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
             canvas_handle: SgfxCanvasHandle::new(),
@@ -108,6 +114,7 @@ impl MyricaApp {
         let go_backend = Rc::clone(&self.backend);
         let go_address = self.address.clone();
 
+        let widevine = Rc::clone(&self.widevine);
         let header = HeaderBar::new(
             hstack! {
                 Button::icon_only(Icon::ArrowLeft)
@@ -128,6 +135,8 @@ impl MyricaApp {
                     .header_style()
                     .on_click(move || navigate_from_address(&go_backend, &go_address)),
                 Text::new(snapshot.backend_name).font_size(12.0),
+                Button::new("Widevine").header_style()
+                    .on_click(move || widevine.borrow_mut().start()),
             }
             .spacing(8.0)
             .padding(10.0),
@@ -193,9 +202,38 @@ impl MyricaApp {
                 .frame(f32::INFINITY, f32::INFINITY),
             )
         };
-        content.on_event_capture(move |event: &Event| {
+        let setup_open = self.widevine.borrow().open.clone();
+        let overlay = if setup_open.get() {
+            Either::A(crate::widevine::panel(Rc::clone(&self.widevine)))
+        } else {
+            Either::B(Spacer::new().frame(0.0, 0.0))
+        };
+        // Keep the page at the same geometry while setup covers the window.
+        ZStack::new((content, overlay)).on_event_capture(move |event: &Event| {
+            if setup_open.get() {
+                if matches!(
+                    event,
+                    Event::Keyboard(KeyEvent::Pressed {
+                        keycode: KeyCode::Escape,
+                        ..
+                    })
+                ) {
+                    setup_open.set(false);
+                }
+                return matches!(
+                    event,
+                    Event::Keyboard(_)
+                        | Event::TextInputPreedit { .. }
+                        | Event::TextInputCommit { .. }
+                        | Event::TextInputDone { .. }
+                );
+            }
             dispatch_browser_shortcut(&shortcut_backend, &shortcut_keys, event)
         })
+    }
+
+    pub fn show_widevine_setup(&self) {
+        self.widevine.borrow_mut().start();
     }
 
     /// Stop the owner even if retained window callbacks still hold shell state.
@@ -300,6 +338,7 @@ impl View for MyricaApp {
             &self.webview_focused,
             &self.gpu_surface,
             &self.fullscreen,
+            &self.widevine_open,
         ]
     }
 
@@ -323,6 +362,7 @@ impl Application for MyricaApp {
     }
 
     fn on_idle(&mut self) {
+        self.widevine.borrow_mut().poll();
         self.synchronize_backend_state();
     }
 
@@ -1160,6 +1200,24 @@ mod tests {
         tree.layout(LayoutConstraints::tight(900.0, 500.0));
         assert_eq!(fields(tree.root().unwrap()), 1);
         assert_eq!(app.webview_size.get(), normal);
+        app.shutdown();
+    }
+
+    #[test]
+    fn setup_overlay_preserves_the_browser_viewport() {
+        let app = MyricaApp::new("about:blank").unwrap();
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let before = app.webview_size.get();
+        app.widevine_open.set(true);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(app.webview_size.get(), before);
+        app.widevine_open.set(false);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(app.webview_size.get(), before);
         app.shutdown();
     }
 

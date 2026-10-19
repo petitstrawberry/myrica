@@ -10,6 +10,7 @@ mod network;
 mod platform;
 #[cfg(feature = "backend-blitz")]
 mod sgfx_scene;
+mod widevine;
 
 use std::process::ExitCode;
 
@@ -30,7 +31,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let Some((kind, initial_location)) = parse_arguments(std::env::args().skip(1))? else {
+    let Some((kind, initial_location, setup)) = parse_arguments(std::env::args().skip(1))? else {
         return Ok(());
     };
     let mut app = if kind == BackendKind::default() {
@@ -38,6 +39,9 @@ fn run() -> Result<(), String> {
     } else {
         MyricaApp::with_backend(&initial_location, kind)?
     };
+    if setup {
+        app.show_widevine_setup();
+    }
     let result = app.run().map_err(|error| error.to_string());
     app.shutdown();
     result
@@ -45,17 +49,19 @@ fn run() -> Result<(), String> {
 
 fn parse_arguments(
     mut arguments: impl Iterator<Item = String>,
-) -> Result<Option<(BackendKind, String)>, String> {
+) -> Result<Option<(BackendKind, String, bool)>, String> {
     let mut kind = BackendKind::default();
     let mut location = None;
+    let mut setup = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => {
-                println!("usage: myrica [--backend blitz|webkit] [URL]");
+                println!("usage: myrica [--backend blitz|webkit] [--widevine-setup] [URL]");
                 println!("       URL defaults to {DEFAULT_LOCATION}");
                 // Return through the native CRT so C/C++ finalizers also run.
                 return Ok(None);
             }
+            "--widevine-setup" => setup = true,
             "--backend" => {
                 kind = BackendKind::parse(
                     &arguments
@@ -74,7 +80,14 @@ fn parse_arguments(
     }
     Ok(Some((
         kind,
-        location.unwrap_or_else(|| String::from(DEFAULT_LOCATION)),
+        location.unwrap_or_else(|| {
+            String::from(if setup {
+                "about:blank"
+            } else {
+                DEFAULT_LOCATION
+            })
+        }),
+        setup,
     )))
 }
 
@@ -94,12 +107,23 @@ mod tests {
     }
 
     #[test]
+    fn setup_opens_without_an_unrelated_network_load() {
+        let (_, url, setup) = parse_arguments(["--widevine-setup".into()].into_iter())
+            .unwrap()
+            .unwrap();
+        assert!(setup);
+        assert_eq!(url, "about:blank");
+    }
+
+    #[test]
     fn cli_rejects_missing_backend_and_extra_locations() {
         assert!(parse_arguments(["--backend".to_owned()].into_iter()).is_err());
         assert!(parse_arguments(["a".to_owned(), "b".to_owned()].into_iter()).is_err());
-        let (kind, location) = parse_arguments(["https://ichigo.dev/".to_owned()].into_iter())
-            .unwrap()
-            .unwrap();
+        let (kind, location, setup) =
+            parse_arguments(["https://ichigo.dev/".to_owned()].into_iter())
+                .unwrap()
+                .unwrap();
+        assert!(!setup);
         assert_eq!(kind, BackendKind::default());
         assert_eq!(location, "https://ichigo.dev/");
     }

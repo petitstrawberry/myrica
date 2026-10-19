@@ -112,6 +112,7 @@
               pkgs.flex
               pkgs.gperf
               pkgs.unifdef
+              pkgs.pkgsCross.aarch64-multiplatform.buildPackages.gcc
               pkgs.gnumake
               pkgs.autoconf
               pkgs.automake

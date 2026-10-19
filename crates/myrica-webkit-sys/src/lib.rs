@@ -12,6 +12,9 @@ mod media_bridge;
 mod cdm_bridge;
 
 #[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
+pub use cdm_host::setup as widevine_setup;
+
+#[cfg(all(target_os = "scarlet", feature = "encrypted-media"))]
 mod cdm_avc;
 
 use std::ffi::c_int;

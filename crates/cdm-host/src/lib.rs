@@ -8,6 +8,8 @@
 //! myrica's WebKit EME integration uses this module from the Scarlet side: the
 //! browser never loads the CDM itself.
 
+pub mod setup;
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 

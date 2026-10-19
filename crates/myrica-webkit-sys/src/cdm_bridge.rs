@@ -18,9 +18,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cdm_host::{
-    CdmHost, CdmHostError, CdmHostOptions, DecryptRequest, HostEvent, KeyStatus, Subsample,
-};
+use cdm_host::{CdmHost, CdmHostError, DecryptRequest, HostEvent, KeyStatus, Subsample};
 
 use crate::Bytes;
 
@@ -267,10 +265,13 @@ pub extern "C" fn cdm_host_create(
     // SAFETY: same contract as above.
     let ld_path = String::from_utf8_lossy(&unsafe { view(ld_path) }).into_owned();
 
-    let mut options = CdmHostOptions::new(host_path, cdm_path);
-    if !ld_path.is_empty() {
-        options.host_ld_path = Some(ld_path);
-    }
+    let mut options = match cdm_host::setup::configure(&host_path, &cdm_path, &ld_path) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("cdm_host_create: {error}");
+            return std::ptr::null_mut();
+        }
+    };
     if slot_count > 0 {
         options.slot_count = slot_count;
     }

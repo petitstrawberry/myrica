@@ -301,3 +301,34 @@ Scarlet Vulkan builds use WebKit’s standard threaded scrolling tree. Wheel inp
 can reach that tree from the UI while the document owner is busy. WebKit retains
 blocking wheel-listener dispatch, with navigation and viewport checks before
 accepting independent input.
+
+### Widevine setup on Scarlet
+
+The aarch64 Myrica bundle installs its Linux CDM service at
+`/usr/libexec/myrica/widevine-host` **inside the Debian view**. CDM binaries are
+installed separately by the user. Open **Widevine** in the toolbar, or run
+`myrica --widevine-setup`. The screen reports missing components, shows Debian
+installation instructions, and provides **再確認** after installation.
+
+Enable `trixie-backports` with `main contrib` in Debian, then run there:
+
+```sh
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+apt-get update
+apt-get install -t trixie-backports widevine-installer libnspr4
+widevine-installer
+```
+
+Review the installer's prompts and CDM terms. The check loads and initializes
+CDM interface 10 in an isolated Linux host with an eight-second timeout; it does
+not request a content license. Playback still depends on the service and content
+requirements. The native browser continues responding during checks.
+
+Playback and setup both use the Linux host's discovery: numeric versions below
+`/var/lib/widevine/WidevineCdm/`, standard Chromium locations, then the existing
+`/shared/widevine/libwidevinecdm.so`. `MYRICA_WIDEVINE_HOST`,
+`MYRICA_WIDEVINE_CDM`, and `MYRICA_WIDEVINE_LD_PATH` remain explicit overrides;
+an invalid override is reported rather than replaced. Paths are Linux-view paths.
+
+The app recipe lives in `platforms/scarlet/bundle.toml`. Its host build is owned
+by `tools/widevine-host/build-host.sh`; the recipe supplies the output filename.

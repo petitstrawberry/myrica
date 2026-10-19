@@ -55,7 +55,7 @@ and `--fd`. For local testing the host also accepts `--shm PATH` and
 ## Build
 
 ```sh
-./build.sh /tmp/widevine-host
+./build.sh ../../target/widevine-host
 ```
 
 The task runner has a standalone C++17 test (no CDM or credentials needed):
@@ -167,3 +167,21 @@ The test client's raw `--decrypt-sample` / experimental decode modes are W1
 probes of CDM API behaviour. The browser playback regression is
 `tests/eme-widevine-playback.html`, served by `tests/webkit_server.py` on the
 host and exercised by the Scarlet `webkit-smoke --eme-only` example.
+
+## Installed service and setup check
+
+`platforms/scarlet/bundle.toml` builds the host with `build-host.sh OUTPUT_FILE`
+and installs it in the Debian view at `/usr/libexec/myrica/widevine-host`.
+`build.sh` defaults to Myrica's `target/widevine-host/` for development outputs.
+
+`--cdm auto` searches Debian/Chromium installations and the legacy shared path;
+an explicitly supplied CDM path is used as given. See the project README for
+installer commands and overrides. Debian's [installer source](https://sources.debian.org/src/widevine-installer/0.0~git20240811.eab8c66-3/widevine-installer/)
+installs the library under `/var/lib/widevine` with browser symlinks.
+
+`widevine-host --check --cdm auto` loads and initializes the CDM without opening
+a server or persistent license state. It returns one `WVH_CHECK` tab-separated
+record on stdout (or `--fd N`) and exits. Loading/initialization/shutdown have
+an eight-second alarm; Myrica also bounds its nonblocking IPC receive and kills
+only its own check process group if needed. Normal playback uses the existing
+control protocol unchanged.
