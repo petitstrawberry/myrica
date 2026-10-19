@@ -54,10 +54,12 @@ impl Setup {
             }
         };
         self.pending = None;
-        self.status.set(match result {
+        let text = match result {
             Ok(text) => text,
             Err(error) => format!("設定が必要です\n{error}"),
-        });
+        };
+        eprintln!("[myrica:widevine] {text}");
+        self.status.set(text);
     }
 }
 

@@ -1120,6 +1120,9 @@ fn clone_request(request: &ffi::Request) -> Result<network::Request, BackendErro
 
 fn normalize_location(location: &str) -> Result<reqwest::Url, BackendError> {
     let location = location.trim();
+    if location == "about:blank" {
+        return Ok(reqwest::Url::parse(location).expect("static blank-page URL"));
+    }
     if location.is_empty() {
         return Err(BackendError::new("the address is empty"));
     }
@@ -1234,6 +1237,11 @@ mod tests {
             normalize_location("127.0.0.1:8080/test").unwrap().as_str(),
             "http://127.0.0.1:8080/test"
         );
+        assert_eq!(
+            normalize_location("about:blank").unwrap().as_str(),
+            "about:blank"
+        );
+        assert!(normalize_location("about:config").is_err());
         assert!(normalize_location("file:///etc/passwd").is_err());
         assert!(normalize_location("javascript://example.com/alert(1)").is_err());
         assert!(normalize_location("https://user:password@example.com/").is_err());
