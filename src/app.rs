@@ -28,8 +28,7 @@ const BROWSER_CHROME_HEIGHT: f32 = 86.0;
 #[derive(Clone)]
 pub struct MyricaApp {
     backend: Rc<RefCell<BrowserWorker>>,
-    widevine: Rc<RefCell<crate::widevine::Setup>>,
-    widevine_open: State<bool>,
+    settings: Rc<crate::settings::Settings>,
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
     canvas_handle: SgfxCanvasHandle,
@@ -77,12 +76,12 @@ impl MyricaApp {
         let initial_frame =
             BrowserFrame::empty(viewport.width, viewport.height).into_canvas_frame();
 
-        let widevine = crate::widevine::Setup::default();
-        let widevine_open = widevine.open.clone();
+        let settings = Rc::new(crate::settings::Settings::new(
+            initial_snapshot.backend_name,
+        ));
         Ok(Self {
             backend: Rc::new(RefCell::new(backend)),
-            widevine: Rc::new(RefCell::new(widevine)),
-            widevine_open,
+            settings,
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
             canvas_handle: SgfxCanvasHandle::new(),
@@ -114,7 +113,7 @@ impl MyricaApp {
         let go_backend = Rc::clone(&self.backend);
         let go_address = self.address.clone();
 
-        let widevine = Rc::clone(&self.widevine);
+        let settings = Rc::clone(&self.settings);
         let header = HeaderBar::new(
             hstack! {
                 Button::icon_only(Icon::ArrowLeft)
@@ -135,8 +134,8 @@ impl MyricaApp {
                     .header_style()
                     .on_click(move || navigate_from_address(&go_backend, &go_address)),
                 Text::new(snapshot.backend_name).font_size(12.0),
-                Button::new("Widevine").header_style()
-                    .on_click(move || widevine.borrow_mut().start()),
+                Button::new("設定").icon(Icon::Settings).header_style()
+                    .on_click(move || settings.open()),
             }
             .spacing(8.0)
             .padding(10.0),
@@ -202,38 +201,17 @@ impl MyricaApp {
                 .frame(f32::INFINITY, f32::INFINITY),
             )
         };
-        let setup_open = self.widevine.borrow().open.clone();
-        let overlay = if setup_open.get() {
-            Either::A(crate::widevine::panel(Rc::clone(&self.widevine)))
-        } else {
-            Either::B(Spacer::new().frame(0.0, 0.0))
-        };
-        // Keep the page at the same geometry while setup covers the window.
-        ZStack::new((content, overlay)).on_event_capture(move |event: &Event| {
-            if setup_open.get() {
-                if matches!(
-                    event,
-                    Event::Keyboard(KeyEvent::Pressed {
-                        keycode: KeyCode::Escape,
-                        ..
-                    })
-                ) {
-                    setup_open.set(false);
-                }
-                return matches!(
-                    event,
-                    Event::Keyboard(_)
-                        | Event::TextInputPreedit { .. }
-                        | Event::TextInputCommit { .. }
-                        | Event::TextInputDone { .. }
-                );
-            }
+        content.on_event_capture(move |event: &Event| {
             dispatch_browser_shortcut(&shortcut_backend, &shortcut_keys, event)
         })
     }
 
+    pub fn show_settings(&self) {
+        self.settings.open();
+    }
+
     pub fn show_widevine_setup(&self) {
-        self.widevine.borrow_mut().start();
+        self.settings.open_widevine();
     }
 
     /// Stop the owner even if retained window callbacks still hold shell state.
@@ -338,7 +316,6 @@ impl View for MyricaApp {
             &self.webview_focused,
             &self.gpu_surface,
             &self.fullscreen,
-            &self.widevine_open,
         ]
     }
 
@@ -355,22 +332,43 @@ impl Application for MyricaApp {
         } else {
             format!("{} — Myrica", snapshot.title)
         };
-        Window::new(window_title, self.content())
-            .app_id("org.scarlet-os.myrica")
-            .decorated(!self.fullscreen.get())
-            .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+        (
+            Window::new(window_title, self.content())
+                .app_id("org.scarlet-os.myrica")
+                .decorated(!self.fullscreen.get())
+                .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
+            self.settings.window(),
+        )
+    }
+
+    fn scene_listenables(&self, key: &scarlet_ui::SceneWindowKey) -> Option<Vec<&dyn Listenable>> {
+        // Settings observes its own navigation and status states. Page activity
+        // must not rebuild its window, nor subscribe it to browser frame state.
+        if key.as_str() == crate::settings::SCENE_KEY {
+            Some(vec![])
+        } else {
+            Some(self.listenables())
+        }
     }
 
     fn on_idle(&mut self) {
-        self.widevine.borrow_mut().poll();
+        self.settings.widevine.borrow_mut().poll();
         self.synchronize_backend_state();
     }
 
     fn on_window_sync(
         &mut self,
-        _: &scarlet_ui::WindowContext,
+        context: &scarlet_ui::WindowContext,
         window: &mut dyn scarlet_ui::platform::PlatformWindow,
     ) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            if self.settings.take_focus_request() {
+                if let Err(error) = window.focus() {
+                    eprintln!("myrica: settings focus failed: {error}");
+                }
+            }
+            return;
+        }
         let request = self.backend.borrow().snapshot().fullscreen;
         if request.request_id == self.last_fullscreen_request.get() {
             return;
@@ -390,7 +388,14 @@ impl Application for MyricaApp {
         }
     }
 
-    fn on_window_fullscreen_changed(&mut self, _: &scarlet_ui::WindowContext, fullscreen: bool) {
+    fn on_window_fullscreen_changed(
+        &mut self,
+        context: &scarlet_ui::WindowContext,
+        fullscreen: bool,
+    ) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            return;
+        }
         self.fullscreen.set(fullscreen);
         let requested = self.backend.borrow().snapshot().fullscreen;
         self.backend
@@ -407,7 +412,10 @@ impl Application for MyricaApp {
         self.webview_focused.set(true);
     }
 
-    fn on_frame_presented(&mut self, _: &scarlet_ui::WindowContext) {
+    fn on_frame_presented(&mut self, context: &scarlet_ui::WindowContext) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            return;
+        }
         // ScarletUI has completed GPU sampling before this callback. Return
         // the previous page image only after its replacement was presented.
         self.presentation_leases.borrow_mut().presented();
@@ -1204,20 +1212,62 @@ mod tests {
     }
 
     #[test]
-    fn setup_overlay_preserves_the_browser_viewport() {
+    fn settings_scene_is_independent_of_the_browser_viewport_and_subscriptions() {
         let app = MyricaApp::new("about:blank").unwrap();
-        let mut tree = scarlet_ui::ElementTree::new();
-        tree.set_root(app.content().create_element());
-        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let mut browser = scarlet_ui::ElementTree::new();
+        browser.set_root(app.content().create_element());
+        browser.layout(LayoutConstraints::tight(900.0, 500.0));
         let before = app.webview_size.get();
-        app.widevine_open.set(true);
-        tree.set_root(app.content().create_element());
-        tree.layout(LayoutConstraints::tight(900.0, 500.0));
-        assert_eq!(app.webview_size.get(), before);
-        app.widevine_open.set(false);
-        tree.set_root(app.content().create_element());
-        tree.layout(LayoutConstraints::tight(900.0, 500.0));
-        assert_eq!(app.webview_size.get(), before);
+        let mut scenes = scarlet_ui::SceneBuilder::new();
+        app.scenes().build(&mut scenes);
+        let mut windows = scenes.into_declarations();
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].opens_at_launch);
+        assert!(!windows[1].opens_at_launch);
+        let settings = windows.pop().unwrap();
+        assert!(app.scene_listenables(&settings.key).unwrap().is_empty());
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(settings.view.create_element());
+        for (width, height) in [(900.0, 640.0), (480.0, 400.0), (1200.0, 800.0)] {
+            tree.layout(LayoutConstraints::tight(width, height));
+            assert_eq!(app.webview_size.get(), before);
+        }
+        assert!(!app.fullscreen.get());
+        app.shutdown();
+    }
+
+    #[test]
+    fn settings_presentation_cannot_release_page_images_or_change_page_fullscreen() {
+        use std::sync::Mutex;
+        let mut app = MyricaApp::new("about:blank").unwrap();
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let lease = |token| {
+            let returned = Arc::clone(&returned);
+            crate::backend::FrameLease::new(
+                token,
+                Arc::new(move |id| returned.lock().unwrap().push(id)),
+            )
+        };
+        app.presentation_leases.borrow_mut().stage(Some(lease(1)));
+        app.presentation_leases.borrow_mut().presented();
+        app.presentation_leases.borrow_mut().stage(Some(lease(2)));
+        *app.staged_damage.borrow_mut() = Some(None);
+        let mut context = scarlet_ui::WindowContext {
+            window_id: scarlet_ui::WindowId::generate(),
+            scene_key: crate::settings::SCENE_KEY.into(),
+            pipeline_id: scarlet_ui::pipeline::PipelineId::new(1),
+            platform_window_id: 1,
+            is_primary: false,
+        };
+        app.on_frame_presented(&context);
+        app.on_window_fullscreen_changed(&context, true);
+        assert!(returned.lock().unwrap().is_empty());
+        assert_eq!(*app.staged_damage.borrow(), Some(None));
+        assert!(!app.fullscreen.get());
+        context.scene_key = scarlet_ui::SceneWindowKey::main();
+        app.on_frame_presented(&context);
+        assert_eq!(*returned.lock().unwrap(), [1]);
+        assert_eq!(*app.staged_damage.borrow(), None);
         app.shutdown();
     }
 

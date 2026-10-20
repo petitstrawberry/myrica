@@ -306,9 +306,12 @@ accepting independent input.
 
 The aarch64 Myrica bundle installs its Linux CDM service at
 `/usr/libexec/myrica/widevine-host` **inside the Debian view**. CDM binaries are
-installed separately by the user. Open **Widevine** in the toolbar, or run
-`myrica --widevine-setup`. The screen reports missing components, shows Debian
-installation instructions, and provides **再確認** after installation.
+installed separately by the user. Open **設定 → メディア** in the browser.
+Settings has its own window and category navigation. The media page reports
+missing components, shows Debian installation instructions, and provides **再確認**.
+Opening settings leaves the page visible and starts no CDM check by itself.
+`myrica --settings` opens this window; `myrica --widevine-setup` also selects the
+media page and starts a check. Closing settings preserves its selection and result.
 
 Enable `trixie-backports` with `main contrib` in Debian, then run there:
 

@@ -7,14 +7,12 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 pub const INSTRUCTIONS: &str = "Debianビューのシェルで実行してください。\n\nabi-run linux-aarch64 /bin/bash\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n\ntrixie-backports の contrib をまだ有効にしていない場合:\ncat > /etc/apt/sources.list.d/widevine-backports.sources <<'EOF'\nTypes: deb\nURIs: http://deb.debian.org/debian\nSuites: trixie-backports\nComponents: main contrib\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\nEOF\n\napt-get update\napt-get install -t trixie-backports widevine-installer libnspr4\nwidevine-installer\n\nCDMはインストーラーの案内と利用条件を確認して導入してください。\n導入後に「再確認」を押してください。\n\n既存のCDMも自動検出します。独自の配置には\nMYRICA_WIDEVINE_HOST / MYRICA_WIDEVINE_CDM /\nMYRICA_WIDEVINE_LD_PATH を指定できます。";
 
 pub struct Setup {
-    pub open: State<bool>,
     pub status: State<String>,
     pending: Option<Receiver<Result<String, String>>>,
 }
 impl Default for Setup {
     fn default() -> Self {
         Self {
-            open: State::new(generate_state_id(), false),
             status: State::new(generate_state_id(), "未確認".into()),
             pending: None,
         }
@@ -22,7 +20,6 @@ impl Default for Setup {
 }
 impl Setup {
     pub fn start(&mut self) {
-        self.open.set(true);
         if self.pending.is_some() {
             return;
         }
@@ -76,14 +73,13 @@ fn check() -> Result<String, String> {
 
 pub fn panel(setup: std::rc::Rc<std::cell::RefCell<Setup>>) -> impl View + Clone {
     let status = setup.borrow().status.clone();
-    let close = setup.borrow().open.clone();
     vstack! {
         hstack! {
-            Text::new("Widevine セットアップ").font_size(21.0).frame_width(f32::INFINITY),
+            Text::new("保護されたコンテンツ").font_size(21.0).frame_width(f32::INFINITY),
             Button::new("再確認").on_click(move || setup.borrow_mut().start()),
-            Button::new("閉じる").on_click(move || close.set(false)),
         }.spacing(12.0),
         ScrollView::new(vstack! {
+            Text::new("Widevine").font_size(18.0),
             Text::from_state(status).font_size(14.0),
             Text::new(INSTRUCTIONS).font_size(13.0),
         }.spacing(18.0).alignment(Alignment::Leading).padding(12.0))
@@ -94,21 +90,18 @@ pub fn panel(setup: std::rc::Rc<std::cell::RefCell<Setup>>) -> impl View + Clone
     .padding(18.0)
     .background(Color::rgb(247, 245, 242))
     .frame(f32::INFINITY, f32::INFINITY)
-    .on_event(|_| true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn closing_during_check_and_rechecking_consumes_fresh_results_on_ui_thread() {
+    fn rechecking_consumes_fresh_results_on_ui_thread() {
         let mut setup = Setup::default();
         let (tx, rx) = mpsc::channel();
         setup.pending = Some(rx);
-        setup.open.set(false);
         tx.send(Err("libnspr4.so".into())).unwrap();
         setup.poll();
-        assert!(!setup.open.get());
         assert!(setup.status.get().contains("libnspr4.so"));
         assert!(setup.pending.is_none());
         let (tx, rx) = mpsc::channel();
