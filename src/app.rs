@@ -356,6 +356,13 @@ impl Application for MyricaApp {
         self.synchronize_backend_state();
     }
 
+    fn on_window_close_requested(&mut self, context: &scarlet_ui::WindowContext) -> bool {
+        if context.scene_key == scarlet_ui::SceneWindowKey::main() {
+            scarlet_ui::dismiss_window(crate::settings::SCENE_KEY);
+        }
+        true
+    }
+
     fn on_window_sync(
         &mut self,
         context: &scarlet_ui::WindowContext,
