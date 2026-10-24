@@ -14,13 +14,13 @@ media = ["dep:scarlet-codecs", "dep:sas-client", "dep:scarlet-video-client"]
 encrypted-media = ["media", "vulkan-rendering", "dep:cdm-host"]
 
 [dependencies]
-scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "13cc8cff3c3a1ce02c51daff75ff60959563bfab", optional = true, default-features = false, features = ["media-container-aac"] }
+scarlet-codecs = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", optional = true, default-features = false, features = ["media-container-aac"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 cdm-host = { path = "../cdm-host", optional = true }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", default-features = false, features = ["std"] }
-sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7ea687d9139bf64d8676bad41257ba897d623bce", optional = true, default-features = false, features = ["std"] }
-scarlet-video-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "7ea687d9139bf64d8676bad41257ba897d623bce", optional = true, default-features = false, features = ["std", "h264-stateful-hw", "h264-stateless-hw"] }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, features = ["std"] }
+sas-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", optional = true, default-features = false, features = ["std"] }
+scarlet-video-client = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", optional = true, default-features = false, features = ["std", "h264-stateful-hw", "h264-stateless-hw"] }

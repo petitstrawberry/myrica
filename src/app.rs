@@ -288,6 +288,7 @@ impl MyricaApp {
                         surrounding_text: input.surrounding_text.clone(),
                         cursor_byte: input.cursor_byte,
                         anchor_byte: input.anchor_byte,
+                        automatic_software_keyboard: true,
                     }
                 }));
         }
