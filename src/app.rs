@@ -9,14 +9,15 @@ use scarlet_ui::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, Mou
 use scarlet_ui::graphics;
 use scarlet_ui::prelude::*;
 use scarlet_ui::{
-    Application, ComponentElement, Element, Listenable, SgfxCanvas, SgfxCanvasFrame,
-    SgfxCanvasHandle, Size, View, Window, WindowContentLayout, WindowDecoration, generate_state_id,
+    Application, ComponentElement, Element, ExternalGpuSurface, Listenable, SgfxCanvas,
+    SgfxCanvasFrame, SgfxCanvasHandle, SgfxTexture, Size, View, Window, WindowContentLayout,
+    WindowDecoration, generate_state_id,
 };
 use scarlet_ui::{hstack, vstack};
 
 use crate::backend::{
-    BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton, BrowserSnapshot,
-    BrowserViewport, BrowserWorker,
+    BackendKind, BrowserFrame, BrowserInput, BrowserKey, BrowserModifiers, BrowserMouseButton,
+    BrowserSnapshot, BrowserViewport, BrowserWorker, GpuImageCache, PresentationLeases,
 };
 
 const WINDOW_WIDTH: f32 = 1_100.0;
@@ -27,43 +28,77 @@ const BROWSER_CHROME_HEIGHT: f32 = 86.0;
 #[derive(Clone)]
 pub struct MyricaApp {
     backend: Rc<RefCell<BrowserWorker>>,
+    settings: Rc<crate::settings::Settings>,
     address: State<String>,
     snapshot: State<BrowserSnapshot>,
     canvas_handle: SgfxCanvasHandle,
     canvas_frame: State<Arc<SgfxCanvasFrame>>,
+    // The outer state switches view kind only once a GPU page arrives. Further
+    // frames notify the inner paint state without rebuilding browser chrome.
+    gpu_surface: State<Option<State<Arc<SgfxTexture>>>>,
+    presentation_leases: Rc<RefCell<PresentationLeases>>,
+    gpu_image_cache: Rc<RefCell<GpuImageCache<SgfxTexture>>>,
     webview_size: State<Size>,
     webview_focused: State<bool>,
     webview_text_input: State<Option<TextInputElementState>>,
     last_webview_focused: Rc<Cell<bool>>,
     last_backend_url: Rc<RefCell<String>>,
+    browser_shortcut_keys: Rc<RefCell<Vec<KeyCode>>>,
+    fullscreen: State<bool>,
+    last_fullscreen_request: Rc<Cell<u64>>,
+    surface_damage: State<Option<scarlet_ui::Rect>>,
+    staged_damage: Rc<RefCell<Option<Option<scarlet_ui::Rect>>>>,
 }
 
 impl MyricaApp {
     /// Construct the browser and begin loading its initial location.
     pub fn new(initial_location: &str) -> std::result::Result<Self, String> {
+        Self::with_backend(initial_location, BackendKind::default())
+    }
+
+    pub fn with_backend(
+        initial_location: &str,
+        kind: BackendKind,
+    ) -> std::result::Result<Self, String> {
         let webview_size = webview_size_for_window(WINDOW_WIDTH, WINDOW_HEIGHT);
         let viewport = viewport_for_size(webview_size);
         // The application loop calls on_idle at least every 16 ms. Keep UI
         // state and its subscribers on that thread; a worker notification
         // must not rebuild the entire window before its result is consumed.
-        let backend =
-            BrowserWorker::new(initial_location, viewport).map_err(|error| error.to_string())?;
+        let backend = if kind == BackendKind::default() {
+            BrowserWorker::new(initial_location, viewport)
+        } else {
+            BrowserWorker::with_backend(initial_location, viewport, kind)
+        }
+        .map_err(|error| error.to_string())?;
         let initial_snapshot = backend.snapshot();
         let initial_url = initial_snapshot.url.clone();
         let initial_frame =
             BrowserFrame::empty(viewport.width, viewport.height).into_canvas_frame();
 
+        let settings = Rc::new(crate::settings::Settings::new(
+            initial_snapshot.backend_name,
+        ));
         Ok(Self {
             backend: Rc::new(RefCell::new(backend)),
+            settings,
             address: State::new(generate_state_id(), initial_url.clone()),
             snapshot: State::new(generate_state_id(), initial_snapshot),
             canvas_handle: SgfxCanvasHandle::new(),
             canvas_frame: State::new(generate_state_id(), initial_frame),
+            gpu_surface: State::new(generate_state_id(), None),
+            presentation_leases: Rc::new(RefCell::new(PresentationLeases::default())),
+            gpu_image_cache: Rc::new(RefCell::new(GpuImageCache::default())),
             webview_size: State::new(generate_state_id(), webview_size),
             webview_focused: State::new(generate_state_id(), false),
             webview_text_input: State::new(generate_state_id(), None),
             last_webview_focused: Rc::new(Cell::new(false)),
             last_backend_url: Rc::new(RefCell::new(initial_url)),
+            browser_shortcut_keys: Rc::new(RefCell::new(Vec::new())),
+            fullscreen: State::new(generate_state_id(), false),
+            last_fullscreen_request: Rc::new(Cell::new(0)),
+            surface_damage: State::new(generate_state_id(), None),
+            staged_damage: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -78,6 +113,7 @@ impl MyricaApp {
         let go_backend = Rc::clone(&self.backend);
         let go_address = self.address.clone();
 
+        let settings = Rc::clone(&self.settings);
         let header = HeaderBar::new(
             hstack! {
                 Button::icon_only(Icon::ArrowLeft)
@@ -98,6 +134,8 @@ impl MyricaApp {
                     .header_style()
                     .on_click(move || navigate_from_address(&go_backend, &go_address)),
                 Text::new(snapshot.backend_name).font_size(12.0),
+                Button::new("設定").icon(Icon::Settings).header_style()
+                    .on_click(move || settings.open()),
             }
             .spacing(8.0)
             .padding(10.0),
@@ -107,24 +145,34 @@ impl MyricaApp {
         let event_backend = Rc::clone(&self.backend);
         let webview_size = self.webview_size.get();
         let observed_webview_size = self.webview_size.clone();
-        let canvas = SgfxCanvas::from_state(
-            self.canvas_handle,
-            webview_size.width,
-            webview_size.height,
-            self.canvas_frame.clone(),
-        )
-        .on_geometry_change(
-            |geometry| geometry.size(),
-            move |size| {
-                if observed_webview_size.get() != size {
-                    observed_webview_size.set(size);
-                }
-            },
-        )
-        .on_event(move |event| dispatch_webview_event(&event_backend, event))
-        .focusable(self.webview_focused.clone())
-        .text_input(self.webview_text_input.clone())
-        .frame(f32::INFINITY, f32::INFINITY);
+        let page = if let Some(texture) = self.gpu_surface.get() {
+            Either::A(
+                ExternalGpuSurface::from_state(webview_size.width, webview_size.height, texture)
+                    .damage(self.surface_damage.clone()),
+            )
+        } else {
+            Either::B(SgfxCanvas::from_state(
+                self.canvas_handle,
+                webview_size.width,
+                webview_size.height,
+                self.canvas_frame.clone(),
+            ))
+        };
+        let canvas = page
+            .on_geometry_change(
+                |geometry| geometry.size(),
+                move |size| {
+                    if observed_webview_size.get() != size {
+                        observed_webview_size.set(size);
+                    }
+                },
+            )
+            .focusable(self.webview_focused.clone())
+            .text_input(self.webview_text_input.clone())
+            // The focused wrapper is the keyboard target. Keep the event handler
+            // outside it so key/IME events reach this ancestor during bubbling.
+            .on_event(move |event| dispatch_webview_event(&event_backend, event))
+            .frame(f32::INFINITY, f32::INFINITY);
 
         let status = Text::new(format!(
             "{} · {}",
@@ -135,12 +183,81 @@ impl MyricaApp {
         .padding_insets(EdgeInsets::symmetric(6.0, 10.0))
         .frame(f32::INFINITY, 30.0);
 
-        vstack! {
-            header,
-            canvas.background(Color::rgb(247, 245, 242)),
-            status,
+        let shortcut_backend = Rc::clone(&self.backend);
+        let shortcut_keys = Rc::clone(&self.browser_shortcut_keys);
+        let content = if self.fullscreen.get() {
+            Either::A(
+                canvas
+                    .background(Color::BLACK)
+                    .frame(f32::INFINITY, f32::INFINITY),
+            )
+        } else {
+            Either::B(
+                vstack! {
+                    header,
+                    canvas.background(Color::rgb(247, 245, 242)),
+                    status,
+                }
+                .frame(f32::INFINITY, f32::INFINITY),
+            )
+        };
+        content.on_event_capture(move |event: &Event| {
+            dispatch_browser_shortcut(&shortcut_backend, &shortcut_keys, event)
+        })
+    }
+
+    pub fn show_settings(&self) {
+        self.settings.open();
+    }
+
+    pub fn show_widevine_setup(&self) {
+        self.settings.open_widevine();
+    }
+
+    /// Stop the owner even if retained window callbacks still hold shell state.
+    pub fn shutdown(&self) {
+        self.gpu_image_cache.borrow_mut().clear();
+        self.presentation_leases.borrow_mut().clear();
+        self.backend.borrow_mut().shutdown();
+    }
+
+    fn set_gpu_surface(&self, texture: Arc<SgfxTexture>) {
+        if let Some(state) = self.gpu_surface.get() {
+            state.set(texture);
+        } else {
+            self.gpu_surface
+                .set(Some(State::new(generate_state_id(), texture)));
         }
-        .frame(f32::INFINITY, f32::INFINITY)
+    }
+
+    fn apply_frame(
+        &self,
+        frame: BrowserFrame,
+    ) -> std::result::Result<(), crate::backend::BackendError> {
+        let lease = frame.lease.clone();
+        let size = self.webview_size.get();
+        let damage = frame.damage.map(|[x, y, width, height]| {
+            scarlet_ui::Rect::from_xywh(
+                x as f32 * size.width / frame.width.max(1) as f32,
+                y as f32 * size.height / frame.height.max(1) as f32,
+                width as f32 * size.width / frame.width.max(1) as f32,
+                height as f32 * size.height / frame.height.max(1) as f32,
+            )
+        });
+        let damage = accumulate_damage(&mut self.staged_damage.borrow_mut(), damage);
+        self.surface_damage.set(damage);
+        let texture = frame.try_external_gpu_texture(&mut self.gpu_image_cache.borrow_mut())?;
+        if let Some(texture) = texture {
+            self.set_gpu_surface(texture);
+        } else {
+            self.gpu_image_cache.borrow_mut().clear();
+            self.canvas_frame.set(frame.try_into_canvas_frame()?);
+            if self.gpu_surface.get().is_some() {
+                self.gpu_surface.set(None);
+            }
+        }
+        self.presentation_leases.borrow_mut().stage(lease);
+        Ok(())
     }
 
     fn synchronize_backend_state(&self) {
@@ -154,7 +271,9 @@ impl MyricaApp {
             backend.poll()
         };
         if let Some(frame) = frame {
-            self.canvas_frame.set(frame.into_canvas_frame());
+            if let Err(error) = self.apply_frame(frame) {
+                eprintln!("myrica: {error}");
+            }
         }
         let latest = self.backend.borrow().snapshot();
         if latest.text_input != self.snapshot.get().text_input {
@@ -169,6 +288,7 @@ impl MyricaApp {
                         surrounding_text: input.surrounding_text.clone(),
                         cursor_byte: input.cursor_byte,
                         anchor_byte: input.anchor_byte,
+                        automatic_software_keyboard: true,
                     }
                 }));
         }
@@ -195,6 +315,8 @@ impl View for MyricaApp {
             &self.snapshot,
             &self.webview_size,
             &self.webview_focused,
+            &self.gpu_surface,
+            &self.fullscreen,
         ]
     }
 
@@ -211,18 +333,128 @@ impl Application for MyricaApp {
         } else {
             format!("{} — Myrica", snapshot.title)
         };
-        Window::new(window_title, self.content())
-            .app_id("org.scarlet-os.myrica")
-            .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+        (
+            Window::new(window_title, self.content())
+                .app_id("org.scarlet-os.myrica")
+                .decorated(!self.fullscreen.get())
+                .size(Size::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
+            self.settings.window(),
+        )
+    }
+
+    fn scene_listenables(&self, key: &scarlet_ui::SceneWindowKey) -> Option<Vec<&dyn Listenable>> {
+        // Settings observes its own navigation and status states. Page activity
+        // must not rebuild its window, nor subscribe it to browser frame state.
+        if key.as_str() == crate::settings::SCENE_KEY {
+            Some(vec![])
+        } else {
+            Some(self.listenables())
+        }
     }
 
     fn on_idle(&mut self) {
+        self.settings.widevine.borrow_mut().poll();
         self.synchronize_backend_state();
+    }
+
+    fn on_window_close_requested(&mut self, context: &scarlet_ui::WindowContext) -> bool {
+        if context.scene_key == scarlet_ui::SceneWindowKey::main() {
+            scarlet_ui::dismiss_window(crate::settings::SCENE_KEY);
+        }
+        true
+    }
+
+    fn on_window_sync(
+        &mut self,
+        context: &scarlet_ui::WindowContext,
+        window: &mut dyn scarlet_ui::platform::PlatformWindow,
+    ) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            if self.settings.take_focus_request() {
+                if let Err(error) = window.focus() {
+                    eprintln!("myrica: settings focus failed: {error}");
+                }
+            }
+            return;
+        }
+        let request = self.backend.borrow().snapshot().fullscreen;
+        if request.request_id == self.last_fullscreen_request.get() {
+            return;
+        }
+        self.last_fullscreen_request.set(request.request_id);
+        let result = window.set_fullscreen(request.requested);
+        if result.is_err() || request.requested == self.fullscreen.get() {
+            self.backend
+                .borrow()
+                .handle_input(BrowserInput::FullscreenChanged {
+                    request_id: request.request_id,
+                    fullscreen: self.fullscreen.get(),
+                });
+        }
+        if let Err(error) = result {
+            eprintln!("myrica: fullscreen transition failed: {error}");
+        }
+    }
+
+    fn on_window_fullscreen_changed(
+        &mut self,
+        context: &scarlet_ui::WindowContext,
+        fullscreen: bool,
+    ) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            return;
+        }
+        self.fullscreen.set(fullscreen);
+        let requested = self.backend.borrow().snapshot().fullscreen;
+        self.backend
+            .borrow()
+            .handle_input(BrowserInput::FullscreenChanged {
+                request_id: if requested.requested == fullscreen {
+                    requested.request_id
+                } else {
+                    0
+                },
+                fullscreen,
+            });
+        // The complete output is the page viewport while browser chrome is hidden.
+        self.webview_focused.set(true);
+    }
+
+    fn on_frame_presented(&mut self, context: &scarlet_ui::WindowContext) {
+        if context.scene_key.as_str() == crate::settings::SCENE_KEY {
+            return;
+        }
+        // ScarletUI has completed GPU sampling before this callback. Return
+        // the previous page image only after its replacement was presented.
+        self.presentation_leases.borrow_mut().presented();
+        self.staged_damage.borrow_mut().take();
     }
 
     fn debug_logging(&self) -> bool {
         false
     }
+}
+
+fn accumulate_damage(
+    pending: &mut Option<Option<scarlet_ui::Rect>>,
+    next: Option<scarlet_ui::Rect>,
+) -> Option<scarlet_ui::Rect> {
+    let merged = match (*pending, next) {
+        (None, next) => next,
+        (Some(Some(a)), Some(b)) => {
+            let x = a.origin.x.min(b.origin.x);
+            let y = a.origin.y.min(b.origin.y);
+            Some(scarlet_ui::Rect::from_xywh(
+                x,
+                y,
+                (a.origin.x + a.size.width).max(b.origin.x + b.size.width) - x,
+                (a.origin.y + a.size.height).max(b.origin.y + b.size.height) - y,
+            ))
+        }
+        _ => None,
+    };
+    *pending = Some(merged);
+    merged
 }
 
 fn viewport_for_size(size: Size) -> BrowserViewport {
@@ -247,6 +479,83 @@ fn navigate_from_address(backend: &Rc<RefCell<BrowserWorker>>, address: &State<S
     if let Err(error) = backend.borrow_mut().navigate(&address.get()) {
         eprintln!("myrica: {error}");
     }
+}
+
+fn dispatch_browser_shortcut(
+    backend: &Rc<RefCell<BrowserWorker>>,
+    pressed: &Rc<RefCell<Vec<KeyCode>>>,
+    event: &Event,
+) -> bool {
+    match event {
+        Event::Keyboard(KeyEvent::Released { keycode, modifiers }) => {
+            let keycode = normalize_key(*keycode, *modifiers);
+            let mut pressed = pressed.borrow_mut();
+            if let Some(index) = pressed.iter().position(|key| *key == keycode) {
+                pressed.remove(index);
+                return true;
+            }
+        }
+        Event::Keyboard(KeyEvent::Pressed { keycode, modifiers }) => {
+            let keycode = normalize_key(*keycode, *modifiers);
+            let mut backend = backend.borrow_mut();
+            match keycode {
+                KeyCode::Escape
+                    if {
+                        let fullscreen = backend.snapshot().fullscreen;
+                        fullscreen.requested || fullscreen.active
+                    } =>
+                {
+                    backend.handle_input(BrowserInput::ExitFullscreen);
+                }
+                KeyCode::Char('r' | 'R')
+                    if modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.alt
+                        && !modifiers.super_key =>
+                {
+                    backend.reload()
+                }
+                KeyCode::Left
+                    if modifiers.alt
+                        && !modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.super_key =>
+                {
+                    backend.go_back()
+                }
+                KeyCode::Right
+                    if modifiers.alt
+                        && !modifiers.control
+                        && !modifiers.shift
+                        && !modifiers.super_key =>
+                {
+                    backend.go_forward()
+                }
+                _ => {
+                    // Recover a held shortcut after a platform drops its keyup
+                    // while the window is inactive. Ordinary new presses own
+                    // their following text, regardless of the previous focus.
+                    pressed.borrow_mut().retain(|key| *key != keycode);
+                    return false;
+                }
+            }
+            if !pressed.borrow().contains(&keycode) {
+                pressed.borrow_mut().push(keycode);
+            }
+            return true;
+        }
+        Event::Keyboard(KeyEvent::Char { c }) => {
+            // Winit delivers printable text separately even for Ctrl+R. The
+            // browser owns all phases of a captured shortcut, including text.
+            if pressed.borrow().iter().any(
+                |key| matches!(key, KeyCode::Char(character) if character.eq_ignore_ascii_case(c)),
+            ) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 fn dispatch_webview_event(backend: &Rc<RefCell<BrowserWorker>>, event: &Event) -> bool {
@@ -288,12 +597,12 @@ fn dispatch_webview_event(backend: &Rc<RefCell<BrowserWorker>>, event: &Event) -
             y: *y as f32,
         },
         Event::Keyboard(KeyEvent::Pressed { keycode, modifiers }) => BrowserInput::Key {
-            key: map_key(*keycode),
+            key: map_key(normalize_key(*keycode, *modifiers)),
             pressed: true,
             modifiers: map_modifiers(*modifiers),
         },
         Event::Keyboard(KeyEvent::Released { keycode, modifiers }) => BrowserInput::Key {
-            key: map_key(*keycode),
+            key: map_key(normalize_key(*keycode, *modifiers)),
             pressed: false,
             modifiers: map_modifiers(*modifiers),
         },
@@ -332,6 +641,20 @@ fn map_modifiers(modifiers: KeyModifiers) -> BrowserModifiers {
     }
 }
 
+fn normalize_key(key: KeyCode, modifiers: KeyModifiers) -> KeyCode {
+    // Native SWS represents Ctrl+A..Z as U+0001..001A in both physical key
+    // phases. Recover the base letter for DOM codes and browser shortcuts;
+    // actual committed text continues through its separate Char event.
+    match key {
+        KeyCode::Char(character)
+            if modifiers.control && ('\u{1}'..='\u{1a}').contains(&character) =>
+        {
+            KeyCode::Char(char::from_u32(character as u32 + 0x60).unwrap())
+        }
+        _ => key,
+    }
+}
+
 fn map_key(key: KeyCode) -> BrowserKey {
     match key {
         KeyCode::Escape => BrowserKey::Escape,
@@ -357,6 +680,362 @@ fn map_key(key: KeyCode) -> BrowserKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_page_uses_a_direct_surface_and_updates_only_its_texture_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct ExternalImage;
+        fn count<T: 'static>(element: &dyn Element) -> usize {
+            usize::from(
+                element
+                    .render_object()
+                    .is_some_and(|render| render.as_any().is::<T>()),
+            ) + element
+                .children()
+                .iter()
+                .map(|child| count::<T>(child.as_ref()))
+                .sum::<usize>()
+        }
+
+        // Opaque image payloads test the shell's actual view selection without
+        // pretending to decode video or supply a native GPU capability.
+        let app = MyricaApp::new("about:blank").unwrap();
+        let kind_changes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&kind_changes);
+        app.gpu_surface.subscribe_any(Arc::new(move || {
+            observed.fetch_add(1, Ordering::Relaxed);
+        }));
+        app.set_gpu_surface(SgfxTexture::external_bgra8(
+            800,
+            600,
+            Arc::new(ExternalImage),
+        ));
+        let texture_state = app.gpu_surface.get().unwrap();
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let root = tree.root().unwrap();
+        assert_eq!(count::<scarlet_ui::ExternalGpuSurfaceRenderObject>(root), 1);
+        assert_eq!(count::<scarlet_ui::SgfxCanvasRenderObject>(root), 0);
+        let size = app.webview_size.get();
+
+        let next = SgfxTexture::external_bgra8(800, 600, Arc::new(ExternalImage));
+        app.set_gpu_surface(Arc::clone(&next));
+        assert_eq!(app.gpu_surface.get().unwrap().id(), texture_state.id());
+        assert!(Arc::ptr_eq(&texture_state.get(), &next));
+        assert_eq!(
+            kind_changes.load(Ordering::Relaxed),
+            1,
+            "frames must not rebuild browser chrome"
+        );
+        tree.layout(LayoutConstraints::tight(420.0, 340.0));
+        assert_ne!(
+            app.webview_size.get(),
+            size,
+            "direct surface retains the geometry observer"
+        );
+
+        app.apply_frame(BrowserFrame::empty(420, 340)).unwrap();
+        assert!(
+            app.gpu_surface.get().is_none(),
+            "CPU scene returns to the canvas path"
+        );
+        let mut canvas = scarlet_ui::ElementTree::new();
+        canvas.set_root(app.content().create_element());
+        canvas.layout(LayoutConstraints::tight(420.0, 340.0));
+        assert_eq!(
+            count::<scarlet_ui::ExternalGpuSurfaceRenderObject>(canvas.root().unwrap()),
+            0
+        );
+        assert_eq!(
+            count::<scarlet_ui::SgfxCanvasRenderObject>(canvas.root().unwrap()),
+            1
+        );
+    }
+
+    #[cfg(feature = "backend-blitz")]
+    #[test]
+    fn focused_canvas_routes_keyboard_to_the_real_page_editor() {
+        use crate::backend::LoadState;
+        use scarlet_ui::pipeline::RenderingPipeline;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/input", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut paths = Vec::new();
+            for generation in 1..=7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let length = stream.read(&mut request).unwrap();
+                paths.push(
+                    String::from_utf8_lossy(&request[..length])
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .to_owned(),
+                );
+                let body = format!(
+                    "<title>ready-{generation}</title><style>body{{margin:0}}input{{position:absolute;left:0;top:0;width:500px;height:200px}}</style><input id='editor'>"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            paths
+        });
+        let mut app = MyricaApp::new(&url).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-1"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "page did not become ready: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        let mut pipeline = RenderingPipeline::new();
+        pipeline.set_root(
+            app.content()
+                .frame(WINDOW_WIDTH, WINDOW_HEIGHT)
+                .create_element(),
+        );
+        pipeline.layout_initial();
+        // Real ScarletUI dispatch chooses the focusable canvas wrapper as the
+        // keyboard target. Its outer event handler must receive the bubble.
+        assert!(
+            pipeline.handle_event(&Event::Mouse(MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            }))
+        );
+        pipeline.handle_event(&Event::Mouse(MouseEvent::ButtonReleased {
+            button: MouseButton::Left,
+            x: 120,
+            y: 100,
+            click_count: 1,
+        }));
+        assert!(app.webview_focused.get(), "canvas did not gain focus");
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Char('a'),
+            modifiers: KeyModifiers::default(),
+        })));
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Char { c: 'a' })));
+        pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+            keycode: KeyCode::Char('a'),
+            modifiers: KeyModifiers::default(),
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app
+            .snapshot
+            .get()
+            .text_input
+            .as_ref()
+            .is_some_and(|input| input.surrounding_text == "a")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "page editor did not receive keyboard events: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+            keycode: KeyCode::Char('r'),
+            modifiers: KeyModifiers {
+                control: true,
+                ..Default::default()
+            },
+        })));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-2"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "Ctrl+R did not reload over HTTP: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Keep R physically held while focusing the fresh real page editor.
+        // Winit's following Char('r') must not become text after a shortcut.
+        for event in [
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: 120,
+                y: 100,
+                click_count: 1,
+            },
+        ] {
+            pipeline.handle_event(&Event::Mouse(event));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().text_input.is_none() {
+            assert!(Instant::now() < deadline, "fresh editor did not gain focus");
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Char { c: 'r' })));
+        pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+            keycode: KeyCode::Char('r'),
+            modifiers: KeyModifiers::default(),
+        }));
+        let deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < deadline {
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.snapshot.get().text_input.unwrap().surrounding_text, "");
+        // Exercise SWS's actual Ctrl+R representation separately.
+        for event in [
+            KeyEvent::Pressed {
+                keycode: KeyCode::Char('\u{12}'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            KeyEvent::Released {
+                keycode: KeyCode::Char('\u{12}'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+        ] {
+            assert!(pipeline.handle_event(&Event::Keyboard(event)));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-3"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "native-shaped Ctrl+R did not reload: {:?}",
+                app.snapshot.get()
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        let origin = url.trim_end_matches("/input");
+        app.backend
+            .borrow_mut()
+            .navigate(&format!("{origin}/second"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-4" || !app.snapshot.get().can_go_back {
+            assert!(
+                Instant::now() < deadline,
+                "second page did not become ready"
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        // A focused address field consumes Char and arrow events itself.
+        // Browser capture must run before that editor for all shortcut phases.
+        for event in [
+            MouseEvent::ButtonPressed {
+                button: MouseButton::Left,
+                x: 250,
+                y: 24,
+                click_count: 1,
+            },
+            MouseEvent::ButtonReleased {
+                button: MouseButton::Left,
+                x: 250,
+                y: 24,
+                click_count: 1,
+            },
+        ] {
+            pipeline.handle_event(&Event::Mouse(event));
+        }
+        assert!(
+            !app.webview_focused.get(),
+            "address editor did not gain focus"
+        );
+        let original_address = app.address.get();
+        for event in [
+            KeyEvent::Pressed {
+                keycode: KeyCode::Char('r'),
+                modifiers: KeyModifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            KeyEvent::Char { c: 'r' },
+            KeyEvent::Released {
+                keycode: KeyCode::Char('r'),
+                modifiers: KeyModifiers::default(),
+            },
+        ] {
+            assert!(pipeline.handle_event(&Event::Keyboard(event)));
+        }
+        assert_eq!(
+            app.address.get(),
+            original_address,
+            "shortcut inserted text into the address"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.snapshot.get().title != "ready-5"
+            || app.snapshot.get().load_state != LoadState::Ready
+        {
+            assert!(
+                Instant::now() < deadline,
+                "address-focused Ctrl+R did not reload"
+            );
+            app.on_idle();
+            thread::sleep(Duration::from_millis(2));
+        }
+        for (keycode, expected) in [(KeyCode::Left, "ready-6"), (KeyCode::Right, "ready-7")] {
+            assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Pressed {
+                keycode,
+                modifiers: KeyModifiers {
+                    alt: true,
+                    ..Default::default()
+                }
+            })));
+            assert!(pipeline.handle_event(&Event::Keyboard(KeyEvent::Released {
+                keycode,
+                modifiers: KeyModifiers::default()
+            })));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while app.snapshot.get().title != expected
+                || app.snapshot.get().load_state != LoadState::Ready
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "Alt history navigation did not load {expected}: {:?}",
+                    app.snapshot.get()
+                );
+                app.on_idle();
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "/input", "/input", "/input", "/second", "/second", "/input", "/second"
+            ]
+        );
+        app.shutdown();
+    }
 
     #[cfg(feature = "javascript")]
     #[test]
@@ -504,6 +1183,100 @@ mod tests {
             "UI state changed on the engine thread"
         );
         assert_eq!(server.join().unwrap(), ["/first", "/address", "/linked"]);
+    }
+
+    #[test]
+    fn fullscreen_hides_address_chrome_and_restores_the_page_viewport() {
+        fn fields(element: &dyn Element) -> usize {
+            usize::from(element.render_object().is_some_and(|render| {
+                render
+                    .as_any()
+                    .is::<scarlet_ui::views::TextFieldRenderObject>()
+            })) + element
+                .children()
+                .iter()
+                .map(|child| fields(child.as_ref()))
+                .sum::<usize>()
+        }
+        let app = MyricaApp::new("about:blank").unwrap();
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        let normal = app.webview_size.get();
+        assert_eq!(fields(tree.root().unwrap()), 1);
+
+        app.fullscreen.set(true);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(fields(tree.root().unwrap()), 0);
+        assert_eq!(app.webview_size.get(), Size::new(900.0, 500.0));
+
+        app.fullscreen.set(false);
+        tree.set_root(app.content().create_element());
+        tree.layout(LayoutConstraints::tight(900.0, 500.0));
+        assert_eq!(fields(tree.root().unwrap()), 1);
+        assert_eq!(app.webview_size.get(), normal);
+        app.shutdown();
+    }
+
+    #[test]
+    fn settings_scene_is_independent_of_the_browser_viewport_and_subscriptions() {
+        let app = MyricaApp::new("about:blank").unwrap();
+        let mut browser = scarlet_ui::ElementTree::new();
+        browser.set_root(app.content().create_element());
+        browser.layout(LayoutConstraints::tight(900.0, 500.0));
+        let before = app.webview_size.get();
+        let mut scenes = scarlet_ui::SceneBuilder::new();
+        app.scenes().build(&mut scenes);
+        let mut windows = scenes.into_declarations();
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].opens_at_launch);
+        assert!(!windows[1].opens_at_launch);
+        let settings = windows.pop().unwrap();
+        assert!(app.scene_listenables(&settings.key).unwrap().is_empty());
+        let mut tree = scarlet_ui::ElementTree::new();
+        tree.set_root(settings.view.create_element());
+        for (width, height) in [(900.0, 640.0), (480.0, 400.0), (1200.0, 800.0)] {
+            tree.layout(LayoutConstraints::tight(width, height));
+            assert_eq!(app.webview_size.get(), before);
+        }
+        assert!(!app.fullscreen.get());
+        app.shutdown();
+    }
+
+    #[test]
+    fn settings_presentation_cannot_release_page_images_or_change_page_fullscreen() {
+        use std::sync::Mutex;
+        let mut app = MyricaApp::new("about:blank").unwrap();
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        let lease = |token| {
+            let returned = Arc::clone(&returned);
+            crate::backend::FrameLease::new(
+                token,
+                Arc::new(move |id| returned.lock().unwrap().push(id)),
+            )
+        };
+        app.presentation_leases.borrow_mut().stage(Some(lease(1)));
+        app.presentation_leases.borrow_mut().presented();
+        app.presentation_leases.borrow_mut().stage(Some(lease(2)));
+        *app.staged_damage.borrow_mut() = Some(None);
+        let mut context = scarlet_ui::WindowContext {
+            window_id: scarlet_ui::WindowId::generate(),
+            scene_key: crate::settings::SCENE_KEY.into(),
+            pipeline_id: scarlet_ui::pipeline::PipelineId::new(1),
+            platform_window_id: 1,
+            is_primary: false,
+        };
+        app.on_frame_presented(&context);
+        app.on_window_fullscreen_changed(&context, true);
+        assert!(returned.lock().unwrap().is_empty());
+        assert_eq!(*app.staged_damage.borrow(), Some(None));
+        assert!(!app.fullscreen.get());
+        context.scene_key = scarlet_ui::SceneWindowKey::main();
+        app.on_frame_presented(&context);
+        assert_eq!(*returned.lock().unwrap(), [1]);
+        assert_eq!(*app.staged_damage.borrow(), None);
+        app.shutdown();
     }
 
     #[test]

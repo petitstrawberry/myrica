@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "llvm-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791893839,
+        "narHash": "sha256-RuhzI+js8dfDQIYsTvq3rGdX0s8Z9t7Wao1/YAr88iY=",
+        "owner": "petitstrawberry",
+        "repo": "llvm-project",
+        "rev": "5733bea91affcb26db1f9f4d7459b22c79756c13",
+        "type": "github"
+      },
+      "original": {
+        "owner": "petitstrawberry",
+        "repo": "llvm-project",
+        "rev": "5733bea91affcb26db1f9f4d7459b22c79756c13",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1788372231,
@@ -60,17 +77,34 @@
         "type": "github"
       }
     },
+    "scarlet-abi-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791904932,
+        "narHash": "sha256-tnyIaXkyGZorjZ+kMGj7vGuq7q/ezkSwyK0AH5orzsE=",
+        "owner": "petitstrawberry",
+        "repo": "Scarlet",
+        "rev": "c6a831d2120c49e3d68c2839e20374d412afd015",
+        "type": "github"
+      },
+      "original": {
+        "owner": "petitstrawberry",
+        "repo": "Scarlet",
+        "rev": "c6a831d2120c49e3d68c2839e20374d412afd015",
+        "type": "github"
+      }
+    },
     "scarlet-rust-toolchain": {
       "inputs": {
         "nixpkgs": "nixpkgs_2",
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1788477566,
-        "narHash": "sha256-UVS91EaLGtCwY92NOW62/hRjuOZQhnZgK6JGrQwrFr4=",
+        "lastModified": 1791935509,
+        "narHash": "sha256-2sJj1bMkz7YtfgPmLs4ihRf5SSXdt5fok78brYQgW4s=",
         "owner": "petitstrawberry",
         "repo": "scarlet-rust-nix",
-        "rev": "f45d9a87ebe054942bf3f7bad49e1a3b61041cc5",
+        "rev": "79f356924d1a93b55904c6b2733d0b3da5ce0de5",
         "type": "github"
       },
       "original": {
@@ -80,18 +114,28 @@
       }
     },
     "scarlet-sdk": {
-      "flake": false,
+      "inputs": {
+        "llvm-src": "llvm-src",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "scarlet-abi-src": "scarlet-abi-src",
+        "scarlet-rust-toolchain": [
+          "scarlet-rust-toolchain"
+        ]
+      },
       "locked": {
-        "lastModified": 1788487831,
-        "narHash": "sha256-ynuBcTBWtVbJqyWlcA6otG1Mw/zeaOyWG8b+/z3xZb4=",
+        "lastModified": 1791947752,
+        "narHash": "sha256-WpVevKHtcMzQr4RU6kroc9eYEAoXvmY1JSfM6J2fC0U=",
         "owner": "petitstrawberry",
         "repo": "scarlet-sdk",
-        "rev": "10a17cce4e8429f6de196a65d55f24395b22b84d",
+        "rev": "a071222231e8bbd96c1d54f38d99d1b27ec90805",
         "type": "github"
       },
       "original": {
         "owner": "petitstrawberry",
         "repo": "scarlet-sdk",
+        "rev": "a071222231e8bbd96c1d54f38d99d1b27ec90805",
         "type": "github"
       }
     }

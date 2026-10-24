@@ -9,8 +9,26 @@ license = "MIT"
 name = "myrica"
 path = "src/main.rs"
 
+[[example]]
+name = "webkit-smoke"
+path = "examples/webkit_smoke.rs"
+required-features = ["backend-webkit"]
+
+[[example]]
+name = "webkit-threaded-presentation"
+path = "examples/webkit_threaded_presentation.rs"
+required-features = ["backend-webkit-vulkan"]
+
+[[bin]]
+name = "webkit-vulkan-probe"
+path = "src/bin/webkit-vulkan-probe.rs"
+required-features = ["webkit-vulkan-probe"]
+
 [features]
 default = ["backend-blitz", "javascript"]
+backend-webkit-vulkan = ["backend-webkit", "myrica-webkit-sys/vulkan-rendering", "myrica-webkit-sys/vulkan-probe", "myrica-webkit-sys/media", "myrica-webkit-sys/encrypted-media"]
+webkit-vulkan-probe = ["backend-webkit", "myrica-webkit-sys/vulkan-probe"]
+encrypted-media = ["backend-webkit-vulkan"]
 javascript = ["backend-blitz", "dep:blitz-vibey-script", "dep:getrandom-v04"]
 backend-blitz = [
     "dep:anyrender",
@@ -34,8 +52,19 @@ backend-blitz = [
     "dep:swash",
     "dep:tokio",
 ]
+backend-webkit = [
+    "dep:brotli-decompressor",
+    "dep:flate2",
+    "dep:myrica-webkit-sys",
+    "dep:reqwest",
+    "reqwest/http2",
+    "dep:tokio",
+]
 
 [dependencies]
+brotli-decompressor = { version = "5.0.3", optional = true }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"], optional = true }
+myrica-webkit-sys = { path = "crates/myrica-webkit-sys", optional = true }
 anyrender = { version = "0.13.0", optional = true }
 blitz-html = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", optional = true }
 blitz-vibey-script = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", optional = true }
@@ -55,19 +84,24 @@ peniko = { version = "0.6.0", optional = true }
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "cookies", "rustls-tls-webpki-roots"], optional = true }
 skrifa = { version = "0.44.0", optional = true }
 swash = { version = "0.2.6", optional = true }
-tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time"], optional = true }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+
+[dev-dependencies]
+brotli-decompressor = "5.0.3"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+serde_json = "1"
 
 [target.'cfg(target_os = "scarlet")'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", default-features = false, features = ["woff"], optional = true }
 getrandom = { version = "0.2.16", default-features = false, features = ["custom"] }
 getrandom-v04 = { package = "getrandom", version = "0.4.3", optional = true }
-scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", package = "scarlet-os", default-features = false, features = ["std"] }
-scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "d3b1c05127d4df3616f988b81a99f616e8a88064", package = "scarlet-sys" }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "1b0f08aeb0a7057c9a6d0d7312554372411afff8", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", package = "scarlet-os", default-features = false, features = ["std"] }
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", package = "scarlet-sys" }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "775e42f502f4e150bb614bbe2c1ed76d46530484", package = "scarlet-ui", default-features = false, features = ["std", "platform-sws"] }
 
 [target.'cfg(not(target_os = "scarlet"))'.dependencies]
 blitz-dom = { git = "https://github.com/petitstrawberry/blitz", rev = "2ff62c576f2648b8d44f4bae53ec328030ded8ae", default-features = false, features = ["system-fonts", "woff"], optional = true }
-scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "1b0f08aeb0a7057c9a6d0d7312554372411afff8", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
+scarlet-ui = { git = "https://github.com/petitstrawberry/scarlet-ui", rev = "775e42f502f4e150bb614bbe2c1ed76d46530484", package = "scarlet-ui", default-features = false, features = ["std", "platform-winit"] }
 
 [patch.crates-io]
 ring = { git = "https://github.com/petitstrawberry/ring.git", branch = "scarlet" }

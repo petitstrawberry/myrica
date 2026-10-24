@@ -24,7 +24,7 @@ use swash::scale::{Render as SwashRender, ScaleContext, Source, StrikeWith, imag
 use swash::zeno::{Format as SwashFormat, Vector as SwashVector};
 use swash::{FontRef as SwashFontRef, GlyphId as SwashGlyphId};
 
-use crate::backend::{BrowserDraw, BrowserFrame, BrowserTexture};
+use crate::backend::{BrowserDraw, BrowserFrame, BrowserTexture, BrowserTextureSource};
 
 const PATH_TOLERANCE: f64 = 0.15;
 const MAX_CANVAS_DRAWS: usize = 240;
@@ -329,7 +329,7 @@ impl SgfxSceneRenderer {
             revision: 0,
             width: image.width,
             height: image.height,
-            pixels: rgba.into(),
+            source: BrowserTextureSource::Rgba8(rgba.into()),
         });
         self.textures.insert(key, Arc::clone(&texture));
         Some(texture)
@@ -870,7 +870,7 @@ impl GlyphAtlasPage {
             revision: self.revision,
             width: GLYPH_ATLAS_SIZE,
             height: GLYPH_ATLAS_SIZE,
-            pixels: self.pixels.clone().into(),
+            source: BrowserTextureSource::Rgba8(self.pixels.clone().into()),
         }));
         self.dirty = false;
     }

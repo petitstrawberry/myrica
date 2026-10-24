@@ -1,0 +1,112 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>eme-running</title>
+<h1>Widevine L3 session integration</h1>
+<pre id="eme-state">Starting…</pre>
+<script>
+(async () => {
+    const state = {secureContext: isSecureContext, sessions: [], rejected: []};
+    const report = () => {
+        document.getElementById('eme-state').textContent = JSON.stringify(state);
+        console.log('MYRICA_EME_STATE', JSON.stringify(state));
+    };
+    try {
+        if (!isSecureContext) throw new Error('Serve over trusted HTTPS or guest localhost');
+        const config = {
+            initDataTypes: ['cenc'], sessionTypes: ['temporary'],
+            distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed',
+            videoCapabilities: [{contentType: 'video/mp4; codecs="avc1.42E01E"', robustness: 'SW_SECURE_CRYPTO', encryptionScheme: 'cenc'}]
+        };
+        for (const [name, keySystem, change] of [
+            ['case-sensitive-key-system', 'COM.WIDEVINE.ALPHA', {}],
+            ['hardware-security', 'com.widevine.alpha', {videoCapabilities: [{...config.videoCapabilities[0], robustness: 'HW_SECURE_ALL'}]}],
+            ['cdm-secure-decode', 'com.widevine.alpha', {videoCapabilities: [{...config.videoCapabilities[0], robustness: 'SW_SECURE_DECODE'}]}],
+            ['persistent-license', 'com.widevine.alpha', {sessionTypes: ['persistent-license'], persistentState: 'required'}],
+            ['unsupported-cbcs', 'com.widevine.alpha', {videoCapabilities: [{...config.videoCapabilities[0], encryptionScheme: 'cbcs'}]}]
+        ]) {
+            state.stage = 'reject:' + name; report();
+            let rejected = false;
+            try { await navigator.requestMediaKeySystemAccess(keySystem, [{...config, ...change}]); }
+            catch (error) { if (error.name !== 'NotSupportedError') throw error; rejected = true; }
+            if (!rejected) throw new Error('Unsupported configuration accepted: ' + name);
+            state.rejected.push(name); report();
+        }
+        state.stage = 'media-capabilities'; report();
+        const decoding = {type: 'media-source', video: {
+            contentType: config.videoCapabilities[0].contentType,
+            width: 256, height: 110, bitrate: 100000, framerate: 24
+        }};
+        const keySystemConfiguration = {
+            keySystem: 'com.widevine.alpha', initDataType: 'cenc',
+            distinctiveIdentifier: 'not-allowed', persistentState: 'not-allowed', sessionTypes: ['temporary'],
+            video: {robustness: 'SW_SECURE_CRYPTO', encryptionScheme: 'cenc'}
+        };
+        const clearInfo = await navigator.mediaCapabilities.decodingInfo(decoding);
+        if (!clearInfo.supported || clearInfo.keySystemAccess !== null)
+            throw new Error('Clear MediaCapabilities mismatch');
+        const encryptedInfo = await navigator.mediaCapabilities.decodingInfo({...decoding, keySystemConfiguration});
+        if (!encryptedInfo.supported || encryptedInfo.keySystemAccess?.keySystem !== 'com.widevine.alpha')
+            throw new Error('Encrypted MediaCapabilities missing usable access');
+        const rejectedInfo = await navigator.mediaCapabilities.decodingInfo({...decoding,
+            keySystemConfiguration: {...keySystemConfiguration, video: {robustness: 'HW_SECURE_ALL'}}});
+        if (rejectedInfo.supported || rejectedInfo.keySystemAccess !== null)
+            throw new Error('Unsupported MediaCapabilities accepted');
+        state.mediaCapabilities = true; report();
+        state.stage = 'request-access'; report();
+        const access = await navigator.requestMediaKeySystemAccess('com.widevine.alpha', [config]);
+        state.configuration = access.getConfiguration(); report();
+        state.stage = 'create-keys'; report();
+        const keys = await access.createMediaKeys();
+        const certificateResponse = await fetch('https://cwip-shaka-proxy.appspot.com/service-cert');
+        if (!certificateResponse.ok || !await keys.setServerCertificate(await certificateResponse.arrayBuffer()))
+            throw new Error('Widevine service certificate rejected');
+        state.serverCertificate = true; report();
+        state.stage = 'manifest'; report();
+        const manifest = await fetch('https://storage.googleapis.com/shaka-demo-assets/sintel-widevine/dash.mpd');
+        if (!manifest.ok) throw new Error('Manifest HTTP ' + manifest.status);
+        const xml = new DOMParser().parseFromString(await manifest.text(), 'application/xml');
+        const protection = [...xml.getElementsByTagNameNS('*', 'ContentProtection')]
+            .find(node => (node.getAttribute('schemeIdUri') || '').toLowerCase() === 'urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed');
+        const pssh = protection?.getElementsByTagNameNS('*', 'pssh')[0]?.textContent.trim();
+        if (!pssh) throw new Error('Widevine PSSH missing');
+        const initData = Uint8Array.from(atob(pssh), c => c.charCodeAt(0));
+        // More sessions than shared slots catches missing RELEASE and duplicate messages.
+        for (let index = 0; index < 6; ++index) {
+            state.stage = 'session:' + index; report();
+            const session = keys.createSession('temporary');
+            const result = {index, messages: 0, usable: 0};
+            let complete, fail;
+            const licensed = new Promise((resolve, reject) => { complete = resolve; fail = reject; });
+            const timeout = setTimeout(() => fail(new Error('Licence timeout')), 30000);
+            session.addEventListener('message', async event => {
+                try {
+                    ++result.messages;
+                    if (event.messageType !== 'license-request' || result.messages !== 1)
+                        throw new Error('Unexpected or duplicate initial message');
+                    const response = await fetch('https://cwip-shaka-proxy.appspot.com/no_auth', {method: 'POST', body: event.message});
+                    if (!response.ok) throw new Error('Licence HTTP ' + response.status);
+                    await session.update(await response.arrayBuffer());
+                    complete();
+                } catch (error) { fail(error); }
+            });
+            await session.generateRequest('cenc', initData);
+            await licensed;
+            clearTimeout(timeout);
+            // WebKit queues key-status delivery as a DOM task after update resolves.
+            for (let attempt = 0; attempt < 100 && !result.usable; ++attempt) {
+                session.keyStatuses.forEach(status => { if (status === 'usable') ++result.usable; });
+                if (!result.usable) await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            if (!session.sessionId || !result.usable) throw new Error('No usable session key');
+            await session.close();
+            await session.closed;
+            if (result.messages !== 1) throw new Error('Duplicate licence message');
+            state.sessions.push(result); report();
+        }
+        state.ok = true; report(); document.title = 'eme-pass';
+    } catch (error) {
+        state.ok = false; state.error = String(error); report(); document.title = 'eme-fail';
+        console.error('MYRICA_EME_FAIL', String(error));
+    }
+})();
+</script>

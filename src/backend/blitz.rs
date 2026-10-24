@@ -307,6 +307,7 @@ impl BlitzBackend {
                 load_state: LoadState::Idle,
                 can_go_back: false,
                 can_go_forward: false,
+                fullscreen: Default::default(),
                 text_input: None,
             },
             history: Vec::new(),
@@ -1016,6 +1017,7 @@ impl BrowserBackend for BlitzBackend {
                 document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
                 document.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(text)));
             }
+            BrowserInput::FullscreenChanged { .. } | BrowserInput::ExitFullscreen => return false,
             BrowserInput::FocusLost => {
                 self.key_modifiers = BrowserModifiers::default();
                 self.document

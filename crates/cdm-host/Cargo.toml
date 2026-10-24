@@ -1,0 +1,13 @@
+[package]
+name = "cdm-host"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Scarlet-native client for the widevine-host CDM service process"
+
+[dependencies]
+scarlet-sys = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca" }
+scarlet-os = { git = "https://github.com/petitstrawberry/Scarlet", rev = "5d0fe3ac8c97289a28599bac22fca4ac26a5f9ca", default-features = false, features = ["std"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("scarlet"))'] }

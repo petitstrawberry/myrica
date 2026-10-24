@@ -1,0 +1,204 @@
+name: Scarlet prebuilt
+
+on:
+  push:
+    branches: [main, master, feature/webkit-backend]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - flake.nix
+      - flake.lock
+      - src/**
+      - crates/**
+      - platforms/scarlet/**
+      - .cargo/**
+      - LICENSE
+      - .github/workflows/scarlet-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scarlet-prebuilt-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      tag: ${{ steps.inputs.outputs.tag }}
+      exists: ${{ steps.inputs.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check published release
+        id: inputs
+        run: |
+          echo "tag=scarlet-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          if gh release view "scarlet-$GITHUB_SHA" --json isDraft --jq '.isDraft' | grep -qx false; then
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Free disk space for WebKit
+        if: steps.inputs.outputs.exists != 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - uses: cachix/install-nix-action@v31
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://scarlet-rust-toolchain.cachix.org
+            extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
+      - uses: cachix/cachix-action@v17
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME || 'scarlet-dev' }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - uses: actions/cache/restore@v4
+        if: steps.inputs.outputs.exists != 'true'
+        id: build-cache
+        with:
+          path: target
+          key: myrica-aarch64-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'platforms/scarlet/**', 'crates/myrica-webkit-sys/**') }}
+          restore-keys: myrica-aarch64-
+      - name: Build Myrica and probe
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
+          nix develop --command bash -euo pipefail <<'BUILD'
+          cargo build --locked --release --target aarch64-unknown-scarlet \
+            --no-default-features --features backend-webkit-vulkan,webkit-vulkan-probe \
+            --bin myrica --bin webkit-vulkan-probe
+          printf '%s\n' "$SCARLET_NATIVE_RUNTIME" > "$RUNNER_TEMP/myrica-native-runtime"
+          printf '%s\n' "$SCARLET_RUST_TOOLCHAIN" > "$RUNNER_TEMP/myrica-toolchain"
+          printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}" > "$RUNNER_TEMP/myrica-cargo-home"
+          BUILD
+      - uses: actions/cache/save@v4
+        if: steps.inputs.outputs.exists != 'true' && steps.build-cache.outputs.cache-hit != 'true'
+        with:
+          path: target
+          key: ${{ steps.build-cache.outputs.cache-primary-key }}
+      - name: Package corresponding sources and notices
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
+          mkdir -p dist/sources/myrica dist/sources/native dist/staging/share/licenses/myrica/third-party
+          git archive HEAD | tar -xf - -C dist/sources/myrica
+          task_cargo_home=$(cat "$RUNNER_TEMP/myrica-cargo-home")
+          mkdir -p dist/sources/cargo-home
+          cp -a "$task_cargo_home/registry" "$task_cargo_home/git" dist/sources/cargo-home/
+          task_native=$(find target/aarch64-unknown-scarlet/release/build -path '*/out/sources/webkit.path' -print -quit)
+          test -n "$task_native"
+          task_native=$(dirname "$task_native")
+          task_webkit_revision=$(git -C "$task_native/_deps/webkit-src" rev-parse HEAD)
+          (cd "$task_native/_deps"; tar --exclude=.git -cf - -- ./*-src) | tar -xf - -C dist/sources/native
+          task_sdk=$(nix eval --impure --raw --expr '(builtins.getFlake ("git+file://" + toString ./.)).inputs.scarlet-sdk.outPath')
+          cp -R "$task_sdk/scarlet-libc" dist/sources/scarlet-libc
+          chmod -R u+w dist/sources/scarlet-libc
+          cp "$task_sdk/LICENSE" dist/sources/scarlet-libc/LICENSE-SDK
+          cp -R "$(cat "$RUNNER_TEMP/myrica-native-runtime")/share/licenses" dist/staging/share/licenses/myrica/native-runtime
+          task_toolchain=$(cat "$RUNNER_TEMP/myrica-toolchain")
+          cp -R "$task_toolchain/lib/rustlib/src/rust/library" dist/sources/rust-library
+          task_rust_revision=$(sed -n 's/^rust_commit = "\(.*\)"/\1/p' "$task_toolchain/manifest.toml")
+          test -n "$task_rust_revision"
+          chmod -R u+w dist/sources/rust-library
+          for task_notice in LICENSE-MIT LICENSE-APACHE COPYRIGHT; do
+            curl --fail --location --retry 3 "https://raw.githubusercontent.com/petitstrawberry/rust/$task_rust_revision/$task_notice" \
+              -o "dist/sources/rust-library/$task_notice"
+          done
+          (
+            cd dist/sources
+            find . -type f \( -iname '*license*' -o -iname '*copying*' -o -iname '*notice*' \
+              -o -iname '*copyright*' -o -iname 'authors*' -o -iname 'ftl.txt' -o -iname 'readme.ijg' \) -print0 \
+              | tar --null -T - -cf -
+          ) | tar -xf - -C dist/staging/share/licenses/myrica/third-party
+          cat > dist/staging/share/licenses/myrica/SOURCES.txt <<SOURCES
+          Myrica uses WebKit, including components under the GNU Library/Lesser
+          General Public License, and other third-party software. Their notices
+          and license texts are retained in third-party/ and native-runtime/.
+          Myrica's independent code remains MIT licensed.
+
+          FreeType is used under the FreeType License (FTL).
+          This software is based in part on the work of the FreeType Team.
+          This software is based in part on the work of the Independent JPEG Group.
+
+          Corresponding source, native dependencies, cached Rust dependencies,
+          and rebuild instructions for this binary are available in this release:
+          https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/myrica-sources.tar.gz
+
+          Myrica: https://github.com/petitstrawberry/myrica/tree/$GITHUB_SHA
+          Modified WebKit: https://github.com/petitstrawberry/WebKit/tree/$task_webkit_revision
+          Rebuild instructions: myrica/README.md in the source archive.
+          Copyright notices in individual source files are retained in that archive.
+          SOURCES
+          cp dist/staging/share/licenses/myrica/SOURCES.txt dist/sources/SOURCES.txt
+          tar --owner=0 --group=0 --mtime=@0 -czf dist/myrica-sources.tar.gz -C dist/sources .
+      - name: Package release
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
+          mkdir -p dist/staging/bin
+          install -m755 target/aarch64-unknown-scarlet/release/myrica dist/staging/bin/myrica
+          install -m755 target/aarch64-unknown-scarlet/release/webkit-vulkan-probe dist/staging/bin/myrica-vulkan-probe
+          install -Dm644 LICENSE dist/staging/share/licenses/myrica/LICENSE
+          chmod -R u+rwX dist/staging
+          task_asset=myrica-aarch64-unknown-scarlet.tar.gz
+          tar --owner=0 --group=0 --mtime=@0 -czf "dist/$task_asset" -C dist/staging .
+          cd dist
+          sha256sum "$task_asset" myrica-sources.tar.gz > SHA256SUMS
+          task_digest=$(sha256sum "$task_asset" | cut -d ' ' -f 1)
+          cat > bundle.toml <<BUNDLE
+          [[layers]]
+          kind = "archive"
+          url = "https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/$task_asset"
+          sha256 = "$task_digest"
+          format = "tar-gz"
+          to = "/"
+          BUNDLE
+      - uses: actions/upload-artifact@v4
+        if: steps.inputs.outputs.exists != 'true'
+        with:
+          name: scarlet-prebuilt
+          path: |
+            dist/*.tar.gz
+            dist/bundle.toml
+            dist/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: needs.build.outputs.exists != 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.build.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: scarlet-prebuilt
+          path: dist
+      - name: Publish complete release without replacing a published asset
+        run: |
+          if gh release view "$TAG" --json isDraft --jq '.isDraft' | grep -qx false; then
+            echo 'Release already published.'
+            exit 0
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" --title "Scarlet $GITHUB_SHA" --notes "AArch64 WebKit/Vulkan browser and diagnostic probe. Built with Myrica’s own locked development environment."
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          gh release edit "$TAG" --draft=false --latest=false

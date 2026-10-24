@@ -4,10 +4,12 @@ use std::fmt;
 use std::sync::Arc;
 
 mod frame;
+mod frame_lease;
 mod worker;
 
 pub use frame::BrowserFrame;
-pub(crate) use frame::{BrowserDraw, BrowserTexture};
+pub(crate) use frame::{BrowserDraw, BrowserTexture, BrowserTextureSource, GpuImageCache};
+pub(crate) use frame_lease::{FrameLease, PresentationLeases};
 pub use worker::{BrowserViewport, BrowserWorker};
 
 #[cfg(feature = "backend-blitz")]
@@ -15,6 +17,73 @@ mod blitz;
 
 #[cfg(feature = "backend-blitz")]
 pub use blitz::BlitzBackend;
+
+#[cfg(feature = "backend-webkit")]
+mod webkit;
+
+// Exercise the texture cache without linking the native C++ engine on the host.
+#[cfg(all(test, not(feature = "backend-webkit")))]
+mod webkit {
+    mod frame;
+    mod network;
+    mod pixels;
+}
+
+#[cfg(feature = "backend-webkit")]
+pub use webkit::WebKitBackend;
+
+/// Engine selected for this browser window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendKind {
+    Blitz,
+    WebKit,
+}
+
+impl BackendKind {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Blitz => "Blitz",
+            Self::WebKit => "WebKit",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, BackendError> {
+        let kind = match name {
+            "blitz" => Self::Blitz,
+            "webkit" => Self::WebKit,
+            _ => {
+                return Err(BackendError::new(format!(
+                    "unknown browser backend: {name}"
+                )));
+            }
+        };
+        if kind.enabled() {
+            Ok(kind)
+        } else {
+            Err(BackendError::new(format!(
+                "{} backend was not enabled at build time",
+                kind.name()
+            )))
+        }
+    }
+
+    pub const fn enabled(self) -> bool {
+        match self {
+            Self::Blitz => cfg!(feature = "backend-blitz"),
+            Self::WebKit => cfg!(feature = "backend-webkit"),
+        }
+    }
+}
+
+impl Default for BackendKind {
+    fn default() -> Self {
+        if cfg!(feature = "backend-blitz") {
+            Self::Blitz
+        } else {
+            Self::WebKit
+        }
+    }
+}
 
 /// Thread-safe callback used by a backend to request another application tick.
 pub type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -44,6 +113,14 @@ impl LoadState {
     }
 }
 
+/// Native fullscreen transition requested by the document owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrowserFullscreen {
+    pub request_id: u64,
+    pub requested: bool,
+    pub active: bool,
+}
+
 /// Browser state exposed to chrome without leaking engine-specific types.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowserSnapshot {
@@ -61,6 +138,7 @@ pub struct BrowserSnapshot {
     pub can_go_forward: bool,
     /// IME state of the page's focused editable control, in viewport CSS pixels.
     pub text_input: Option<BrowserTextInput>,
+    pub fullscreen: BrowserFullscreen,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,6 +224,12 @@ pub enum BrowserInput {
     },
     ImeCommit(String),
     FocusLost,
+    /// Window-server acknowledgement. Zero identifies a forced platform exit.
+    FullscreenChanged {
+        request_id: u64,
+        fullscreen: bool,
+    },
+    ExitFullscreen,
 }
 
 /// Error returned when a browser backend rejects an operation.
@@ -167,8 +251,67 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// A completed compositor frame, independent of document execution.
+pub struct PresentedFrame {
+    pub generation: u64,
+    pub viewport: BrowserViewport,
+    pub frame: BrowserFrame,
+}
+
+/// This endpoint may exchange completed images and leases only. It must never
+/// enter the document, execute script, or wait for the engine/GPU.
+pub trait BrowserFrameSource: Send {
+    /// Immutable producer limit, queried on construction rather than per frame.
+    fn maximum_surface_dimension(&self) -> Option<u32> {
+        None
+    }
+    fn poll(&mut self) -> Result<Option<PresentedFrame>, BackendError>;
+}
+
+/// Optional input routing independent of the document owner. An accepted event
+/// must not also be enqueued on the owner. False preserves the ordinary path.
+pub trait BrowserInputSink: Send + Sync {
+    fn dispatch(&self, input: &BrowserInput, generation: u64, viewport: BrowserViewport) -> bool;
+}
+
 /// Narrow WebView-like interface implemented by each embedded browser engine.
 pub trait BrowserBackend {
+    fn take_input_sink(&mut self) -> Option<Arc<dyn BrowserInputSink>> {
+        None
+    }
+
+    fn take_frame_source(&mut self) -> Option<Box<dyn BrowserFrameSource>> {
+        None
+    }
+
+    fn set_frame_generation(&mut self, _generation: u64) {}
+
+    /// Optional thread-safe interruption used before joining a native engine
+    /// during shutdown. The callback must not enter owner-only engine APIs.
+    fn shutdown_callback(&self) -> Option<WakeCallback> {
+        None
+    }
+
+    fn set_frame_releaser(&mut self, _release: Arc<dyn Fn(u64) + Send + Sync>) {}
+    fn release_frame(&mut self, _token: u64) {}
+    fn can_render(&mut self) -> bool {
+        true
+    }
+    fn render_if_ready(&mut self, width: u32, height: u32, scale: f32) -> Option<BrowserFrame> {
+        Some(self.render(width, height, scale))
+    }
+
+    /// Whether an earlier render has an uncollected asynchronous submission.
+    /// This query must neither tick the engine nor begin another paint.
+    fn has_pending_frame(&mut self) -> bool {
+        false
+    }
+
+    /// Collect only an earlier submission, without starting layout or painting.
+    fn poll_pending_frame(&mut self) -> Option<BrowserFrame> {
+        None
+    }
+
     /// Start a new top-level navigation.
     fn navigate(&mut self, location: &str) -> Result<(), BackendError>;
 
@@ -200,11 +343,22 @@ pub trait BrowserBackend {
 
 /// Construct the backend selected at compile time.
 pub fn create_backend(wake: WakeCallback) -> Result<Box<dyn BrowserBackend>, BackendError> {
-    #[cfg(feature = "backend-blitz")]
-    {
-        return Ok(Box::new(BlitzBackend::new(wake)?));
-    }
+    create_backend_selected(BackendKind::default(), wake)
+}
 
-    #[allow(unreachable_code)]
-    Err(BackendError::new("no browser backend is enabled"))
+pub fn create_backend_selected(
+    kind: BackendKind,
+    wake: WakeCallback,
+) -> Result<Box<dyn BrowserBackend>, BackendError> {
+    match kind {
+        #[cfg(feature = "backend-blitz")]
+        BackendKind::Blitz => Ok(Box::new(BlitzBackend::new(wake)?)),
+        #[cfg(feature = "backend-webkit")]
+        BackendKind::WebKit => Ok(Box::new(WebKitBackend::new(wake)?)),
+        #[allow(unreachable_patterns)]
+        _ => Err(BackendError::new(format!(
+            "{} backend was not enabled at build time",
+            kind.name()
+        ))),
+    }
 }
