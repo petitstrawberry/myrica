@@ -18,6 +18,11 @@ on:
       - LICENSE
       - .github/workflows/scarlet-release.yml
   workflow_dispatch:
+    inputs:
+      reuse_from:
+        description: Existing Myrica release commit to reuse for packaging-only changes
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -32,6 +37,7 @@ jobs:
     timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
+      REUSE_FROM: ${{ inputs.reuse_from }}
     outputs:
       tag: ${{ steps.inputs.outputs.tag }}
       exists: ${{ steps.inputs.outputs.exists }}
@@ -44,8 +50,21 @@ jobs:
           if gh release view "scarlet-$GITHUB_SHA" --json isDraft --jq '.isDraft' | grep -qx false; then
             echo 'exists=true' >> "$GITHUB_OUTPUT"
           fi
+      - name: Reuse matching browser, probe, and corresponding sources
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from != ''
+        run: |
+          [[ "$REUSE_FROM" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin "$REUSE_FROM"
+          git diff --exit-code FETCH_HEAD HEAD -- . ':!.github/workflows/scarlet-release.yml' ':!README.md'
+          gh release download "scarlet-$REUSE_FROM" --dir dist \
+            --pattern myrica-aarch64-unknown-scarlet.tar.gz --pattern myrica-sources.tar.gz --pattern SHA256SUMS
+          (cd dist && sha256sum -c SHA256SUMS)
+          mkdir -p dist/staging
+          tar -xzf dist/myrica-aarch64-unknown-scarlet.tar.gz -C dist/staging
+          test -x dist/staging/bin/myrica
+          test -x dist/staging/bin/myrica-vulkan-probe
       - name: Free disk space for WebKit
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
         with:
           tool-cache: false
@@ -56,7 +75,7 @@ jobs:
           docker-images: true
           swap-storage: false
       - uses: cachix/install-nix-action@v31
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         with:
           github_access_token: ${{ github.token }}
           extra_nix_config: |
@@ -64,19 +83,19 @@ jobs:
             extra-substituters = https://scarlet-rust-toolchain.cachix.org
             extra-trusted-public-keys = scarlet-rust-toolchain.cachix.org-1:p+coBExi0nNTIvWF/oM9H9/1/GhwFtqGZ2Vs+4pYl6o=
       - uses: cachix/cachix-action@v17
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'scarlet-dev' }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: actions/cache/restore@v4
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         id: build-cache
         with:
           path: target
           key: myrica-aarch64-${{ hashFiles('flake.lock', 'Cargo.lock', 'Cargo.toml', 'build.rs', 'platforms/scarlet/**', 'crates/myrica-webkit-sys/**') }}
           restore-keys: myrica-aarch64-
       - name: Build Myrica and probe
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         run: |
           nix develop --command bash -euo pipefail <<'BUILD'
           cargo build --locked --release --target aarch64-unknown-scarlet \
@@ -87,7 +106,7 @@ jobs:
           printf '%s\n' "${CARGO_HOME:-$HOME/.cargo}" > "$RUNNER_TEMP/myrica-cargo-home"
           BUILD
       - uses: actions/cache/save@v4
-        if: steps.inputs.outputs.exists != 'true' && steps.build-cache.outputs.cache-hit != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == '' && steps.build-cache.outputs.cache-hit != 'true'
         with:
           path: target
           key: ${{ steps.build-cache.outputs.cache-primary-key }}
@@ -98,12 +117,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends g++-13-aarch64-linux-gnu
           host=dist/staging/systems/linux-aarch64/usr/libexec/myrica/widevine-host
           CROSS_CXX=aarch64-linux-gnu-g++-13 sh tools/widevine-host/build-host.sh "$host"
-          readelf -hW "$host" | grep -E 'Machine:[[:space:]]+AArch64$'
-          readelf -lW "$host" | grep -F 'Requesting program interpreter: /lib/ld-linux-aarch64.so.1]'
+          aarch64-linux-gnu-readelf -hW "$host" | grep -E 'Machine:[[:space:]]+AArch64$'
+          aarch64-linux-gnu-readelf -lW "$host" | grep -F 'Requesting program interpreter: /lib/ld-linux-aarch64.so.1]'
           install -Dm644 /usr/share/doc/libstdc++-13-dev-arm64-cross/copyright \
             dist/staging/share/licenses/myrica/linux-cross-gcc.txt
       - name: Package corresponding sources and notices
-        if: steps.inputs.outputs.exists != 'true'
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         run: |
           mkdir -p dist/sources/myrica dist/sources/native dist/staging/share/licenses/myrica/third-party
           git archive HEAD | tar -xf - -C dist/sources/myrica
@@ -156,13 +175,16 @@ jobs:
           SOURCES
           cp dist/staging/share/licenses/myrica/SOURCES.txt dist/sources/SOURCES.txt
           tar --owner=0 --group=0 --mtime=@0 -czf dist/myrica-sources.tar.gz -C dist/sources .
-      - name: Package release
-        if: steps.inputs.outputs.exists != 'true'
+      - name: Stage compiled browser and probe
+        if: steps.inputs.outputs.exists != 'true' && inputs.reuse_from == ''
         run: |
           mkdir -p dist/staging/bin
           install -m755 target/aarch64-unknown-scarlet/release/myrica dist/staging/bin/myrica
           install -m755 target/aarch64-unknown-scarlet/release/webkit-vulkan-probe dist/staging/bin/myrica-vulkan-probe
           install -Dm644 LICENSE dist/staging/share/licenses/myrica/LICENSE
+      - name: Package release
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
           chmod -R u+rwX dist/staging
           task_asset=myrica-aarch64-unknown-scarlet.tar.gz
           tar --owner=0 --group=0 --mtime=@0 -czf "dist/$task_asset" -C dist/staging .
@@ -172,9 +194,8 @@ jobs:
           cat > bundle.toml <<BUNDLE
           [[layers]]
           kind = "archive"
-          architectures = ["aarch64"]
           url = "https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/$task_asset"
-          sha256 = "$task_digest"
+          sha256 = { aarch64 = "$task_digest" }
           format = "tar-gz"
           to = "/"
           BUNDLE
