@@ -61,11 +61,12 @@ The experimental backend uses the Scarlet branch of the
 [WebKit fork](https://github.com/petitstrawberry/WebKit/tree/scarlet) and its
 `ScarletWebView` C ABI with JavaScriptCore.
 
-Scarlet's AArch64 desktop bundle consumes the browser and probe from the
-`Scarlet prebuilt` Actions workflow. Releases are tagged
-`scarlet-<full-myrica-commit>` and include a checksum-pinned `bundle.toml`.
-Myrica owns the WebKit integration. Its own flake supplies the compilers and
-SDK runtime used by the build.
+The `Scarlet prebuilt` Actions workflow packages the AArch64 browser with
+WebKit linked in, the Vulkan diagnostic probe, and the Linux Widevine host
+in one archive. Releases are tagged `scarlet-<full-myrica-commit>` and include
+a checksum-pinned `bundle.toml` for image builds. Myrica's flake supplies the
+browser toolchain and SDK runtime. The workflow uses Ubuntu's AArch64 Linux
+GCC 13 cross compiler for the host.
 
 The release includes `myrica-sources.tar.gz` with the matching Myrica source,
 cached Rust crates and native dependency sources (including the modified
@@ -82,6 +83,7 @@ nix develop
 CARGO_HOME="$(cd ../cargo-home && pwd)" cargo build --locked --offline --release --target aarch64-unknown-scarlet \
   --no-default-features --features backend-webkit-vulkan,webkit-vulkan-probe \
   --bin myrica --bin webkit-vulkan-probe
+CROSS_CXX=aarch64-linux-gnu-g++-13 sh tools/widevine-host/build-host.sh target/widevine-host/widevine-host
 ```
 
 Nix and CMake may fetch the pinned build environment and native sources. To

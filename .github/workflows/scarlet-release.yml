@@ -12,6 +12,8 @@ on:
       - src/**
       - crates/**
       - platforms/scarlet/**
+      - tools/widevine-host/**
+      - tools/widevine-probe/api/**
       - .cargo/**
       - LICENSE
       - .github/workflows/scarlet-release.yml
@@ -89,6 +91,17 @@ jobs:
         with:
           path: target
           key: ${{ steps.build-cache.outputs.cache-primary-key }}
+      - name: Build the AArch64 Linux Widevine host
+        if: steps.inputs.outputs.exists != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-13-aarch64-linux-gnu
+          host=dist/staging/systems/linux-aarch64/usr/libexec/myrica/widevine-host
+          CROSS_CXX=aarch64-linux-gnu-g++-13 sh tools/widevine-host/build-host.sh "$host"
+          readelf -hW "$host" | grep -E 'Machine:[[:space:]]+AArch64$'
+          readelf -lW "$host" | grep -F 'Requesting program interpreter: /lib/ld-linux-aarch64.so.1]'
+          install -Dm644 /usr/share/doc/libstdc++-13-dev-arm64-cross/copyright \
+            dist/staging/share/licenses/myrica/linux-cross-gcc.txt
       - name: Package corresponding sources and notices
         if: steps.inputs.outputs.exists != 'true'
         run: |
@@ -159,6 +172,7 @@ jobs:
           cat > bundle.toml <<BUNDLE
           [[layers]]
           kind = "archive"
+          architectures = ["aarch64"]
           url = "https://github.com/petitstrawberry/myrica/releases/download/scarlet-$GITHUB_SHA/$task_asset"
           sha256 = "$task_digest"
           format = "tar-gz"
@@ -198,7 +212,7 @@ jobs:
             exit 0
           fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" --title "Scarlet $GITHUB_SHA" --notes "AArch64 WebKit/Vulkan browser and diagnostic probe. Built with Myrica’s own locked development environment."
+            gh release create "$TAG" --draft --prerelease --target "$GITHUB_SHA" --title "Scarlet $GITHUB_SHA" --notes "AArch64 WebKit/Vulkan browser, diagnostic probe, and Linux Widevine host. The CDM is installed separately in Debian."
           fi
           gh release upload "$TAG" dist/* --clobber
           gh release edit "$TAG" --draft=false --latest=false
